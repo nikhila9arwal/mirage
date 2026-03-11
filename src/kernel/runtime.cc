@@ -18,6 +18,7 @@
 #include "mirage/transpiler/utils.h"
 #include "mirage/utils/json_utils.h"
 #include <queue>
+#include <tuple>
 
 namespace mirage {
 namespace kernel {
@@ -71,6 +72,34 @@ int get_num_subtasks(int num_gpus, TaskType task_type) {
     return 1;
   }
 }
+
+namespace {
+
+constexpr uint32_t MAX_PROFILER_GROUP_COUNT = 1u << 13;
+
+using ProfilerGroupKey = std::tuple<uint32_t, TaskType, uint32_t>;
+
+void assign_profiler_group_ids(std::vector<FullTaskDesc> &all_tasks) {
+  std::map<ProfilerGroupKey, uint32_t> group_ids;
+
+  for (FullTaskDesc &task : all_tasks) {
+    if (!uses_dag_profiler_group(task.task_type)) {
+      task.profiler_group_id = INVALID_PROFILER_GROUP_ID;
+      continue;
+    }
+
+    ProfilerGroupKey key(
+        static_cast<uint32_t>(task.dependent_event & 0xFFFFFFFFull),
+        task.task_type,
+        static_cast<uint32_t>(task.trigger_event & 0xFFFFFFFFull));
+    auto inserted = group_ids.emplace(key, static_cast<uint32_t>(group_ids.size()));
+    uint32_t profiler_group_id = inserted.first->second;
+    assert(profiler_group_id < MAX_PROFILER_GROUP_COUNT);
+    task.profiler_group_id = profiler_group_id;
+  }
+}
+
+} // namespace
 
 void dfs_create_events_add_tasks(
     int depth,
@@ -593,6 +622,10 @@ TaskGraphResult print_task_graph(
     code.e("FullTaskDesc "
            "task_desc(static_cast<TaskType>(task.at(\"task_type\")),");
     code.e("            task.at(\"variant_id\"));");
+    code.e("if (task.contains(\"profiler_group_id\")) {");
+    code.e("task_desc.profiler_group_id = "
+           "task.at(\"profiler_group_id\").get<uint32_t>();");
+    code.e("}");
     code.e("task_desc.task_metadata.request_id = "
            "task.at(\"request_id\").get<int>();");
     code.e("task_desc.task_metadata.expert_offset = "
@@ -799,6 +832,7 @@ TaskGraphResult print_task_graph(
     json_task_graph["all_tasks"].push_back(
         json{{"task_type", TASK_TERMINATE},
              {"variant_id", 0},
+             {"profiler_group_id", all_tasks[0].profiler_group_id},
              {"inputs", {}},
              {"outputs", {}},
              {"trigger_event", EVENT_INVALID_ID},
@@ -812,9 +846,12 @@ TaskGraphResult print_task_graph(
   // generate task[1]
   {
     tgbody.e("all_tasks.push_back(FullTaskDesc(TASK_BEGIN_TASK_GRAPH));");
+    tgbody.e("all_tasks.back().profiler_group_id = $;",
+             all_tasks[1].profiler_group_id);
     json_task_graph["all_tasks"].push_back(
         json{{"task_type", TASK_BEGIN_TASK_GRAPH},
              {"variant_id", 0},
+             {"profiler_group_id", all_tasks[1].profiler_group_id},
              {"inputs", {}},
              {"outputs", {}},
              {"trigger_event",
@@ -887,6 +924,7 @@ TaskGraphResult print_task_graph(
             json_task = {
                 {"task_type", task_desc.task_type},
                 {"variant_id", task_desc.variant_id},
+                {"profiler_group_id", task_desc.profiler_group_id},
                 {"inputs", {}},
                 {"outputs", {}},
                 {"trigger_event", task_desc.trigger_event},
@@ -1303,6 +1341,7 @@ TaskGraphResult Graph::generate_task_graph(int _num_gpus, int _my_gpu_id) {
                    first_tasks,
                    all_task_maps,
                    task_config);
+  assign_profiler_group_ids(all_tasks);
   assert(sanity_check(*this, all_tasks, all_events, first_tasks));
   return print_task_graph(*this,
                           num_gpus,

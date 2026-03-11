@@ -1,120 +1,17 @@
 #!/usr/bin/env python3
-"""Combine a static task graph JSON with a Perfetto execution trace to produce
-an interactive HTML Gantt / pipeline timeline diagram.
+"""Render a Mirage task-graph JSON and Perfetto trace as an interactive HTML timeline.
 
 Usage:
     python scripts/display_task_graph_timeline.py task_graph_0.json mirage_0.perfetto-trace [-o output.html]
 
-Outputs an interactive HTML timeline with three views:
-  1. Pipeline Phases  -- trace events grouped into repeating transformer layers
-  2. By Task Type     -- one row per task type, bars per invocation
-  3. Per Block        -- one row per GPU block (SM), with dependency highlighting,
-                        straggler detection, ready-time markers, and schedule metrics
-
-================================================================================
-ARCHITECTURE OVERVIEW
-================================================================================
-
-Data sources
-------------
-  task_graph_*.json
-      Static DAG exported by Mirage at graph-build time.  Each "event" is a
-      GPU synchronisation point.  Each "task" has:
-        dependent_event  -- the event this task WAITS for before it can run
-        trigger_event    -- the event this task FIRES when it completes
-      Tasks with the same (task_type, dependent_event, trigger_event) form a
-      "task group" -- all blocks run one task from this group in parallel.
-
-  *.perfetto-trace
-      Perfetto binary trace captured at runtime (via tg4perfetto).
-      Each slice is named "TASK_TYPE_N" where:
-        TASK_TYPE  -- the task type string matching _TRACE_NAME_MAP
-        N          -- a PER-BLOCK sequential counter (0, 1, 2, ...)
-                     This is NOT a DAG event index!  It simply numbers the
-                     invocations for that block in time order.
-      Slices on different block tracks running the same N represent the same
-      logical task group executing across all GPU blocks simultaneously.
-
-Key computed data structures
-----------------------------
-  dag_groups     List of DAG task groups, each with task_type, dep/trig event,
-                 and task_count.  Groups are nodes in the dependency graph.
-
-  adjacency /    Forward and reverse adjacency dicts (group_id -> [group_ids])
-  reverse_adj    representing the DAG dependency edges.
-
-  group_timing   dict[dag_group_id -> {start, end, ready_time}].
-                 Populated via the Nth-match approach (see below).
-                 Used for: block utilization sums, critical path approximation.
-
-  group_deps     dict[trace_name -> {p, s, rt, ad, gs, ge}]
-                 Populated via temporal proximity matching (see below).
-                 Used for: interactive dependency highlighting in the browser,
-                 queue wait computation in the schedule metrics.
-
-================================================================================
-MAPPING CHALLENGE: PARALLEL EXECUTION CHAINS
-================================================================================
-
-Naive approach -- Nth positional match
-  Sort DAG groups of type T by (dep_event, trig_event) to approximate pipeline
-  execution order; sort trace groups by min_start; pair by position (0th with
-  0th, 1st with 1st, etc.).
-
-  Problem: Mirage can run MULTIPLE PARALLEL COMPUTATION CHAINS simultaneously.
-  For example, speculative decoding runs a draft chain and a verify chain at
-  the same time, both executing RMS_NORM → LINEAR → ATTN → ... sequences.
-  This means the trace may have ~2x as many invocations of each task type as
-  the DAG has groups for that type.  Temporal interleaving of invocations from
-  different chains breaks the Nth-match: you end up pairing task 0 from chain A
-  with task 1 from chain B, producing nonsensical predecessor relationships
-  (e.g. a "predecessor" that actually ends AFTER the task started).
-
-  The Nth-match is still used for group_timing / critical path because it gives
-  a reasonable structural approximation for those aggregate metrics.
-
-Temporal proximity matching (used for group_deps)
-  Instead of positional matching, this approach:
-    1. Extracts TYPE-LEVEL predecessor/successor structure from the DAG into
-       type_preds / type_succs dicts (which task types depend on which others).
-    2. Builds per-type sorted timing lists for binary search.
-    3. For each specific trace invocation (task_type T, event_no N):
-         predecessor = for each predecessor type P, find the P invocation
-                       whose max_end is the LATEST one before this T's min_start.
-                       (binary search: bisect_right on sorted max_end list)
-         successor   = for each successor type S, find the S invocation with
-                       the EARLIEST min_start after this T's max_end.
-                       (binary search: bisect_left on sorted min_start list)
-
-WHY IS THE MOST RECENT PREDECESSOR THE RIGHT ONE?
-  In Mirage's execution model, task group B "waits for" event E which is
-  "fired by" task group A (when all A tasks across all blocks complete).
-  So the causal relationship is: event E fires → B becomes eligible → B runs.
-
-  For a specific B invocation (trace_name B_N):
-    - The predecessor A that "released" B is the A invocation that fired event E.
-    - E fires when the LAST block finishes its A task -- i.e. at max_end(A_M).
-    - Therefore: max_end(A_M) < min_start(B_N), and nothing ran between them.
-    - Among all A invocations that ended before B_N started, the LATEST-ending
-      one is the actual bottleneck -- if B was gated by some earlier A, there
-      would be a large unexplained gap where B could have started but didn't.
-      A well-functioning scheduler starts B as soon as E fires, so the gap
-      between pred max_end and B min_start should be near-zero (just scheduling
-      latency), not 100s of microseconds.
-
-  Limitation: when parallel chains run in tight lock-step, invocations from
-  different chains can interleave within a few microseconds.  In that case,
-  chain A's A_0 (ending at t=99) may be picked as chain B's B_3's predecessor
-  instead of chain B's A_3 (ending at t=98).  In practice this produces small
-  queue-wait estimation errors but not the gross errors (>100 us off) that the
-  Nth-match caused.
+This script requires traces emitted with exact ``profiler_group_id`` values.
+It does not support the older per-block counter naming scheme.
 """
 
 import argparse
 import json
 import os
 import re
-import sys
 from collections import defaultdict, Counter
 from typing import Dict, List, Tuple
 
@@ -226,6 +123,8 @@ TASK_COLORS: Dict[str, str] = {
 }
 
 SCHEDULER_TYPES = {"TASK_SCHD_TASKS", "TASK_SCHD_EVENTS", "TASK_GET_EVENT", "TASK_GET_NEXT_TASK"}
+STRAGGLER_RATIO = 1.3
+UNPROFILED_TASK_TYPES = {0, 200, 201, 202, 203}
 
 
 def _color_for(name: str) -> str:
@@ -254,6 +153,17 @@ def get_index_from_id(eid: int) -> int:
 
 
 BASE_EVENT = 0xFFFFFFFE
+INVALID_PROFILER_GROUP_ID = 0xFFFFFFFF
+
+
+def _task_profiler_group_id(task):
+    profiler_group_id = task.get("profiler_group_id")
+    if profiler_group_id is None:
+        return None
+    profiler_group_id = int(profiler_group_id)
+    if profiler_group_id == INVALID_PROFILER_GROUP_ID:
+        return None
+    return profiler_group_id
 
 
 def build_stage_sequence(events, tasks):
@@ -365,8 +275,8 @@ def _parse_trace_name(name: str) -> Tuple[str, int]:
 
     Example: 'TASK_RMS_NORM_HOPPER_42' -> ('TASK_RMS_NORM_HOPPER', 42)
 
-    The trailing integer is a per-block sequential invocation counter assigned
-    by tg4perfetto -- it is NOT related to dep_event or trig_event in the DAG.
+    The trailing integer is the DAG-stable profiler_group_id emitted by the
+    persistent kernel.
     """
     m = re.match(r"^(.+)_(\d+)$", name)
     if m:
@@ -377,48 +287,62 @@ def _parse_trace_name(name: str) -> Tuple[str, int]:
 # ---------------------------------------------------------------------------
 # Dependency DAG, trace-to-graph mapping, and schedule metrics
 # ---------------------------------------------------------------------------
-_TRACE_ID_MAP: Dict[str, int] = {v: k for k, v in _TRACE_NAME_MAP.items()}
 
 
-def build_dependency_dag(events, tasks):
+def build_dependency_dag(tasks):
     """Build a dependency DAG from the task graph JSON.
 
-    A "task group" is the set of all tasks sharing the same
-    (task_type, dependent_event, trigger_event) triple.  At runtime, every
-    GPU block executes exactly one task from each group in parallel.
-
-    The DAG edges are: group A -> group B  iff  A.trigger_event == B.dependent_event.
-    This means B cannot start until all blocks have finished A (the trigger event fires).
-
-    Parameters
-    ----------
-    events : list
-        Raw event list from the task graph JSON (used only for length reporting).
-    tasks : list
-        Raw task list, each with keys: task_type, dependent_event, trigger_event.
+    Uses the exact ``profiler_group_id`` embedded in the task graph JSON.
+    Tasks without a profiler group id are rejected unless they are explicitly
+    unprofiled runtime sentinels such as ``TASK_TERMINATE``.
 
     Returns
     -------
     dag_groups : list of dicts
         Each dict has: group_id, dep_event, trig_event, task_type,
-        task_type_name, task_count.
+        task_type_name, task_count, trace_event_no.
     adjacency : dict[group_id -> [successor group_ids]]
     reverse_adj : dict[group_id -> [predecessor group_ids]]
     """
-    group_key_to_tasks = defaultdict(list)
-    for i, t in enumerate(tasks):
-        dep = get_index_from_id(t["dependent_event"])
-        tt = t["task_type"]
-        trig = get_index_from_id(t["trigger_event"])
-        group_key_to_tasks[(dep, tt, trig)].append(i)
+    exact_groups = defaultdict(list)
+    missing_profiler_ids = Counter()
 
-    dag_groups = []
+    for i, t in enumerate(tasks):
+        task_type = t["task_type"]
+        if task_type in UNPROFILED_TASK_TYPES:
+            continue
+        profiler_group_id = _task_profiler_group_id(t)
+        if profiler_group_id is not None:
+            exact_groups[profiler_group_id].append(i)
+            continue
+        missing_profiler_ids[_TRACE_NAME_MAP.get(task_type, f"TASK_{task_type}")] += 1
+
+    if missing_profiler_ids:
+        summary = ", ".join(
+            f"{task_type} ({count})"
+            for task_type, count in sorted(missing_profiler_ids.items())
+        )
+        raise ValueError(
+            "Task graph is missing profiler_group_id for profiled task types: "
+            f"{summary}"
+        )
+
+    dag_groups_by_id = {}
     dep_event_to_gids = defaultdict(list)
 
-    for (dep, tt, trig), task_indices in group_key_to_tasks.items():
-        gid = len(dag_groups)
+    for gid in sorted(exact_groups):
+        task_indices = exact_groups[gid]
+        first_task = tasks[task_indices[0]]
+        dep = get_index_from_id(first_task["dependent_event"])
+        tt = first_task["task_type"]
+        trig = get_index_from_id(first_task["trigger_event"])
+        for task_idx in task_indices[1:]:
+            task = tasks[task_idx]
+            assert get_index_from_id(task["dependent_event"]) == dep
+            assert task["task_type"] == tt
+            assert get_index_from_id(task["trigger_event"]) == trig
         tname = _TRACE_NAME_MAP.get(tt, f"TASK_{tt}")
-        dag_groups.append({
+        dag_groups_by_id[gid] = {
             "group_id": gid,
             "dep_event": dep,
             "trig_event": trig,
@@ -426,8 +350,11 @@ def build_dependency_dag(events, tasks):
             "task_type_name": tname,
             "task_count": len(task_indices),
             "task_indices": task_indices,
-        })
+            "trace_event_no": gid,
+        }
         dep_event_to_gids[dep].append(gid)
+
+    dag_groups = [dag_groups_by_id[gid] for gid in sorted(dag_groups_by_id)]
 
     adjacency: Dict[int, List[int]] = defaultdict(list)
     reverse_adj: Dict[int, List[int]] = defaultdict(list)
@@ -466,34 +393,8 @@ def _topo_sort(dag_groups, adjacency):
     return order
 
 
-def map_trace_to_graph(slices, track_names, dag_groups, adjacency,
-                       reverse_adj, global_start):
+def map_trace_to_graph(slices, dag_groups, adjacency, reverse_adj, global_start):
     """Map trace task-groups to DAG groups and compute timing / dependency info.
-
-    This function runs two complementary mapping passes:
-
-    Pass 1 -- Nth positional match (-> group_timing, dag_to_trace)
-        For each task type T, sort DAG groups by (dep_event, trig_event) and
-        trace groups by min_start, then pair by position.  This gives a
-        reasonable structural mapping for block utilization and critical path
-        approximation.  It can be wrong for workloads with parallel execution
-        chains (see module docstring), but the aggregate metrics it feeds are
-        robust to occasional mismatches.
-
-    Pass 2 -- Temporal proximity match (-> group_deps)
-        For each specific trace invocation (type T, event_no N):
-          - Predecessor: for each predecessor TYPE P (from DAG type-level edges),
-            find the specific P invocation whose max_end is the latest one that
-            still precedes this T_N's min_start.  This is the P invocation that
-            causally released T_N -- any P ending later hadn't finished yet
-            when T_N started, so it couldn't have been T_N's actual blocker.
-          - Successor: earliest-starting S invocation after this T_N's max_end.
-          - Ready time: max(predecessor max_end values), i.e. the moment the last
-            required dependency completed.  Queue wait = min_start - ready_time.
-
-        Covers ALL trace invocations regardless of whether they have a DAG match.
-        See module docstring for why "most recent predecessor" is the right choice
-        and what the limitations are with tight parallel chains.
 
     Returns
     -------
@@ -517,7 +418,6 @@ def map_trace_to_graph(slices, track_names, dag_groups, adjacency,
             continue
         trace_agg[(tts, eno)].append((ts, dur, track_id))
 
-    by_type_trace: Dict[str, list] = defaultdict(list)
     trace_timing: Dict[Tuple[str, int], dict] = {}
     for (tts, eno), records in trace_agg.items():
         min_start = min(r[0] for r in records)
@@ -529,45 +429,35 @@ def map_trace_to_graph(slices, track_names, dag_groups, adjacency,
             "max_end": max_end,
             "avg_dur": sum(durs) / len(durs),
         }
-        by_type_trace[tts].append(entry)
         trace_timing[(tts, eno)] = entry
-    # Sort each type's invocations by wall-clock start time.
-    for tts in by_type_trace:
-        by_type_trace[tts].sort(key=lambda x: x["min_start"])
 
-    # ---- Step 2 (Pass 1): Nth positional match for group_timing ----
-    # Sort DAG groups of each type by (dep_event, trig_event).
-    # dep_event is a pipeline ordering proxy: smaller dep_event indices appear
-    # earlier in the dependency chain and therefore run earlier.  This is an
-    # approximation -- it breaks with parallel chains -- but is good enough for
-    # the aggregate metrics (block utilization, critical path) that use it.
-    by_type_dag: Dict[str, list] = defaultdict(list)
+    exact_trace_to_dag: Dict[Tuple[str, int], int] = {}
     for g in dag_groups:
-        by_type_dag[g["task_type_name"]].append(g["group_id"])
+        exact_trace_to_dag[(g["task_type_name"], g["trace_event_no"])] = g["group_id"]
 
-    def _dag_order_key(gid):
-        g = dag_groups[gid]
-        dep = g["dep_event"]
-        trig = g["trig_event"]
-        # BASE_EVENT (0xFFFFFFFE) means "no event"; treat as 0 for sorting.
-        dep_k = 0 if dep == BASE_EVENT else dep
-        trig_k = 0 if trig == BASE_EVENT else trig
-        return (dep_k, trig_k)
+    unknown_trace_keys = sorted(k for k in trace_timing if k not in exact_trace_to_dag)
+    if unknown_trace_keys:
+        preview = ", ".join(f"{tts}_{eno}" for tts, eno in unknown_trace_keys[:10])
+        raise ValueError(
+            "Trace contains task groups absent from the DAG mapping: "
+            f"{preview}"
+        )
 
-    for ttype in by_type_dag:
-        by_type_dag[ttype].sort(key=_dag_order_key)
+    missing_trace_keys = sorted(k for k in exact_trace_to_dag if k not in trace_timing)
+    if missing_trace_keys:
+        preview = ", ".join(f"{tts}_{eno}" for tts, eno in missing_trace_keys[:10])
+        raise ValueError(
+            "Trace is missing DAG task groups required for exact mapping: "
+            f"{preview}"
+        )
 
-    # Pair Nth trace invocation <-> Nth DAG group (by execution order).
-    trace_to_dag: Dict[Tuple[str, int], int] = {}
-    dag_to_trace: Dict[int, Tuple[str, int]] = {}
-    for ttype, trace_list in by_type_trace.items():
-        dag_list = by_type_dag.get(ttype, [])
-        for i, tg in enumerate(trace_list):
-            if i < len(dag_list):
-                trace_to_dag[(ttype, tg["eno"])] = dag_list[i]
-                dag_to_trace[dag_list[i]] = (ttype, tg["eno"])
+    trace_to_dag: Dict[Tuple[str, int], int] = {
+        trace_key: exact_trace_to_dag[trace_key] for trace_key in trace_timing
+    }
+    dag_to_trace: Dict[int, Tuple[str, int]] = {
+        gid: trace_key for trace_key, gid in trace_to_dag.items()
+    }
 
-    # Populate group_timing from the Nth-matched trace invocations.
     group_timing: Dict[int, dict] = {}
     for (tts, eno), gid in trace_to_dag.items():
         tg = trace_timing[(tts, eno)]
@@ -588,89 +478,41 @@ def map_trace_to_graph(slices, track_names, dag_groups, adjacency,
         else:
             group_timing[gid]["ready_time"] = group_timing[gid]["start_time"]
 
-    # ---- Step 3 (Pass 2): Temporal proximity match for group_deps ----
-    # Extract type-level predecessor/successor structure from the DAG.
-    # We use the DAG only for WHICH TYPES depend on which other types;
-    # the specific INSTANCE pairing is done by temporal proximity below.
-    type_preds: Dict[str, set] = defaultdict(set)  # task type -> {predecessor types}
-    type_succs: Dict[str, set] = defaultdict(set)  # task type -> {successor types}
-    for gid in range(len(dag_groups)):
-        g_type = dag_groups[gid]["task_type_name"]
-        for sgid in adjacency.get(gid, []):
-            sg_type = dag_groups[sgid]["task_type_name"]
-            type_succs[g_type].add(sg_type)
-            type_preds[sg_type].add(g_type)
-
-    # Pre-sort per-type timing lists to enable O(log N) binary search.
-    # by_type_max_end[P]   = [(max_end, eno), ...] sorted ascending by max_end
-    # by_type_min_start[S] = [(min_start, eno), ...] sorted ascending by min_start
-    by_type_max_end: Dict[str, list] = defaultdict(list)
-    by_type_min_start: Dict[str, list] = defaultdict(list)
-    for (tts, eno), tg in trace_timing.items():
-        by_type_max_end[tts].append((tg["max_end"], eno))
-        by_type_min_start[tts].append((tg["min_start"], eno))
-    for tts in by_type_max_end:
-        by_type_max_end[tts].sort()
-        by_type_min_start[tts].sort()
-
-    # Build group_deps for EVERY trace invocation using temporal proximity.
-    # We iterate over all (tts, eno) in trace_timing (not just mapped ones),
-    # so every bar in the Per Block view gets dependency / ready-time info.
-    import bisect
     group_deps: Dict[str, dict] = {}
-    for (tts, eno), tg in trace_timing.items():
+    for gid, trace_key in dag_to_trace.items():
+        tts, eno = trace_key
+        tg = trace_timing[trace_key]
         trace_name = f"{tts}_{eno}"
         my_start = tg["min_start"]
         my_end = tg["max_end"]
 
-        # --- Find predecessor instance for each predecessor TYPE ---
-        # bisect_right(ends, my_start) gives the insertion point after all
-        # values <= my_start.  Subtract 1 to get the latest-ending predecessor
-        # that completed at or before this task started.  This is the causal
-        # predecessor: the one whose completion was the last required condition
-        # before this task became eligible.
         pred_names: List[str] = []
+        pred_ends: List[int] = []
         seen_p: set = set()
-        for pred_type in sorted(type_preds.get(tts, [])):
-            ends = [x[0] for x in by_type_max_end[pred_type]]
-            idx = bisect.bisect_right(ends, my_start) - 1
-            if idx >= 0:
-                _, peno = by_type_max_end[pred_type][idx]
-                pname = f"{pred_type}_{peno}"
-                if pname not in seen_p:
-                    pred_names.append(pname)
-                    seen_p.add(pname)
+        for pred_gid in reverse_adj.get(gid, []):
+            pred_trace = dag_to_trace.get(pred_gid)
+            if pred_trace is None:
+                continue
+            pname = f"{pred_trace[0]}_{pred_trace[1]}"
+            if pname in seen_p:
+                continue
+            pred_names.append(pname)
+            pred_ends.append(trace_timing[pred_trace]["max_end"])
+            seen_p.add(pname)
 
-        # --- Find successor instance for each successor TYPE ---
-        # bisect_left(starts, my_end) gives the first position with value >=
-        # my_end -- i.e. the earliest-starting successor after this task ends.
         succ_names: List[str] = []
         seen_s: set = set()
-        for succ_type in sorted(type_succs.get(tts, [])):
-            starts = [x[0] for x in by_type_min_start[succ_type]]
-            idx = bisect.bisect_left(starts, my_end)
-            if idx < len(starts):
-                _, seno = by_type_min_start[succ_type][idx]
-                sname = f"{succ_type}_{seno}"
-                if sname not in seen_s:
-                    succ_names.append(sname)
-                    seen_s.add(sname)
+        for succ_gid in adjacency.get(gid, []):
+            succ_trace = dag_to_trace.get(succ_gid)
+            if succ_trace is None:
+                continue
+            sname = f"{succ_trace[0]}_{succ_trace[1]}"
+            if sname in seen_s:
+                continue
+            succ_names.append(sname)
+            seen_s.add(sname)
 
-        # Ready time = when all matched predecessors had finished.
-        # Initialize to 0 (not my_start) so we can correctly detect the case
-        # where a predecessor ends before my_start (any >0 value is a real pred).
-        ready_time = 0
-        for pname in pred_names:
-            last_u = pname.rfind("_")
-            ptup = (pname[:last_u], int(pname[last_u + 1:]))
-            ptg = trace_timing.get(ptup)
-            if ptg:
-                ready_time = max(ready_time, ptg["max_end"])
-        if ready_time == 0:
-            ready_time = my_start  # no predecessors: task was ready at its own start
-
-        # gs/ge/rt are stored as offsets from global_start (nanoseconds) so
-        # JavaScript can compute queue_wait = gs - rt without knowing global_start.
+        ready_time = max(pred_ends) if pred_ends else my_start
         group_deps[trace_name] = {
             "p": pred_names,
             "s": succ_names,
@@ -693,12 +535,10 @@ def compute_schedule_metrics(slices, track_names, group_timing, dag_groups,
     slices : list of (name, ts, dur, track_id)
         Raw Perfetto slices -- used for block utilization (sum of raw durations).
     group_timing : dict[dag_group_id -> {start_time, end_time, avg_dur, ready_time}]
-        Timing from the Nth positional match.  Used for the critical path DP
-        (which is a DAG-structural computation and tolerates approximate mapping).
+        Timing from exact profiler-group mapping. Used for the critical path DP.
     group_deps : dict[trace_name -> {gs, ge, rt, ad, p, s}]
-        Timing and dependency info from temporal proximity matching.  Used for
-        queue wait computation because temporal proximity gives accurate
-        ready_time values even with parallel execution chains.
+        Timing and dependency info from exact DAG mapping. Used for queue-wait
+        computation and dependency highlighting.
 
     Returns
     -------
@@ -730,11 +570,7 @@ def compute_schedule_metrics(slices, track_names, group_timing, dag_groups,
             "idle_us": round((total_dur - busy) / 1e3, 1),
         })
 
-    # ---- Per-invocation queue wait (from temporal proximity data) ----
-    # We use group_deps (temporal proximity match) rather than group_timing
-    # (Nth positional match) because group_timing.ready_time is unreliable
-    # for workloads with parallel execution chains.  group_deps.rt gives the
-    # actual completion time of the predecessor that released each invocation.
+    # ---- Per-invocation queue wait (from dependency-aware group_deps) ----
     #
     # queue_wait = gs - rt
     #   gs = group min_start offset from global_start (when the first block started)
@@ -939,11 +775,7 @@ def build_views(slices, track_names, stage_seq):
         ts["sum_avg"] += e["avg_dur"]
 
     # ---- 1. Pipeline Phases view ----
-    # Detect the layer pattern from the task graph, then group trace entries
-    # into phases.  If no clear pattern, fall back to temporal bucketing.
-    period = detect_layer_pattern(stage_seq) if stage_seq else 0
-
-    pipeline_rows = _build_pipeline_rows(compute_entries, global_start, stage_seq, period)
+    pipeline_rows = _build_pipeline_rows(compute_entries, global_start, stage_seq)
 
     # ---- 2. By Task Type view ----
     type_groups = defaultdict(list)
@@ -1002,7 +834,7 @@ def _bar(entry, global_start, tts_hint=""):
     }
 
 
-def _build_pipeline_rows(compute_entries, global_start, stage_seq, period):
+def _build_pipeline_rows(compute_entries, global_start, stage_seq):
     """Build pipeline rows by detecting repeating phases.
 
     Uses the task graph to identify which task type marks the start of each
@@ -1128,10 +960,12 @@ def generate_html(pipeline_rows, tasktype_rows, block_rows,
         num_events=num_events,
         num_tasks=num_tasks,
         total_dur_ms=total_dur / 1e6,
+        straggler_ratio=f"{STRAGGLER_RATIO:.1f}",
         stats_rows=stats_rows_html,
         sched_analysis=sched_html,
         js_global_start=global_start,
         js_total_dur=total_dur,
+        js_straggler_ratio=STRAGGLER_RATIO,
         js_pipeline=json.dumps(pipeline_rows),
         js_tasktype=json.dumps(tasktype_rows),
         js_blocks=json.dumps(block_rows),
@@ -1560,7 +1394,7 @@ h1{{color:#e0e0e0;margin-bottom:5px}}
 <p>Each row is one GPU block (SM). Bars show individual task executions on that block over time.</p>
 <dl>
 <dt>Colored bars</dt><dd>Task executions. Color = task type (see legend above). Hover for timing details. <b>Click</b> to highlight the task group and its dependencies.</dd>
-<dt><span class="swatch" style="border:2px solid #e94560;box-shadow:0 0 4px #e94560"></span> Glowing red border</dt><dd><b>Straggler</b> &mdash; this task took &gt;1.5&times; the group average duration across all blocks.</dd>
+<dt><span class="swatch" style="border:2px solid #e94560;box-shadow:0 0 4px #e94560"></span> Glowing red border</dt><dd><b>Straggler</b> &mdash; this task took &gt;{straggler_ratio}&times; the group average duration across all blocks.</dd>
 <dt>Click a bar &rarr; highlights</dt><dd><span style="color:#fff"><b>White outline</b></span> = all instances of the clicked task group (same task across all blocks). <span style="color:#e94560"><b>Red dashed outline</b></span> = predecessor groups (must complete first). <span style="color:#76b7b2"><b>Teal dashed outline</b></span> = successor groups (waiting on this). All other bars are faded out. Click background to dismiss.</dd>
 <dt><span class="swatch" style="background:#76b7b2"></span> Teal line inside bar</dt><dd><b>Ready-time marker</b> (appears after clicking) &mdash; the moment all dependencies were satisfied. Gap between this marker and the bar&apos;s left edge = <b>queue wait time</b> (scheduler delay after task became eligible).</dd>
 </dl>
@@ -1585,6 +1419,7 @@ const ttR={js_tasktype};
 const blkR={js_blocks};
 const legI={js_legend};
 const GD={js_group_deps};
+const STRAGGLER_RATIO={js_straggler_ratio};
 
 let bw=3000;
 let barMap={{}};
@@ -1645,7 +1480,7 @@ function renderBlk(cid,rows){{
       const gd=GD[b.name];
 
       /* straggler detection */
-      if(gd&&gd.ad>0&&b.avg_dur>gd.ad*1.5)be.classList.add('straggler');
+      if(gd&&gd.ad>0&&b.avg_dur>gd.ad*STRAGGLER_RATIO)be.classList.add('straggler');
 
       /* register in barMap */
       if(!barMap[b.name])barMap[b.name]=[];
@@ -1663,7 +1498,7 @@ function renderBlk(cid,rows){{
           txt+='\\nGroup avg: '+(gd.ad/1e3).toFixed(1)+' us (across all blocks)';
           const qw=(b.start-gd.rt)/1e3;
           if(qw>0)txt+='\\nQueue wait: '+qw.toFixed(1)+' us (ready\\u2192start delay)';
-          if(b.avg_dur>gd.ad*1.5&&gd.ad>0)txt+='\\n\\u26a0 STRAGGLER: '+(b.avg_dur/gd.ad).toFixed(1)+'x group avg';
+          if(b.avg_dur>gd.ad*STRAGGLER_RATIO&&gd.ad>0)txt+='\\n\\u26a0 STRAGGLER: '+(b.avg_dur/gd.ad).toFixed(1)+'x group avg';
           txt+='\\n\\nClick bar to highlight dependencies:';
           txt+='\\n  Predecessors: '+(gd.p.length?gd.p.length+' groups':'none');
           txt+='\\n  Successors: '+(gd.s.length?gd.s.length+' groups':'none');
@@ -1967,7 +1802,7 @@ def main():
         print(f"  Detected layer period = {period} stages")
 
     print("Building dependency DAG …")
-    dag_groups, adjacency, reverse_adj = build_dependency_dag(events, tasks)
+    dag_groups, adjacency, reverse_adj = build_dependency_dag(tasks)
     print(f"  {len(dag_groups)} task groups, "
           f"{sum(len(v) for v in adjacency.values())} edges")
 
@@ -1979,7 +1814,7 @@ def main():
 
     print("Mapping trace to task graph …")
     group_deps, group_timing, dag_to_trace = map_trace_to_graph(
-        slices, track_names, dag_groups, adjacency, reverse_adj, g_start)
+        slices, dag_groups, adjacency, reverse_adj, g_start)
     print(f"  Mapped {len(group_deps)} trace groups to DAG")
 
     print("Computing schedule metrics …")

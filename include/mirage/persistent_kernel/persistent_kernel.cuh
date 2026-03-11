@@ -647,8 +647,12 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config) {
     __syncthreads();
 
 #ifdef MPK_ENABLE_PROFILING
+    uint32_t profiler_event_no = task_counter;
+    if (uses_dag_profiler_group(task_desc->task_type)) {
+      profiler_event_no = task_desc->profiler_group_id;
+    }
     if (task_desc->task_type != TASK_TERMINATE) {
-      PROFILER_EVENT_START(task_desc->task_type, task_counter);
+      PROFILER_EVENT_START(task_desc->task_type, profiler_event_no);
     }
 #endif
 
@@ -671,8 +675,9 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config) {
 
 #ifdef MPK_ENABLE_PROFILING
     if (task_desc->task_type != TASK_TERMINATE) {
-      PROFILER_EVENT_END(task_desc->task_type, task_counter++);
+      PROFILER_EVENT_END(task_desc->task_type, profiler_event_no);
     }
+    task_counter++;
 #endif
 
     // Trigger event

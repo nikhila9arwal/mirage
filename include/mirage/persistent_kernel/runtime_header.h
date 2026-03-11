@@ -16,6 +16,7 @@
 #pragma once
 
 #include "mirage/config.h"
+#include <cstdint>
 #include <cuda_runtime.h>
 
 #ifdef USE_NVSHMEM
@@ -160,6 +161,17 @@ enum EventType {
   EVENT_INVALID = 999,
 };
 
+constexpr uint32_t INVALID_PROFILER_GROUP_ID = 0xFFFFFFFFu;
+
+constexpr bool is_scheduler_task_type(TaskType task_type) {
+  return task_type == TASK_SCHD_TASKS || task_type == TASK_SCHD_EVENTS ||
+         task_type == TASK_GET_EVENT || task_type == TASK_GET_NEXT_TASK;
+}
+
+constexpr bool uses_dag_profiler_group(TaskType task_type) {
+  return task_type != TASK_TERMINATE && !is_scheduler_task_type(task_type);
+}
+
 struct TensorDesc {
   int num_dims;
   void *base_ptr;
@@ -184,15 +196,19 @@ struct EventDesc {
 
 struct FullTaskDesc {
   FullTaskDesc(TaskType t, int _variant_id)
-      : task_type(t), variant_id(_variant_id), num_inputs(0), num_outputs(0),
-        trigger_event(EVENT_INVALID_ID), dependent_event(EVENT_INVALID_ID) {
+      : task_type(t), variant_id(_variant_id),
+        profiler_group_id(INVALID_PROFILER_GROUP_ID), num_inputs(0),
+        num_outputs(0), trigger_event(EVENT_INVALID_ID),
+        dependent_event(EVENT_INVALID_ID) {
     task_metadata.raw_payload = ~0ull;
   }
   FullTaskDesc() {
+    profiler_group_id = INVALID_PROFILER_GROUP_ID;
     task_metadata.raw_payload = ~0ull;
   }
   TaskType task_type;
   unsigned variant_id;
+  uint32_t profiler_group_id;
   int num_inputs, num_outputs;
   EventId trigger_event;
   EventId dependent_event;
@@ -221,8 +237,8 @@ static_assert(
 struct alignas(16) TaskDesc {
   TaskDesc(FullTaskDesc t)
       : task_type(t.task_type), variant_id(t.variant_id),
-        trigger_event(t.trigger_event), dependent_event(t.dependent_event),
-        task_metadata(t.task_metadata) {
+        profiler_group_id(t.profiler_group_id), trigger_event(t.trigger_event),
+        dependent_event(t.dependent_event), task_metadata(t.task_metadata) {
     for (int i = 0; i < t.num_inputs; i++) {
       input_ptrs[i] = t.inputs[i].base_ptr;
     }
@@ -243,10 +259,12 @@ struct alignas(16) TaskDesc {
 #endif
   }
   TaskDesc() {
+    profiler_group_id = INVALID_PROFILER_GROUP_ID;
     task_metadata.raw_payload = ~0ull;
   }
   TaskType task_type;
   unsigned variant_id;
+  uint32_t profiler_group_id;
   EventId trigger_event;
   EventId dependent_event;
   void *input_ptrs[MAX_INPUTS_PER_TASK];
