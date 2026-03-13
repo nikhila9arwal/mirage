@@ -45,6 +45,26 @@ Selection is now above the runtime layer, not inside the old runtime:
   - or environment variable `MIRAGE_TASK_GRAPH_MODE`
   - default mode is `legacy_event`
 
+Within `resident_data`, there are now two resident execution modes that share
+the same schema-v2 public graph model:
+
+- `scheduler_dispatch`
+  - this is the original resident runtime behavior
+  - it remains the default resident execution mode
+  - enable explicitly with `MIRAGE_RESIDENT_EXECUTION_MODE=scheduler_dispatch`
+- `hybrid_prelaunch`
+  - this is the faster resident execution feature added later
+  - enable with `MIRAGE_RESIDENT_EXECUTION_MODE=hybrid_prelaunch`
+
+So the selection hierarchy is now:
+
+- `MIRAGE_TASK_GRAPH_MODE=legacy_event`
+  - use the old event runtime
+- `MIRAGE_TASK_GRAPH_MODE=resident_data`
+  - use the resident/data compiler path
+  - then choose the resident execution strategy with
+    `MIRAGE_RESIDENT_EXECUTION_MODE`
+
 ## Quick background: what Mirage MPK is
 
 Mirage MPK is a compiler/runtime system for executing a model as a persistent GPU megakernel.
@@ -371,6 +391,7 @@ config from scratch.
 
 New important fields include:
 
+- `resident_execution_mode`
 - `begin_event_index`
 - `end_event_index`
 - `num_resident_tasks`
@@ -392,12 +413,10 @@ New important fields include:
 - `completion_queue_last_ready_data_id`
 - `completion_queue_next_free_data_id`
 - `completion_queues`
-- `resident_ready_data_head`
-- `data_ready_next`
-- `resident_active_workers`
-- `resident_completed_data`
 - `completed_terminal_data_count`
+- `completed_data_this_iteration_count`
 - `first_data_ids`
+- `current_iteration`
 
 The inherited legacy arrays `all_tasks`, `all_events`, and `first_tasks` are
 still present and are still used by the validated worker fast path.
@@ -411,9 +430,14 @@ That means:
 
 This is the key architectural compromise that brought the implementation back closer to Mirage's original fast path.
 
-Some queue-related arrays (`resident_ready_data_head`, `data_ready_next`,
-`resident_active_workers`) reflect earlier resident-task activation ideas.
-They are not the central mechanism on the currently validated fast path.
+Because both resident execution modes now coexist in one resident runtime,
+`ResidentRuntimeConfig` intentionally contains enough state for both:
+
+- the older scheduler-dispatch resident path,
+- the newer hybrid-prelaunch resident path.
+
+The slower scheduler-dispatch-only fields are still present so the old resident
+path can be preserved for direct comparison from the same checkout.
 
 ## Scheduler and worker behavior after the change
 
@@ -434,19 +458,59 @@ Control events still exist, but only for iteration-level control:
 - end graph,
 - termination.
 
-The compute path that is currently implemented and validated works like this:
+There are now two resident execution strategies on top of the same schema-v2
+graph.
 
-1. a new iteration starts,
-2. scheduler 0 publishes the begin control event,
-3. the begin control event activates all `first_data_ids`,
-4. each `first_data_id` is mapped through `data_to_task_id` to the corresponding legacy task position in `all_tasks`,
-5. schedulers enqueue those legacy task ids into worker queues using the same per-scheduler local queue-position logic Mirage used before,
-6. workers batch-load `TaskDesc` objects from `all_tasks` into shared memory, again matching the original Mirage execution style,
-7. if a task is a control or compatibility-only task with no data mapping, it follows the old event-based behavior,
-8. if a task has a `data_id` mapping, the worker executes the legacy `TaskDesc` and then publishes the completed `data_id` into a scheduler-owned completion queue,
-9. local schedulers drain completion queues, walk outgoing `data_edges`, decrement successor predecessor counts, and enqueue newly ready successor tasks by mapping `succ_data_id -> succ_task_id`,
-10. terminal data items contribute to end-of-graph completion,
-11. once all terminal data has completed, the end control event is published.
+### Resident mode: `scheduler_dispatch`
+
+This is the original resident runtime behavior, preserved as the default
+resident execution mode.
+
+It works like this:
+
+1. scheduler 0 handles `END_OF_TASK_GRAPH`, prepares the next batch, resets
+   predecessor counts, and enqueues `TASK_BEGIN_TASK_GRAPH`,
+2. `TASK_BEGIN_TASK_GRAPH` eventually causes the first ready `data_id`s from
+   `first_data_ids` to be launched,
+3. workers execute compatibility `TaskDesc`s from `all_tasks`,
+4. after a data task finishes, the worker publishes the completed `data_id`
+   into a scheduler-owned completion queue,
+5. the scheduler drains that completion queue, walks outgoing `data_edges`,
+   decrements successor predecessor counts, and maps newly ready `data_id`s
+   back to compatibility task ids through `data_to_task_id`,
+6. terminal data contributes to end-of-graph completion from the scheduler
+   side.
+
+This mode exists so the older resident runtime can still be run without
+restoring an old tree.
+
+### Resident mode: `hybrid_prelaunch`
+
+This is the faster resident execution feature added on top of the old resident
+path.
+
+It works like this:
+
+1. scheduler 0 handles `END_OF_TASK_GRAPH`, prepares the next batch, resets
+   per-data predecessor counts, and enqueues the `BEGIN_TASK_GRAPH` control
+   task for the next iteration,
+2. when `BEGIN_TASK_GRAPH` fires, the legacy compatibility task range is
+   prelaunched to workers exactly like the old event runtime,
+3. workers batch-load `TaskDesc` objects from `all_tasks` into shared memory,
+   again matching Mirage's original execution style,
+4. if a task is a control or compatibility-only task with no data mapping, it
+   follows the old event-based behavior,
+5. if a task has a `data_id` mapping and its dependency is local/non-NVSHMEM,
+   the worker ignores `dependent_event` for readiness and waits on
+   `data_pending_predecessor_counts[data_id] == 0`,
+6. if a task has a `data_id` mapping but its dependency is remote/NVSHMEM, the
+   worker keeps the old event wait path,
+7. after executing a local data task, the worker CTA itself walks outgoing
+   `data_edges` and decrements successor predecessor counts,
+8. terminal data items contribute to end-of-graph completion directly from the
+   worker path,
+9. schedulers are now only on the control path: iteration transitions,
+   control-event handling, and remote/NVSHMEM event launch behavior.
 
 ### Important consequence
 
@@ -463,8 +527,9 @@ resident/data DAG, while execution still uses Mirage's original batched
 In other words, the current architecture is:
 
 - resident/data DAG for correctness and fine-grained readiness,
-- legacy batched task execution for performance,
-- scheduler-owned dependency release for newly ready data.
+- legacy batched task execution as the common execution granule,
+- `scheduler_dispatch` as the preserved older resident runtime,
+- `hybrid_prelaunch` as the faster resident execution feature.
 
 That high-level design makes sense for Mirage because Mirage was already optimized around batched worker-side execution of prebuilt task descriptors.
 
@@ -612,11 +677,14 @@ what lets the resident runtime reuse the existing generated task bodies.
 This is the resident/data runtime implementation. It contains:
 
 - resident runtime initialization and teardown,
+- both resident execution modes,
+  - scheduler-owned completion-queue dispatch,
+  - hybrid prelaunch with worker-side local dependency release,
 - worker-side batched execution over compatibility `TaskDesc`s,
-- scheduler-owned completion queues,
-- `task_to_data_id` / `data_to_task_id` mapping logic,
-- successor release by walking `data_edges`,
-- end-of-graph detection using terminal data completion.
+- `task_to_data_id` mapping logic,
+- `data_to_task_id` mapping logic,
+- end-of-graph detection using terminal data completion,
+- kernel launch selection between the two resident execution strategies.
 
 ### `include/mirage/persistent_kernel/resident_tma.cuh`
 
@@ -634,9 +702,10 @@ This is the resident/data compiler and codegen path. It adds:
 
 - resident/data graph construction,
 - tensor-overlap-based producer/consumer refinement,
+- classification of local compute events versus remote/NVSHMEM events,
 - graph validation for predecessor counts / zero-indegree / cycle detection,
 - schema-v2 JSON emission and loading,
-- compatibility `task_to_data_id` / `data_to_task_id` mappings,
+- compatibility `task_to_data_id` mappings,
 - resident-path CUDA generation and wrappers.
 
 ### Mode-selection glue
@@ -770,7 +839,7 @@ This is the environment that was used for the live validation recorded below.
 
 ### Live single-GPU Hopper validation
 
-The current split implementation was revalidated on:
+The latest resident-mode layering was revalidated on:
 
 - `demo/qwen3/demo_30B_A3B_hopper.py`
 - single GPU
@@ -778,53 +847,69 @@ The current split implementation was revalidated on:
 - `--max-num-batched-requests 1`
 - `--max-seq-length 40`
 
-The important post-split artifacts are:
+The important latest artifacts are:
 
 - legacy path:
-  - `validation_mode_split_legacy/task_graph_rank0.json`
-  - `validation_mode_split_legacy/test_rank0.cu`
-  - `validation_mode_split_legacy.log`
-- resident/data path:
-  - `validation_mode_split_resident/task_graph_rank0.json`
-  - `validation_mode_split_resident/test_rank0.cu`
-  - `validation_mode_split_resident.log`
+  - `validation_resident_feature_modes/legacy_single/task_graph_rank0.json`
+  - `validation_resident_feature_modes/legacy_single/test_rank0.cu`
+  - `validation_resident_feature_modes/legacy_single/run.log`
+- resident default (`scheduler_dispatch`):
+  - `validation_resident_feature_modes/resident_scheduler_dispatch_single/task_graph_rank0.json`
+  - `validation_resident_feature_modes/resident_scheduler_dispatch_single/test_rank0.cu`
+  - `validation_resident_feature_modes/resident_scheduler_dispatch_single/run.log`
+- resident feature (`hybrid_prelaunch`):
+  - `validation_resident_feature_modes/resident_hybrid_prelaunch_single_v4/task_graph_rank0.json`
+  - `validation_resident_feature_modes/resident_hybrid_prelaunch_single_v4/test_rank0.cu`
+  - `validation_resident_feature_modes/resident_hybrid_prelaunch_single_v4/run.log`
 
-The split behaved as intended:
+The current layered setup behaved as intended:
 
-- legacy mode emits the old path:
-  - generated CUDA includes `persistent_kernel.cuh`
-  - generated JSON is legacy schema (`schema_version` absent, treated as v1)
-- resident mode emits the new path:
-  - generated CUDA includes `resident_persistent_kernel.cuh`
-  - generated JSON has `schema_version = 2`
-  - resident graph still has:
-    - `533` `resident_tasks`
-    - `21,331` `all_data`
-    - `128,641` `data_edges`
-    - `1` `first_data_ids`
+- legacy mode still emits the old event runtime
+- resident default emits schema v2 and keeps the old slower resident runtime
+- resident hybrid emits schema v2 and uses the faster hybrid-prelaunch runtime
 
-Both modes completed the live Hopper run end-to-end from the same checkout.
+The two resident graphs on this shape still emitted the same public resident
+graph structure:
+
+- `533` `resident_tasks`
+- `21,331` `all_data`
+- `128,641` `data_edges`
+- `1` `first_data_ids`
 
 Measured latencies on the same validation shape:
 
-- legacy/event path: `5.229 ms/token`
-- resident/data path: `81.990 ms/token`
+- legacy/event path: `5.225 ms/token`
+- resident/data `scheduler_dispatch`: `82.036 ms/token`
+- resident/data `hybrid_prelaunch`: `5.878 ms/token`
 
-So after the split:
+So after adding resident execution modes on top of the old resident runtime:
 
-- the coexistence requirement is satisfied,
-- the old runtime behavior is preserved in-place,
-- the resident/data runtime remains much slower than legacy on this workload.
+- the old resident behavior is preserved as the default resident execution mode,
+- the faster hybrid-prelaunch resident path is still available in the same
+  checkout,
+- legacy, resident-default, and resident-hybrid all completed the live Hopper
+  run end-to-end from the same tree.
+
+One practical consequence is compile time:
+
+- the resident generated CUDA is now larger because both resident execution
+  modes are compiled into the same resident runtime file,
+- the live `nvcc` step for resident mode is noticeably slower than it was when
+  only one resident runtime existed in the file.
 
 Important caveat:
 
-- these runs validated that both megakernels compile, launch, and return,
-- they did not validate that the generated text/tokens match a reference Hugging Face run or the old Mirage runtime,
-- semantic correctness of the actual model output still needs explicit checking.
+- these runs validated that all three live paths compile, launch, and return,
+- they validated that the visible decoded one-token output matched across
+  legacy, resident-default, and resident-hybrid on the tested prompt,
+- they did not redo the earlier larger-batch validation after layering the two
+  resident execution modes into one resident runtime file,
+- they did not validate multi-token semantic correctness exhaustively, and they
+  did not validate multi-GPU/NVSHMEM model outputs end-to-end.
 
 ### Compiler warning notes from the live run
 
-The v21 live run still emits `ptxas` warnings such as:
+The current live runs still emit `ptxas` warnings such as:
 
 - `C7520` about `wgmma.mma_async` serialization in `worker_kernel`
 - function-scope shared-memory dynamic-initialization warnings
@@ -833,71 +918,73 @@ These warnings also appear in the clean baseline run, so they are not sufficient
 
 ### Operational note
 
-At one point it was suspected that a stale GPU job was causing bad runs.
-
-Before the successful v21 rerun, `nvidia-smi` on `node-gpu02` showed:
-
-- `0 MiB` memory in use,
-- no running compute processes.
-
-That means the v21 measurement was taken on an idle GPU.
+The validation runs above were taken on an idle GPU from the active Slurm job
+used during this rewrite.
 
 ## Known limitations and current status
 
 This section is the handoff state as of March 12, 2026.
 
-### 1. Both paths now work end-to-end from one checkout
+### 1. All three execution paths now work end-to-end from one checkout
 
 The current implementation:
 
 - builds,
 - preserves the legacy event runtime in the original files,
 - keeps the resident/data runtime in separate files,
+- preserves the original resident scheduler-dispatch path as the default
+  resident execution mode,
+- adds the faster hybrid-prelaunch resident path as an opt-in feature mode,
 - generates both legacy and schema-v2 resident graphs,
 - compiles both generated megakernels,
-- runs both live Hopper MoE modes to completion from the same checkout.
+- runs all three live Hopper single-GPU modes to completion from the same
+  checkout.
 
-### 2. The system is still much slower than the original baseline
+### 2. Resident execution modes are now directly comparable
 
 Current live numbers on the same validation shape:
 
-- legacy/event path: `5.229 ms/token`
-- resident/data path: `81.990 ms/token`
+- legacy/event path: `5.225 ms/token`
+- resident/data `scheduler_dispatch`: `82.036 ms/token`
+- resident/data `hybrid_prelaunch`: `5.878 ms/token`
 
-So the residual problem is performance, not basic correctness.
+This is the key reason for keeping both resident execution modes:
 
-The best current hypothesis is that the remaining gap comes from explicit fine-grained dependency bookkeeping:
-
-- scheduler-side draining of completion queues,
-- `atomicSub` over `128,641` `data_edges` per iteration,
-- mapping every ready successor `data_id` back into a compatibility `TaskId`,
-- extra queue traffic compared with the old coarse event-release model.
+- `scheduler_dispatch` preserves the old resident runtime for direct A/B
+  comparisons,
+- `hybrid_prelaunch` preserves the faster resident design that removes the
+  scheduler-owned completion queue from the compute hot path.
 
 ### 3. Model-output correctness has not been validated yet
 
-The live Hopper run proves that the runtime now completes, but it does not prove that the returned tokens are semantically correct.
+The live Hopper runs prove more than they did earlier, but correctness is still
+not fully closed out.
+
+What has been checked:
+
+- the visible decoded one-token output matched across legacy,
+  resident-default, and resident-hybrid on the validated single-GPU prompt,
+- the earlier resident-only milestone had deeper checks against legacy/Hugging
+  Face, but those checks were not rerun after layering both resident execution
+  modes into one resident runtime file.
 
 What still needs to be checked:
 
-- compare generated token ids against a reference Hugging Face run,
-- compare generated token ids against the old Mirage runtime on the same prompt,
-- verify that intermediate debug output is not masking silent correctness bugs.
-
-Until that comparison is done, correctness should be treated as partially validated only at the "no crash / returns output" level.
+- deeper token-by-token comparison against Hugging Face for longer generations,
+- correctness on larger batches beyond the one-token visible output case,
+- correctness on multi-GPU/NVSHMEM paths.
 
 ### 4. Multi-GPU/NVSHMEM behavior has not been revalidated end-to-end
 
-Compatibility event fields were preserved in `DataDesc` because some task bodies still read them, but full cross-GPU validation has not yet been redone after the scheduler rewrite.
+Compatibility event fields are still preserved in `DataDesc`, and the resident
+runtime now forces the single-kernel path when multiple GPUs are visible so it
+does not rely on the known-bad split worker/scheduler launch for NVSHMEM.
 
-### 5. Some runtime fields are now transitional
+However, full cross-GPU validation has not been redone yet in this environment.
+The current Slurm allocation used for validation exposed only one GPU to the
+container, so there was no way to execute a real multi-GPU model run here.
 
-The current validated path no longer uses the original resident-local ready-data stack for compute dispatch.
-
-Some arrays are still present because they still help preserve compatibility.
-
-They can be removed once the current architecture is treated as final.
-
-### 6. Compatibility views are still intentionally present
+### 5. Compatibility views are still intentionally present
 
 `all_tasks` and `all_events` are still emitted and are still used by the fast worker path.
 
@@ -908,16 +995,22 @@ The current mental model should be:
 - resident/data graph is the canonical dependency graph,
 - compatibility tasks are the canonical execution granule.
 
-### 7. Recommended next steps for the next person
+### 6. Recommended next steps for the next person
 
 If someone picks this up from here, the highest-value next steps are:
 
-1. measure where the remaining `82 ms/token` is going inside the new scheduler path.
-2. focus on completion-queue drainage and successor-release cost, not on graph correctness.
-3. validate actual token/output correctness against a reference run before treating the implementation as fully correct.
-4. look for ways to coalesce or amortize dependency release for groups of edges that are reproducing the old coarse event behavior without reintroducing unnecessary barriers.
-5. remove transitional queue/debug fields only after the performance path is settled.
-6. rerun end-to-end validation on at least one non-MoE graph and on multi-GPU once the single-GPU path is fast enough.
+1. run a real multi-GPU/NVSHMEM validation once an allocation exposes more than
+   one GPU and a usable sharded model path is available.
+2. capture a profiling trace on a larger batched shape and confirm, from the
+   actual timeline, that downstream resident stages begin before all sibling
+   upstream slices finish.
+3. rerun the earlier larger-batch resident validation after the new
+   resident-mode layering so both resident execution modes are covered on more
+   than the `1 token / 1 request` shape.
+4. validate longer-generation token correctness against Hugging Face, not just
+   the current one-token visible-output check.
+5. rerun end-to-end validation on at least one non-MoE graph so the hybrid
+   prelaunch runtime is not only validated on this MoE workload.
 
 ## The conceptual difference in one example
 

@@ -19,6 +19,8 @@
 #include "mirage/transpiler/utils.h"
 #include "mirage/utils/json_utils.h"
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <queue>
 #include <stdexcept>
 #include <unordered_map>
@@ -175,13 +177,34 @@ bool tensors_overlap(TensorDesc const &lhs, TensorDesc const &rhs) {
          rhs_interval.begin < lhs_interval.end;
 }
 
+bool is_control_event(EventDesc const &event_desc) {
+  return event_desc.event_type == EVENT_TERMINATION ||
+         event_desc.event_type == EVENT_LAUNCH_DEPENDENT_TASKS ||
+         event_desc.event_type == EVENT_END_OF_TASK_GRAPH;
+}
+
+ResidentExecutionMode get_resident_execution_mode() {
+  char const *mode_env = std::getenv("MIRAGE_RESIDENT_EXECUTION_MODE");
+  if (mode_env == nullptr || std::strcmp(mode_env, "") == 0 ||
+      std::strcmp(mode_env, "scheduler_dispatch") == 0) {
+    return RESIDENT_EXECUTION_SCHEDULER_DISPATCH;
+  }
+  if (std::strcmp(mode_env, "hybrid_prelaunch") == 0) {
+    return RESIDENT_EXECUTION_HYBRID_PRELAUNCH;
+  }
+  throw std::runtime_error(
+      "Invalid MIRAGE_RESIDENT_EXECUTION_MODE. Expected "
+      "\"scheduler_dispatch\" or \"hybrid_prelaunch\".");
+}
+
 ResidentTaskGraph build_resident_task_graph(
     mirage::kernel::Graph const &graph,
     std::vector<FullTaskDesc> const &all_tasks,
     std::vector<EventDesc> const &all_events,
     std::map<kernel::KNOperator *,
              std::map<dim3, std::vector<TaskId>, Dim3Comparator>> const
-        &all_task_maps) {
+        &all_task_maps,
+    ResidentExecutionMode execution_mode) {
   ResidentTaskGraph result;
   result.task_to_data_id.assign(all_tasks.size(), DATA_INVALID_ID);
 
@@ -258,6 +281,11 @@ ResidentTaskGraph build_resident_task_graph(
   }
 
   for (size_t event_idx = 0; event_idx < all_events.size(); event_idx++) {
+    bool const hybrid_prelaunch =
+        execution_mode == RESIDENT_EXECUTION_HYBRID_PRELAUNCH;
+    if (hybrid_prelaunch && is_control_event(all_events[event_idx])) {
+      continue;
+    }
     auto producer_it = event_producers.find(static_cast<uint32_t>(event_idx));
     auto consumer_it = event_consumers.find(static_cast<uint32_t>(event_idx));
     if (producer_it == event_producers.end() || consumer_it == event_consumers.end()) {
@@ -265,6 +293,26 @@ ResidentTaskGraph build_resident_task_graph(
     }
     auto const &producer_tasks = producer_it->second;
     auto const &consumer_tasks = consumer_it->second;
+    if (hybrid_prelaunch) {
+      bool nvshmem_event = false;
+      for (TaskId producer_task_id : producer_tasks) {
+        if (is_nvshmem_event(all_tasks[producer_task_id].trigger_event)) {
+          nvshmem_event = true;
+          break;
+        }
+      }
+      if (!nvshmem_event) {
+        for (TaskId consumer_task_id : consumer_tasks) {
+          if (is_nvshmem_event(all_tasks[consumer_task_id].dependent_event)) {
+            nvshmem_event = true;
+            break;
+          }
+        }
+      }
+      if (nvshmem_event) {
+        continue;
+      }
+    }
     for (TaskId consumer_task_id : consumer_tasks) {
       std::unordered_set<TaskId> matched_producers;
       FullTaskDesc const &consumer_task = all_tasks[consumer_task_id];
@@ -886,12 +934,20 @@ TaskGraphResult print_task_graph(
     std::map<mirage::type::GuidType, IODesc> const &io_configs,
     bool use_json_format) {
   using mirage::runtime::IODesc;
+  ResidentExecutionMode resident_execution_mode =
+      get_resident_execution_mode();
   ResidentTaskGraph resident_graph =
-      build_resident_task_graph(graph, all_tasks, all_events, all_task_maps);
+      build_resident_task_graph(graph,
+                                all_tasks,
+                                all_events,
+                                all_task_maps,
+                                resident_execution_mode);
   validate_resident_task_graph(resident_graph);
   mirage::transpiler::CodeKeeper code;
   mirage::transpiler::CodeKeeper tgbody;
   tgbody.inc_indent();
+  code.e("#define MIRAGE_RESIDENT_EXECUTION_MODE_VALUE $",
+         static_cast<uint32_t>(resident_execution_mode));
   code.e("#include \"resident_persistent_kernel.cuh\"");
   if (use_json_format) {
     code.e("#include <nlohmann/json.hpp>");

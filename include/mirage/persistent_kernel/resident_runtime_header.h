@@ -26,6 +26,11 @@ typedef uint32_t DataId;
 constexpr ResidentTaskId RESIDENT_TASK_INVALID_ID = 0xFFFFFFFFu;
 constexpr DataId DATA_INVALID_ID = 0xFFFFFFFFu;
 
+enum ResidentExecutionMode : uint32_t {
+  RESIDENT_EXECUTION_SCHEDULER_DISPATCH = 0,
+  RESIDENT_EXECUTION_HYBRID_PRELAUNCH = 1,
+};
+
 using TaskMetadata = FullTaskDesc::TaskMetadata;
 
 struct ResidentTaskDesc {
@@ -241,6 +246,7 @@ static_assert(alignof(ResolvedTaskDesc) == alignof(TaskDesc),
               "ResolvedTaskDesc alignment must match TaskDesc.");
 
 struct ResidentRuntimeConfig : public RuntimeConfig {
+  uint32_t resident_execution_mode;
   int begin_event_index;
   int end_event_index;
   int num_resident_tasks;
