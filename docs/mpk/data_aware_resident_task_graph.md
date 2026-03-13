@@ -19,15 +19,7 @@ The goal of the change is simple:
 
 In short, the old model was "one runtime task object per logical partition". The new model is "one resident task object per operator family, plus many data objects that flow through it".
 
-## Important update: current code layout after the split
-
-The first resident/data implementation directly modified Mirage's shared MPK
-runtime files.
-
-That is no longer the current architecture.
-
-The codebase was later refactored so the old and new systems coexist in one
-checkout without sharing the same low-level runtime files.
+## Current code layout
 
 Current layout:
 
@@ -51,10 +43,7 @@ Selection is now above the runtime layer, not inside the old runtime:
 - `PersistentKernel` chooses between them using:
   - constructor arg `task_graph_mode="legacy_event" | "resident_data"`
   - or environment variable `MIRAGE_TASK_GRAPH_MODE`
-
-Any section below that talks about modifying the old shared runtime files
-should be read as historical context from the first implementation, not the
-final split architecture.
+  - default mode is `legacy_event`
 
 ## Quick background: what Mirage MPK is
 
@@ -72,14 +61,22 @@ The main user-facing entry point is `PersistentKernel` in Python. A model author
 
 Internally, the important pieces for this change are:
 
-- `src/kernel/runtime.cc`
-  This is where the task graph is built and where CUDA runtime code is generated.
-- `include/mirage/persistent_kernel/runtime_header.h`
-  This holds the core runtime descriptor types.
-- `include/mirage/persistent_kernel/persistent_kernel.cuh`
-  This contains the persistent-kernel runtime implementation: worker loops, scheduler loops, queue handling, initialization, and teardown.
-- `include/mirage/persistent_kernel/tma.cuh`
-  This builds host-side TMA descriptors for Hopper/Blackwell tasks.
+- legacy path:
+  - `src/kernel/runtime.cc`
+  - `include/mirage/persistent_kernel/runtime_header.h`
+  - `include/mirage/persistent_kernel/persistent_kernel.cuh`
+  - `include/mirage/persistent_kernel/tma.cuh`
+- resident/data path:
+  - `src/kernel/runtime_resident.cc`
+  - `include/mirage/persistent_kernel/resident_runtime_header.h`
+  - `include/mirage/persistent_kernel/resident_persistent_kernel.cuh`
+  - `include/mirage/persistent_kernel/resident_tma.cuh`
+- mode-selection glue:
+  - `include/mirage/kernel/graph.h`
+  - `python/mirage/_cython/CCore.pxd`
+  - `python/mirage/_cython/core.pyx`
+  - `python/mirage/kernel.py`
+  - `python/mirage/mpk/persistent_kernel.py`
 - `scripts/display_task_graph.py`
   Static task-graph visualization.
 - `scripts/display_task_graph_timeline.py`
@@ -243,7 +240,8 @@ The new graph construction still starts from the old flat task/event graph, beca
 
 The compiler then builds a second, data-aware view.
 
-This logic lives in `build_resident_task_graph(...)` in `src/kernel/runtime.cc`.
+This logic lives in `build_resident_task_graph(...)` in
+`src/kernel/runtime_resident.cc`.
 
 ### Step 1: create resident tasks
 
@@ -305,12 +303,18 @@ This compatibility view exists so older tooling can still open the graph while t
 
 Important detail:
 
-- the new runtime treats the resident/data structures as the canonical execution model,
-- `all_tasks` is now mainly a compatibility/debugging view.
+- the resident runtime treats the resident/data DAG as the canonical dependency
+  model,
+- but the current validated implementation still uses compatibility `all_tasks`
+  as the concrete worker execution granule.
 
 ## Runtime type changes
 
-The core runtime descriptor changes are in `include/mirage/persistent_kernel/runtime_header.h`.
+The core resident-runtime descriptor changes are in
+`include/mirage/persistent_kernel/resident_runtime_header.h`.
+
+The original `include/mirage/persistent_kernel/runtime_header.h` remains the
+legacy/event path header.
 
 ### New identifiers
 
@@ -358,7 +362,12 @@ That is a compatibility bridge, not a return to event-based compute scheduling.
 
 ## RuntimeConfig changes
 
-`RuntimeConfig` now owns resident-task/data scheduling state in addition to the legacy arrays.
+The resident path uses `ResidentRuntimeConfig`, defined in
+`include/mirage/persistent_kernel/resident_runtime_header.h`.
+
+`ResidentRuntimeConfig` extends the legacy `RuntimeConfig` with
+resident-task/data scheduling state rather than replacing the original runtime
+config from scratch.
 
 New important fields include:
 
@@ -390,7 +399,8 @@ New important fields include:
 - `completed_terminal_data_count`
 - `first_data_ids`
 
-The old arrays `all_tasks`, `all_events`, and `first_tasks` are still present for compatibility.
+The inherited legacy arrays `all_tasks`, `all_events`, and `first_tasks` are
+still present and are still used by the validated worker fast path.
 
 One subtle but important design choice is that the legacy `all_tasks` array is still the actual execution unit on the validated fast path.
 
@@ -401,13 +411,14 @@ That means:
 
 This is the key architectural compromise that brought the implementation back closer to Mirage's original fast path.
 
-The queue-related arrays (`resident_ready_data_head`, `data_ready_next`, `resident_active_workers`) are now transitional.
-
-The validated runtime path described below no longer depends on them for steady-state compute dispatch.
+Some queue-related arrays (`resident_ready_data_head`, `data_ready_next`,
+`resident_active_workers`) reflect earlier resident-task activation ideas.
+They are not the central mechanism on the currently validated fast path.
 
 ## Scheduler and worker behavior after the change
 
-The most important behavioral change is in `include/mirage/persistent_kernel/persistent_kernel.cuh`.
+The most important behavioral change is in
+`include/mirage/persistent_kernel/resident_persistent_kernel.cuh`.
 
 ### Old behavior
 
@@ -445,7 +456,9 @@ There is no need to wait for every sibling that used to share the same event.
 
 That is the main source of newly exposed overlap.
 
-The important implementation point is that this overlap is exposed by the resident/data DAG, while execution still uses Mirage's original batched `TaskDesc` worker path.
+The important implementation point is that this overlap is exposed by the
+resident/data DAG, while execution still uses Mirage's original batched
+`TaskDesc` worker path.
 
 In other words, the current architecture is:
 
@@ -461,7 +474,7 @@ Hopper/Blackwell tasks often need TMA descriptors that depend on the exact tenso
 
 That means TMA state belongs with the data object, not with the resident task.
 
-To support this, `include/mirage/persistent_kernel/tma.cuh` now includes:
+To support this, `include/mirage/persistent_kernel/resident_tma.cuh` includes:
 
 - `create_tma_desc_by_data(ResidentTaskDesc const&, FullDataDesc&)`
 
@@ -477,7 +490,8 @@ This avoided rewriting all existing TMA creation logic.
 
 ## Generated CUDA code changes
 
-The CUDA code generator in `src/kernel/runtime.cc` was updated in several ways.
+The resident CUDA code generator in `src/kernel/runtime_resident.cc` was
+updated in several ways.
 
 ### New JSON loader
 
@@ -511,7 +525,7 @@ The primary one is the old fast-path shape:
 
 ```cpp
 void _execute_task(TaskDesc const* task_desc,
-                   RuntimeConfig const &runtime_config)
+                   ResidentRuntimeConfig const &runtime_config)
 ```
 
 This is what the worker loop uses after batching `TaskDesc`s out of `all_tasks`.
@@ -521,7 +535,7 @@ The compatibility wrapper for resident/data resolution is:
 ```cpp
 void _execute_task(ResidentTaskDesc const* resident_task_desc,
                    DataDesc const* data_desc,
-                   RuntimeConfig const &runtime_config)
+                   ResidentRuntimeConfig const &runtime_config)
 ```
 
 Inside, it resolves those two descriptors into a `TaskDesc`-compatible view and then forwards to the primary `TaskDesc`-based dispatcher.
@@ -567,53 +581,74 @@ Without that change, the analytical model would keep interpreting the new graph 
 
 ## Files changed and why
 
-### `include/mirage/persistent_kernel/runtime_header.h`
+### Legacy runtime files
 
-Added:
+- `include/mirage/persistent_kernel/runtime_header.h`
+- `include/mirage/persistent_kernel/persistent_kernel.cuh`
+- `include/mirage/persistent_kernel/tma.cuh`
+- `src/kernel/runtime.cc`
+
+These remain the old event-based MPK runtime. The point of the split was to
+keep this path available for direct comparison and to avoid mixing the legacy
+and resident implementations in the same low-level files.
+
+### `include/mirage/persistent_kernel/resident_runtime_header.h`
+
+This is the resident/data type-system change. It defines:
 
 - resident task/data IDs,
-- resident/data descriptors,
-- resolved descriptor,
-- new runtime arrays and counters for data-aware scheduling,
-- explicit task/data mapping arrays,
-- scheduler-owned completion-queue metadata.
+- `ResidentTaskDesc`,
+- `FullDataDesc`,
+- `DataDesc`,
+- `DataEdgeDesc`,
+- `ResolvedTaskDesc`,
+- `ResidentRuntimeConfig`.
 
-This is the core type-system change.
+It also keeps `ResolvedTaskDesc` layout-compatible with `TaskDesc`, which is
+what lets the resident runtime reuse the existing generated task bodies.
 
-### `include/mirage/persistent_kernel/persistent_kernel.cuh`
+### `include/mirage/persistent_kernel/resident_persistent_kernel.cuh`
 
-Changed:
+This is the resident/data runtime implementation. It contains:
 
-- worker execution loop,
-- scheduler execution loop,
-- task/data mapping logic,
-- completion-queue handling,
-- scheduler-owned successor release,
-- runtime initialization and teardown for the new arrays.
+- resident runtime initialization and teardown,
+- worker-side batched execution over compatibility `TaskDesc`s,
+- scheduler-owned completion queues,
+- `task_to_data_id` / `data_to_task_id` mapping logic,
+- successor release by walking `data_edges`,
+- end-of-graph detection using terminal data completion.
 
-This is the core runtime behavior change.
+### `include/mirage/persistent_kernel/resident_tma.cuh`
 
-### `include/mirage/persistent_kernel/tma.cuh`
+This adds the resident-path TMA bridge:
 
-Added:
+- host helpers that build per-data TMA descriptors from resident static state
+  plus data-local tensor slices.
 
-- host helper to create per-data TMA descriptors.
+This is what allows TMA state to follow the data object without rewriting all
+legacy TMA creation logic.
 
-This is the bridge that makes data-local TMA slices work without rewriting all existing TMA code.
+### `src/kernel/runtime_resident.cc`
 
-### `src/kernel/runtime.cc`
-
-Added/changed:
+This is the resident/data compiler and codegen path. It adds:
 
 - resident/data graph construction,
 - tensor-overlap-based producer/consumer refinement,
 - graph validation for predecessor counts / zero-indegree / cycle detection,
-- schema v2 JSON emission,
-- schema v2 JSON loading,
-- task/data compatibility mapping,
-- primary `TaskDesc` execution wrapper plus resident/data forwarding wrapper.
+- schema-v2 JSON emission and loading,
+- compatibility `task_to_data_id` / `data_to_task_id` mappings,
+- resident-path CUDA generation and wrappers.
 
-This is the core compiler/codegen change.
+### Mode-selection glue
+
+- `include/mirage/kernel/graph.h`
+- `python/mirage/_cython/CCore.pxd`
+- `python/mirage/_cython/core.pyx`
+- `python/mirage/kernel.py`
+- `python/mirage/mpk/persistent_kernel.py`
+
+These files expose both generation entry points and let Python select
+`legacy_event` or `resident_data` without needing separate checkouts.
 
 ### `scripts/display_task_graph.py`
 
@@ -644,7 +679,8 @@ This passed.
 
 ### Graph validation
 
-`validate_resident_task_graph(...)` was added on the generator side in `src/kernel/runtime.cc`.
+`validate_resident_task_graph(...)` was added on the generator side in
+`src/kernel/runtime_resident.cc`.
 
 It throws if the resident/data graph contains:
 
