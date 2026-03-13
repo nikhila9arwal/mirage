@@ -505,7 +505,23 @@ def build_group_models(tasks: List[dict],
     for row in locality_rows:
         incoming_locality[row["succ_gid"]].append(row)
 
-    max_fan_in = max((event.get("num_triggers", 0) for event in events), default=1)
+    max_fan_in = max(
+        (
+            (
+                int(group.get("fan_in", 0))
+                if int(group.get("fan_in", 0)) > 0
+                else int(
+                    events[int(group.get("dep_event", -1))].get(
+                        "num_triggers", 0
+                    )
+                )
+                if 0 <= int(group.get("dep_event", -1)) < len(events)
+                else 0
+            )
+            for group in dag_groups
+        ),
+        default=1,
+    )
     group_models: Dict[object, dict] = {}
     for group in dag_groups:
         gid = group["group_id"]
@@ -515,9 +531,9 @@ def build_group_models(tasks: List[dict],
         base_duration = float(trace_group["avg_dur"]) if trace_group else float(type_median.get(task_type, global_median))
         duration_cv = float(trace_group.get("duration_cv", 0.0)) if trace_group else float(type_cv.get(task_type, 0.0))
         observed_queue_wait = float(trace_group["queue_wait"]) if trace_group else float(type_qwait.get(task_type, 0.0))
-        fan_in = 0
         dep_event = int(group["dep_event"])
-        if 0 <= dep_event < len(events):
+        fan_in = int(group.get("fan_in", 0))
+        if fan_in <= 0 and 0 <= dep_event < len(events):
             fan_in = int(events[dep_event].get("num_triggers", 0))
         locality_score = max(
             (row["effective_reuse"] for row in incoming_locality.get(gid, [])),

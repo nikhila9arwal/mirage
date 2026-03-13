@@ -114,6 +114,7 @@ PyMODINIT_FUNC PyInit___mirage_launcher(void) {
 """
 
 valid_persistent_kernel_modes = {"offline", "online", "online_notoken", "onepass", "online_multi_turn"}
+valid_task_graph_modes = {"legacy_event", "resident_data"}
 
 def get_compile_command(
     mpk,
@@ -264,13 +265,19 @@ class PersistentKernel:
         trace_name: str,
         spec_decode_config: SpecDecodeConfig,
         use_cutlass_kernel: bool,
+        task_graph_mode: Optional[str] = None,
         eos_token_id: int64 = -1,
     ):
         self.__finalized__ = False
         self._is_compiled = False
         if mode not in valid_persistent_kernel_modes:
             raise ValueError(f"Invalid persistent kernel mode: {mode}")
+        if task_graph_mode is None:
+            task_graph_mode = os.environ.get("MIRAGE_TASK_GRAPH_MODE", "legacy_event")
+        if task_graph_mode not in valid_task_graph_modes:
+            raise ValueError(f"Invalid task graph mode: {task_graph_mode}")
         self.mode = mode
+        self.task_graph_mode = task_graph_mode
         self.world_size = world_size
         self.mpi_rank = mpi_rank
         self.num_workers = num_workers
@@ -323,6 +330,15 @@ class PersistentKernel:
         assert paged_kv_indptr_buffer.dtype == torch.int32, f"paged_kv_indptr_buffer.dtype: {paged_kv_indptr_buffer.dtype}"
         assert paged_kv_indices_buffer.dtype == torch.int32, f"paged_kv_indices_buffer.dtype: {paged_kv_indices_buffer.dtype}"
         assert paged_kv_last_page_len_buffer.dtype == torch.int32, f"paged_kv_last_page_len_buffer.dtype: {paged_kv_last_page_len_buffer.dtype}"
+
+    def generate_task_graph(self):
+        if self.task_graph_mode == "resident_data":
+            return self.kn_graph.generate_resident_task_graph(
+                num_gpus=self.world_size, my_gpu_id=self.mpi_rank
+            )
+        return self.kn_graph.generate_task_graph(
+            num_gpus=self.world_size, my_gpu_id=self.mpi_rank
+        )
 
     def attach_input(self, torch_tensor: torch.Tensor, name: str = None) -> DTensor:
         dims = tuple([d for d in torch_tensor.shape])
@@ -1332,7 +1348,7 @@ class PersistentKernel:
             tempdir_obj = tempfile.TemporaryDirectory()
             tempdir = tempdir_obj.name
         os.makedirs(tempdir, exist_ok=True)
-        results = self.kn_graph.generate_task_graph(num_gpus=self.world_size, my_gpu_id=self.mpi_rank)
+        results = self.generate_task_graph()
 
         cuda_code_path = os.path.join(tempdir, "test.cu")
         so_path = os.path.join(tempdir, "test.cpython-38-x86_64-linux-gnu.so")

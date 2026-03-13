@@ -801,7 +801,7 @@ def build_mirage_graph(model, args, world_size, rank, input_data, eos_token_id_f
         )
     
     # Generate task graph and compile
-    results = mpk.kn_graph.generate_task_graph(num_gpus=world_size, my_gpu_id=rank)
+    results = mpk.generate_task_graph()
     with open(f"task_graph_{rank}.json", "w") as f:
         f.write(results["json_file"])
     with open(f"kernel_{rank}.cu", "w") as f:

@@ -396,7 +396,7 @@ class MPK:
         print("Generating task graph...")
         if not self.is_built:
             raise ValueError("Model is not built yet")
-        results = self.persistent_kernel.kn_graph.generate_task_graph(num_gpus=self.world_size, my_gpu_id=self.rank)
+        results = self.persistent_kernel.generate_task_graph()
         print("Generating task graph... done")
         self.task_graph_generated = True
         return results

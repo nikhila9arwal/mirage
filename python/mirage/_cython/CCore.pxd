@@ -251,6 +251,7 @@ cdef extern from "mirage/kernel/graph.h" namespace "mirage::kernel":
         void register_task(const char *task_type,
                            vector[int] params)
         TaskGraphResult generate_task_graph(int num_gpus, int my_gpu_id)
+        TaskGraphResult generate_resident_task_graph(int num_gpus, int my_gpu_id)
 
         vector[CppKNOperator*] operators
 

@@ -798,3 +798,6 @@ class KNGraph:
 
     def generate_task_graph(self, num_gpus: int, my_gpu_id: int):
         return self.cygraph.generate_task_graph(num_gpus, my_gpu_id)
+
+    def generate_resident_task_graph(self, num_gpus: int, my_gpu_id: int):
+        return self.cygraph.generate_resident_task_graph(num_gpus, my_gpu_id)

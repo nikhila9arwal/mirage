@@ -376,7 +376,7 @@ if __name__ == "__main__":
 
             
 
-        results = mpk.kn_graph.generate_task_graph(num_gpus=world_size, my_gpu_id=rank)
+        results = mpk.generate_task_graph()
         with open(f"task_graph_{rank}.json", "w") as f:
             f.write(results["json_file"])
         with open(f"kernel_{rank}.cu", "w") as f:
