@@ -9,7 +9,7 @@ from statistics import mean, median, pstdev
 from typing import Dict, Iterable, List, Optional, Tuple
 
 
-_TRACE_NAME_RE = re.compile(r"^(.+)_(\d+)$")
+_TRACE_NAME_RE = re.compile(r"^(.+)_(\d+)(?:_d(\d+))?$")
 
 _DATA_TYPE_SIZES = {
     930: 1,
@@ -36,11 +36,12 @@ _RESOURCE_VECTORS = {
 _LOCALITY_FALLBACK_THRESHOLD = 0.02
 
 
-def parse_trace_name(name: str) -> Tuple[str, int]:
+def parse_trace_name(name: str) -> Tuple[str, int, int]:
     match = _TRACE_NAME_RE.match(name)
     if match is None:
-        return name, 0
-    return match.group(1), int(match.group(2))
+        return name, 0, -1
+    data_id = match.group(3)
+    return match.group(1), int(match.group(2)), int(data_id) if data_id else -1
 
 
 def short_name(name: str) -> str:
@@ -225,7 +226,7 @@ def build_trace_groups(slices: List[Tuple[str, int, int, int]],
     scheduler_set = set(scheduler_types)
     grouped: Dict[str, List[dict]] = defaultdict(list)
     for name, ts, dur, track_id in slices:
-        task_type, _ = parse_trace_name(name)
+        task_type, event_no, _ = parse_trace_name(name)
         if task_type in scheduler_set:
             continue
         track_name = track_names.get(track_id, f"track_{track_id}")
@@ -233,7 +234,8 @@ def build_trace_groups(slices: List[Tuple[str, int, int, int]],
         if block_match is None:
             continue
         block_id = int(block_match.group(1))
-        grouped[name].append({
+        stage_name = f"{task_type}_{event_no}"
+        grouped[stage_name].append({
             "block": block_id,
             "start": ts - global_start,
             "end": ts + dur - global_start,
@@ -242,7 +244,7 @@ def build_trace_groups(slices: List[Tuple[str, int, int, int]],
 
     trace_groups: Dict[str, dict] = {}
     for name, records in grouped.items():
-        task_type, event_no = parse_trace_name(name)
+        task_type, event_no, _ = parse_trace_name(name)
         records.sort(key=lambda item: (item["start"], item["block"]))
         ready = group_deps.get(name, {}).get("rt", 0)
         durations = [record["dur"] for record in records]

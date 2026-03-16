@@ -275,7 +275,7 @@ class MPK:
         
         if args.profiling:
             self.profiler_tensor = torch.zeros(
-                3000 * 128, dtype=torch.uint64, device="cuda"
+                20000 * 128, dtype=torch.uint64, device="cuda"
             ).contiguous()
         else:
             self.profiler_tensor = None

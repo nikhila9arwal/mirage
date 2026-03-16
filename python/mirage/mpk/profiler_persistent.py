@@ -3,7 +3,7 @@ import csv
 import json
 from collections import namedtuple
 from enum import Enum
-from typing import List
+from typing import List, Optional
 
 import torch
 from tg4perfetto import TraceGenerator
@@ -72,6 +72,7 @@ class EventType(Enum):
     kBegin = 0
     kEnd = 1
     kInstant = 2
+    kMetadata = 3
 
 
 def decode_tag(tag, num_blocks, num_groups):
@@ -88,6 +89,13 @@ def decode_tag(tag, num_blocks, num_groups):
     )
 
 
+def _format_event_name(task_name: str, event_no: int, data_id: Optional[int]) -> str:
+    name = f"{task_name}_{event_no}"
+    if data_id is not None and data_id >= 0:
+        name += f"_d{data_id}"
+    return name
+
+
 def export_to_perfetto_trace(
     profiler_buffer: torch.Tensor,
     file_name: str,
@@ -102,6 +110,7 @@ def export_to_perfetto_trace(
 
     tid_map = {}
     track_map = {}
+    open_events = {}
     for block_idx in range(num_blocks):
         pid = tgen.create_group(f"block_{block_idx}")
         for group_idx in range(num_groups):
@@ -119,20 +128,37 @@ def export_to_perfetto_trace(
             tag, num_blocks, num_groups
         )
 
-        event = event_name_list[event_idx] + f"_{event_no}"
         tid = tid_map[(block_idx, group_idx)]
-
-        if (block_idx, group_idx, event_idx) in track_map:
-            track = track_map[(block_idx, group_idx, event_idx)]
+        track_key = (block_idx, group_idx, event_idx)
+        if track_key in track_map:
+            track = track_map[track_key]
         else:
             track = tid.create_track()
-            track_map[(block_idx, group_idx, event_idx)] = track
+            track_map[track_key] = track
+        event_name = event_name_list.get(event_idx, f"TASK_{event_idx}")
 
         if event_type == EventType.kBegin.value:
-            track.open(timestamp, event)
+            open_events[track_key] = {
+                "task_name": event_name,
+                "event_no": event_no,
+                "start_timestamp": timestamp,
+                "data_id": None,
+            }
         elif event_type == EventType.kEnd.value:
+            open_event = open_events.pop(track_key, None)
+            if open_event is None or open_event["event_no"] != event_no:
+                continue
+            event = _format_event_name(
+                open_event["task_name"], event_no, open_event["data_id"]
+            )
+            track.open(open_event["start_timestamp"], event)
             track.close(timestamp)
         elif event_type == EventType.kInstant.value:
-            track.instant(timestamp, event)
+            track.instant(timestamp, _format_event_name(event_name, event_no, None))
+        elif event_type == EventType.kMetadata.value:
+            open_event = open_events.get(track_key)
+            if open_event is None or open_event["event_no"] != event_no:
+                continue
+            open_event["data_id"] = timestamp
 
     tgen.flush()

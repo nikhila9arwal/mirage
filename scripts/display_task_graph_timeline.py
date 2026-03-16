@@ -13,7 +13,7 @@ import json
 import os
 import re
 from collections import defaultdict, Counter
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from whatif_model import (
     analyze_bubbles,
@@ -342,18 +342,31 @@ def parse_perfetto_trace(path: str):
     return slices, track_names
 
 
-def _parse_trace_name(name: str) -> Tuple[str, int]:
-    """Split a Perfetto slice name into (task_type_string, event_no).
+def _parse_trace_name(name: str) -> Tuple[str, int, int]:
+    """Split a Perfetto slice name into (task_type_string, event_no, data_id).
 
-    Example: 'TASK_RMS_NORM_HOPPER_42' -> ('TASK_RMS_NORM_HOPPER', 42)
+    Examples:
+      - 'TASK_RMS_NORM_HOPPER_42' -> ('TASK_RMS_NORM_HOPPER', 42, -1)
+      - 'TASK_RMS_NORM_HOPPER_42_d1307' -> ('TASK_RMS_NORM_HOPPER', 42, 1307)
 
     The trailing integer is the DAG-stable profiler_group_id emitted by the
-    persistent kernel.
+    persistent kernel. Resident traces may also include a ``data_id`` suffix.
     """
+    m = re.match(r"^(.+)_(\d+)_d(\d+)$", name)
+    if m:
+        return m.group(1), int(m.group(2)), int(m.group(3))
     m = re.match(r"^(.+)_(\d+)$", name)
     if m:
-        return m.group(1), int(m.group(2))
-    return name, 0
+        return m.group(1), int(m.group(2)), -1
+    return name, 0, -1
+
+
+def _stage_trace_name(task_type: str, event_no: int) -> str:
+    return f"{task_type}_{event_no}"
+
+
+def _data_trace_name(task_type: str, event_no: int, data_id: int) -> str:
+    return f"{task_type}_{event_no}_d{data_id}"
 
 
 # ---------------------------------------------------------------------------
@@ -500,6 +513,90 @@ def build_dependency_dag(graph_data):
     return dag_groups, dict(adjacency), dict(reverse_adj)
 
 
+def build_data_dependency_dag(graph_data):
+    """Build the per-data dependency DAG for schema-v2 resident graphs."""
+    if graph_data["schema_version"] < 2 or not graph_data["resident_tasks"]:
+        return [], {}, {}
+
+    resident_tasks = graph_data["resident_tasks"]
+    all_data = graph_data["all_data"]
+    data_edges = graph_data["data_edges"]
+
+    data_nodes = []
+    for data_id, data_desc in enumerate(all_data):
+        resident_task_id = int(data_desc["resident_task_id"])
+        resident_task = resident_tasks[resident_task_id]
+        task_type = resident_task["task_type"]
+        profiler_group_id = resident_task.get("profiler_group_id")
+        if profiler_group_id is None or int(profiler_group_id) == INVALID_PROFILER_GROUP_ID:
+            raise ValueError(
+                "Resident task graph is missing profiler_group_id for "
+                f"resident_task_id={resident_task_id}"
+            )
+        trace_event_no = int(profiler_group_id)
+        task_type_name = _TRACE_NAME_MAP.get(task_type, f"TASK_{task_type}")
+        data_nodes.append({
+            "data_id": data_id,
+            "resident_task_id": resident_task_id,
+            "task_type": task_type,
+            "task_type_name": task_type_name,
+            "trace_event_no": trace_event_no,
+            "trace_name": _data_trace_name(task_type_name, trace_event_no, data_id),
+            "initial_predecessor_count": int(
+                data_desc.get("initial_predecessor_count", 0)
+            ),
+        })
+
+    adjacency_sets: Dict[int, set] = defaultdict(set)
+    reverse_sets: Dict[int, set] = defaultdict(set)
+    for edge in data_edges:
+        src_data = int(edge["src_data_id"])
+        dst_data = int(edge["dst_data_id"])
+        if src_data == dst_data:
+            continue
+        adjacency_sets[src_data].add(dst_data)
+        reverse_sets[dst_data].add(src_data)
+
+    adjacency = {gid: sorted(succs) for gid, succs in adjacency_sets.items()}
+    reverse_adj = {gid: sorted(preds) for gid, preds in reverse_sets.items()}
+    return data_nodes, adjacency, reverse_adj
+
+
+def filter_trace_slices_to_graph(slices, dag_groups, data_nodes):
+    """Keep only trace slices that correspond to graph-backed stage/data nodes."""
+    allowed_stage_keys = {
+        (group["task_type_name"], int(group["trace_event_no"])) for group in dag_groups
+    }
+    allowed_data_keys = {
+        (
+            node["task_type_name"],
+            int(node["trace_event_no"]),
+            int(node["data_id"]),
+        )
+        for node in data_nodes
+    }
+
+    filtered = []
+    dropped = 0
+    for slice_entry in slices:
+        name, ts, dur, track_id = slice_entry
+        task_type_name, event_no, data_id = _parse_trace_name(name)
+        if task_type_name in SCHEDULER_TYPES:
+            filtered.append(slice_entry)
+            continue
+        if data_id >= 0:
+            if (task_type_name, event_no, data_id) in allowed_data_keys:
+                filtered.append(slice_entry)
+            else:
+                dropped += 1
+            continue
+        if (task_type_name, event_no) in allowed_stage_keys:
+            filtered.append(slice_entry)
+        else:
+            dropped += 1
+    return filtered, dropped
+
+
 def _topo_sort(dag_groups, adjacency):
     """Return group-ids in topological order."""
     in_deg: Dict[int, int] = defaultdict(int)
@@ -543,7 +640,7 @@ def map_trace_to_graph(slices, dag_groups, adjacency, reverse_adj, global_start)
     # avg_dur is the mean per-block task duration (not wall span).
     trace_agg: Dict[Tuple[str, int], list] = defaultdict(list)
     for name, ts, dur, track_id in slices:
-        tts, eno = _parse_trace_name(name)
+        tts, eno, _ = _parse_trace_name(name)
         if tts in SCHEDULER_TYPES:
             continue
         trace_agg[(tts, eno)].append((ts, dur, track_id))
@@ -655,6 +752,297 @@ def map_trace_to_graph(slices, dag_groups, adjacency, reverse_adj, global_start)
     return group_deps, group_timing, dag_to_trace
 
 
+def map_data_trace_to_graph(slices, data_nodes, adjacency, reverse_adj, global_start):
+    """Map data-aware trace slices onto the schema-v2 per-data DAG."""
+    if not data_nodes:
+        return {}, {}, {}
+
+    trace_agg: Dict[Tuple[str, int, int], list] = defaultdict(list)
+    for name, ts, dur, track_id in slices:
+        task_type_name, event_no, data_id = _parse_trace_name(name)
+        if task_type_name in SCHEDULER_TYPES or data_id < 0:
+            continue
+        trace_agg[(task_type_name, event_no, data_id)].append((ts, dur, track_id))
+
+    if not trace_agg:
+        return {}, {}, {}
+
+    trace_timing: Dict[Tuple[str, int, int], dict] = {}
+    for trace_key, records in trace_agg.items():
+        min_start = min(r[0] for r in records)
+        max_end = max(r[0] + r[1] for r in records)
+        durs = [r[1] for r in records]
+        trace_timing[trace_key] = {
+            "min_start": min_start,
+            "max_end": max_end,
+            "avg_dur": sum(durs) / len(durs),
+        }
+
+    exact_trace_to_data: Dict[Tuple[str, int, int], int] = {}
+    for node in data_nodes:
+        exact_trace_to_data[(
+            node["task_type_name"],
+            node["trace_event_no"],
+            node["data_id"],
+        )] = node["data_id"]
+
+    unknown_trace_keys = sorted(k for k in trace_timing if k not in exact_trace_to_data)
+    if unknown_trace_keys:
+        preview = ", ".join(
+            _data_trace_name(task_type, event_no, data_id)
+            for task_type, event_no, data_id in unknown_trace_keys[:10]
+        )
+        raise ValueError(
+            "Trace contains data-aware task instances absent from the DAG mapping: "
+            f"{preview}"
+        )
+
+    trace_to_data: Dict[Tuple[str, int, int], int] = {
+        trace_key: exact_trace_to_data[trace_key] for trace_key in trace_timing
+    }
+    data_to_trace: Dict[int, Tuple[str, int, int]] = {
+        data_id: trace_key for trace_key, data_id in trace_to_data.items()
+    }
+
+    data_timing: Dict[int, dict] = {}
+    for trace_key, data_id in trace_to_data.items():
+        timing = trace_timing[trace_key]
+        data_timing[data_id] = {
+            "start_time": timing["min_start"],
+            "end_time": timing["max_end"],
+            "avg_dur": timing["avg_dur"],
+        }
+
+    for data_id, timing in data_timing.items():
+        preds = reverse_adj.get(data_id, [])
+        pred_ends = [
+            data_timing[pred_id]["end_time"]
+            for pred_id in preds
+            if pred_id in data_timing
+        ]
+        timing["ready_time"] = max(pred_ends) if pred_ends else timing["start_time"]
+
+    data_deps: Dict[str, dict] = {}
+    for data_id, trace_key in data_to_trace.items():
+        task_type_name, event_no, _ = trace_key
+        trace_name = _data_trace_name(task_type_name, event_no, data_id)
+        timing = data_timing[data_id]
+        pred_names = [
+            _data_trace_name(data_to_trace[pred_id][0], data_to_trace[pred_id][1], pred_id)
+            for pred_id in reverse_adj.get(data_id, [])
+            if pred_id in data_to_trace
+        ]
+        succ_names = [
+            _data_trace_name(data_to_trace[succ_id][0], data_to_trace[succ_id][1], succ_id)
+            for succ_id in adjacency.get(data_id, [])
+            if succ_id in data_to_trace
+        ]
+        data_deps[trace_name] = {
+            "p": pred_names,
+            "s": succ_names,
+            "rt": timing["ready_time"] - global_start,
+            "ad": timing["avg_dur"],
+            "gs": timing["start_time"] - global_start,
+            "ge": timing["end_time"] - global_start,
+            "data_id": data_id,
+            "resident_task_id": data_nodes[data_id]["resident_task_id"],
+        }
+
+    return data_deps, data_timing, data_to_trace
+
+
+def build_data_overlap_rows(data_nodes, data_timing, stage_order, global_start):
+    if not data_timing:
+        return []
+
+    rows_by_group: Dict[int, list] = defaultdict(list)
+    row_meta: Dict[int, dict] = {}
+    for data_id, timing in data_timing.items():
+        node = data_nodes[data_id]
+        group_id = int(node["trace_event_no"])
+        row_meta[group_id] = {
+            "task_type_name": node["task_type_name"],
+            "trace_event_no": group_id,
+        }
+        rows_by_group[group_id].append({
+            "start": timing["start_time"] - global_start,
+            "end": timing["end_time"] - global_start,
+            "name": node["trace_name"],
+            "blocks": 1,
+            "avg_dur": timing["end_time"] - timing["start_time"],
+            "color": _color_for(node["task_type_name"]),
+        })
+
+    order_lookup = {group_id: idx for idx, group_id in enumerate(stage_order)}
+    ordered_group_ids = sorted(
+        rows_by_group,
+        key=lambda group_id: (
+            order_lookup.get(group_id, len(order_lookup)),
+            rows_by_group[group_id][0]["start"],
+            group_id,
+        ),
+    )
+
+    rows = []
+    for group_id in ordered_group_ids:
+        bars = sorted(rows_by_group[group_id], key=lambda bar: (bar["start"], bar["name"]))
+        meta = row_meta[group_id]
+        rows.append({
+            "label": f"{_short(meta['task_type_name'])}_{group_id} ({len(bars)} data)",
+            "bars": bars,
+        })
+    return rows
+
+
+def compute_data_schedule_metrics(data_nodes,
+                                  data_timing,
+                                  adjacency,
+                                  reverse_adj,
+                                  group_timing):
+    if not data_timing:
+        return None
+
+    data_metrics = []
+    longest: Dict[int, float] = {}
+    pred_on_path: Dict[int, Optional[int]] = {}
+
+    def dp(data_id: int) -> float:
+        if data_id in longest:
+            return longest[data_id]
+        timing = data_timing.get(data_id)
+        if not timing:
+            longest[data_id] = 0.0
+            pred_on_path[data_id] = None
+            return 0.0
+        dur = timing["end_time"] - timing["start_time"]
+        best_pred = None
+        best_val = 0.0
+        for pred_id in reverse_adj.get(data_id, []):
+            pred_val = dp(pred_id)
+            if pred_val > best_val:
+                best_val = pred_val
+                best_pred = pred_id
+        longest[data_id] = best_val + dur
+        pred_on_path[data_id] = best_pred
+        return longest[data_id]
+
+    for data_id in data_timing:
+        dp(data_id)
+        timing = data_timing[data_id]
+        queue_wait = max(0, timing["start_time"] - timing["ready_time"])
+        data_metrics.append({
+            "name": data_nodes[data_id]["trace_name"],
+            "trace_key": data_nodes[data_id]["trace_name"],
+            "data_id": data_id,
+            "queue_wait_us": round(queue_wait / 1e3, 1),
+            "dur_us": round((timing["end_time"] - timing["start_time"]) / 1e3, 1),
+            "resident_task_id": data_nodes[data_id]["resident_task_id"],
+        })
+
+    critical_path = []
+    if longest:
+        end_data_id = max(longest, key=longest.get)
+        current = end_data_id
+        while current is not None:
+            timing = data_timing[current]
+            critical_path.append({
+                "name": data_nodes[current]["trace_name"],
+                "dur_us": round((timing["end_time"] - timing["start_time"]) / 1e3, 1),
+            })
+            current = pred_on_path.get(current)
+        critical_path.reverse()
+
+    overlap_stats: Dict[Tuple[int, int], dict] = {}
+    for src_data_id, succ_ids in adjacency.items():
+        src_node = data_nodes[src_data_id]
+        pred_group_id = int(src_node["trace_event_no"])
+        pred_stage = group_timing.get(pred_group_id)
+        if pred_stage is None:
+            continue
+        pred_stage_end = pred_stage["end_time"]
+        for dst_data_id in succ_ids:
+            if dst_data_id not in data_timing:
+                continue
+            dst_node = data_nodes[dst_data_id]
+            succ_group_id = int(dst_node["trace_event_no"])
+            if pred_group_id == succ_group_id:
+                continue
+            stat = overlap_stats.setdefault(
+                (pred_group_id, succ_group_id),
+                {
+                    "pred_name": _stage_trace_name(
+                        src_node["task_type_name"], pred_group_id
+                    ),
+                    "succ_name": _stage_trace_name(
+                        dst_node["task_type_name"], succ_group_id
+                    ),
+                    "succ_ids": set(),
+                    "overlap_ids": set(),
+                    "lead_us": [],
+                },
+            )
+            stat["succ_ids"].add(dst_data_id)
+            succ_start = data_timing[dst_data_id]["start_time"]
+            if succ_start < pred_stage_end:
+                stat["overlap_ids"].add(dst_data_id)
+                stat["lead_us"].append((pred_stage_end - succ_start) / 1e3)
+
+    overlap_edges = []
+    total_overlap = 0
+    total_edge_data = 0
+    for (pred_group_id, succ_group_id), stat in overlap_stats.items():
+        total = len(stat["succ_ids"])
+        overlap = len(stat["overlap_ids"])
+        if total == 0:
+            continue
+        total_overlap += overlap
+        total_edge_data += total
+        overlap_edges.append({
+            "pred_name": stat["pred_name"],
+            "succ_name": stat["succ_name"],
+            "pred_group_id": pred_group_id,
+            "succ_group_id": succ_group_id,
+            "overlap_ratio": overlap / total,
+            "overlap_count": overlap,
+            "total_count": total,
+            "avg_lead_us": round(sum(stat["lead_us"]) / len(stat["lead_us"]), 1)
+            if stat["lead_us"] else 0.0,
+            "max_lead_us": round(max(stat["lead_us"]), 1)
+            if stat["lead_us"] else 0.0,
+        })
+    overlap_edges.sort(
+        key=lambda item: (
+            -item["overlap_ratio"],
+            -item["overlap_count"],
+            -item["avg_lead_us"],
+            item["pred_name"],
+            item["succ_name"],
+        )
+    )
+
+    waits = [item["queue_wait_us"] for item in data_metrics if item["queue_wait_us"] > 0]
+    summary = {
+        "num_timed_data": len(data_timing),
+        "avg_queue_wait_us": round(sum(waits) / len(waits), 1) if waits else 0.0,
+        "max_queue_wait_us": round(max(waits), 1) if waits else 0.0,
+        "p50_queue_wait_us": round(sorted(waits)[len(waits) // 2], 1) if waits else 0.0,
+        "p90_queue_wait_us": round(sorted(waits)[int(len(waits) * 0.9)], 1)
+        if waits else 0.0,
+        "critical_path_us": round(max(longest.values()) / 1e3, 1) if longest else 0.0,
+        "overall_overlap_ratio": (total_overlap / total_edge_data) if total_edge_data else 0.0,
+        "edge_pairs_with_overlap": sum(1 for item in overlap_edges if item["overlap_count"] > 0),
+        "total_stage_edges": len(overlap_edges),
+    }
+
+    top_waits = sorted(data_metrics, key=lambda item: -item["queue_wait_us"])[:20]
+    return {
+        "summary": summary,
+        "top_waits": top_waits,
+        "critical_path": critical_path,
+        "overlap_edges": overlap_edges,
+    }
+
+
 def compute_schedule_metrics(slices, track_names, group_timing, dag_groups,
                              adjacency, reverse_adj, dag_to_trace,
                              global_start, total_dur, group_deps):
@@ -678,7 +1066,7 @@ def compute_schedule_metrics(slices, track_names, group_timing, dag_groups,
     block_busy: Dict[int, int] = defaultdict(int)
     block_names: Dict[int, str] = {}
     for name, ts, dur, track_id in slices:
-        tts, _ = _parse_trace_name(name)
+        tts, _, _ = _parse_trace_name(name)
         if tts in SCHEDULER_TYPES:
             continue
         block_busy[track_id] += dur
@@ -859,6 +1247,62 @@ def _generate_sched_html(metrics):
     return h
 
 
+def _generate_data_sched_html(metrics):
+    if not metrics:
+        return ""
+
+    s = metrics["summary"]
+    h = '<div class="sched-grid">\n'
+
+    h += '<div class="sched-card"><h4>Data Summary</h4>'
+    h += '<p style="font-size:11px;color:#888;margin:0 0 6px">Per-data-item timing derived from the resident schema-v2 DAG and data-aware profiler slices.</p><table>\n'
+    h += f'<tr><td>Timed data items</td><td><b>{s["num_timed_data"]}</b></td><td style="color:#888;font-size:11px">Distinct data items that appeared in the trace</td></tr>\n'
+    h += f'<tr><td>Data critical path</td><td>{s["critical_path_us"]:.1f} us</td><td style="color:#888;font-size:11px">Longest path through the data DAG using actual observed timings</td></tr>\n'
+    h += f'<tr><td>Avg Queue Wait</td><td>{s["avg_queue_wait_us"]:.1f} us</td><td style="color:#888;font-size:11px">Average delay after predecessor data completed</td></tr>\n'
+    h += f'<tr><td>Max Queue Wait</td><td>{s["max_queue_wait_us"]:.1f} us</td><td style="color:#888;font-size:11px">Worst data-level ready-to-start gap</td></tr>\n'
+    h += f'<tr><td>p50 / p90 Queue Wait</td><td>{s["p50_queue_wait_us"]:.1f} / {s["p90_queue_wait_us"]:.1f} us</td><td style="color:#888;font-size:11px">Median and 90th percentile data queue wait</td></tr>\n'
+    h += f'<tr><td>Weighted overlap ratio</td><td>{s["overall_overlap_ratio"] * 100:.1f}%</td><td style="color:#888;font-size:11px">Fraction of downstream data items that started before the upstream stage fully ended</td></tr>\n'
+    h += f'<tr><td>Edges with overlap</td><td>{s["edge_pairs_with_overlap"]} / {s["total_stage_edges"]}</td><td style="color:#888;font-size:11px">Resident-stage edges where at least one downstream data item overlapped</td></tr>\n'
+    h += '</table></div>\n'
+
+    h += '<div class="sched-card"><h4>Stage-Edge Overlap</h4>'
+    h += '<p style="font-size:11px;color:#888;margin:0 0 6px">Top resident-stage edges ranked by how much data-level overlap they exposed.</p>'
+    h += '<table><tr><th>Edge</th><th>Overlap</th><th>Count</th><th>Lead</th></tr>\n'
+    for row in metrics["overlap_edges"][:15]:
+        h += (
+            f'<tr><td>{_short(row["pred_name"])} → {_short(row["succ_name"])}</td>'
+            f'<td>{row["overlap_ratio"] * 100:.1f}%</td>'
+            f'<td>{row["overlap_count"]}/{row["total_count"]}</td>'
+            f'<td>{row["avg_lead_us"]:.1f} us avg</td></tr>\n'
+        )
+    h += '</table></div>\n'
+
+    h += '<div class="sched-card"><h4>Top Data Queue Waits</h4>'
+    h += '<p style="font-size:11px;color:#888;margin:0 0 6px">Data items with the largest gap between becoming ready and actually starting.</p>'
+    h += '<table><tr><th>Data</th><th>Wait</th><th>Dur</th></tr>\n'
+    for row in metrics["top_waits"][:15]:
+        h += (
+            f'<tr><td>{row["name"]}</td>'
+            f'<td>{row["queue_wait_us"]:.1f} us</td>'
+            f'<td>{row["dur_us"]:.1f} us</td></tr>\n'
+        )
+    h += '</table></div>\n'
+
+    h += '<div class="sched-card"><h4>Data Critical Path</h4>'
+    h += '<p style="font-size:11px;color:#888;margin:0 0 6px">Observed bottleneck path through the per-data DAG.</p>'
+    h += '<div class="cp-flow">\n'
+    for i, step in enumerate(metrics["critical_path"][:24]):
+        if i > 0:
+            h += '<span class="cp-arrow">&#8594;</span>'
+        h += f'<span class="cp-node">{step["name"]}<br><small>{step["dur_us"]:.1f} us</small></span>'
+    if len(metrics["critical_path"]) > 24:
+        h += f'<span class="cp-arrow">&#8594;</span><span class="cp-node">... +{len(metrics["critical_path"]) - 24} more</span>'
+    h += '</div></div>\n'
+
+    h += '</div>\n'
+    return h
+
+
 # ---------------------------------------------------------------------------
 # Build the three views
 # ---------------------------------------------------------------------------
@@ -868,7 +1312,7 @@ def build_views(slices, track_names, stage_seq):
     # ---- Aggregate trace by (task_type_str, event_no) ----
     agg = defaultdict(list)
     for name, ts, dur, track_id in slices:
-        tts, eno = _parse_trace_name(name)
+        tts, eno, _ = _parse_trace_name(name)
         agg[(tts, eno)].append((ts, dur, track_id))
 
     entries = []  # List of dicts, sorted by start time
@@ -923,10 +1367,10 @@ def build_views(slices, track_names, stage_seq):
     # ---- 3. Per-Block view ----
     block_slices = defaultdict(list)
     for name, ts, dur, track_id in slices:
-        tts, eno = _parse_trace_name(name)
+        tts, eno, data_id = _parse_trace_name(name)
         if tts in SCHEDULER_TYPES:
             continue
-        block_slices[track_id].append((name, ts, dur, tts))
+        block_slices[track_id].append((name, _stage_trace_name(tts, eno), data_id, ts, dur, tts))
 
     # Sort blocks by block number (extract from "block_N")
     def _block_sort_key(tid):
@@ -937,13 +1381,15 @@ def build_views(slices, track_names, stage_seq):
     block_rows = []
     for tid in sorted(block_slices.keys(), key=_block_sort_key):
         tname = track_names.get(tid, f"track_{tid}")
-        sorted_sl = sorted(block_slices[tid], key=lambda s: s[1])
+        sorted_sl = sorted(block_slices[tid], key=lambda s: s[3])
         bars = []
-        for name, ts, dur, tts in sorted_sl:
+        for name, trace_key, data_id, ts, dur, tts in sorted_sl:
             bars.append({
                 "start": ts - global_start,
                 "end": ts + dur - global_start,
                 "name": name,
+                "trace_key": trace_key,
+                "data_id": data_id,
                 "blocks": 1,
                 "avg_dur": dur,
                 "color": _color_for(tts),
@@ -1054,9 +1500,10 @@ def _build_pipeline_rows(compute_entries, global_start, stage_seq):
 # ---------------------------------------------------------------------------
 # HTML output
 # ---------------------------------------------------------------------------
-def generate_html(pipeline_rows, tasktype_rows, block_rows,
+def generate_html(pipeline_rows, tasktype_rows, block_rows, data_rows,
                   global_start, total_dur, type_stats,
-                  graph_info, group_deps, sched_metrics, output_path: str):
+                  graph_info, group_deps, sched_metrics,
+                  data_sched_metrics, output_path: str):
     num_events, num_tasks = graph_info
 
     # Build legend from actually-used colors
@@ -1068,7 +1515,7 @@ def generate_html(pipeline_rows, tasktype_rows, block_rows,
                 c = bar["color"]
                 if c not in seen_colors:
                     seen_colors.add(c)
-                    tts, _ = _parse_trace_name(bar["name"])
+                    tts, _, _ = _parse_trace_name(bar["name"])
                     legend_items.append({"name": _short(tts), "color": c})
 
     # Stats table rows
@@ -1085,6 +1532,19 @@ def generate_html(pipeline_rows, tasktype_rows, block_rows,
         )
 
     sched_html = _generate_sched_html(sched_metrics) if sched_metrics else ""
+    data_sched_html = (
+        _generate_data_sched_html(data_sched_metrics) if data_sched_metrics else ""
+    )
+    data_analysis_section = ""
+    if data_sched_html:
+        data_analysis_section = (
+            '<div class="sa">'
+            '<h3>Data-Level Analysis</h3>'
+            '<p style="font-size:12px;color:#888;margin:0 0 10px">'
+            'Per-data timing and overlap metrics. This section is only populated '
+            'when the trace carries resident data ids.</p>'
+            f'{data_sched_html}</div>'
+        )
 
     html = _HTML_TEMPLATE.format(
         num_events=num_events,
@@ -1093,12 +1553,14 @@ def generate_html(pipeline_rows, tasktype_rows, block_rows,
         straggler_ratio=f"{STRAGGLER_RATIO:.1f}",
         stats_rows=stats_rows_html,
         sched_analysis=sched_html,
+        data_analysis=data_analysis_section,
         js_global_start=global_start,
         js_total_dur=total_dur,
         js_straggler_ratio=STRAGGLER_RATIO,
         js_pipeline=json.dumps(pipeline_rows),
         js_tasktype=json.dumps(tasktype_rows),
         js_blocks=json.dumps(block_rows),
+        js_data=json.dumps(data_rows),
         js_legend=json.dumps(legend_items),
         js_group_deps=json.dumps(group_deps or {}),
     )
@@ -1147,7 +1609,7 @@ def generate_svg(tasktype_rows, global_start, total_dur, output_path: str):
             c = bar["color"]
             if c not in seen:
                 seen.add(c)
-                tts, _ = _parse_trace_name(bar["name"])
+                tts, _, _ = _parse_trace_name(bar["name"])
                 patches.append(mpatches.Patch(color=c, label=_short(tts)))
     ax.legend(handles=patches, loc="upper right", fontsize=7, ncol=2)
     plt.tight_layout()
@@ -1164,7 +1626,7 @@ def _ensure_bar_colors(rows):
     for row in rows:
         bars = []
         for bar in row.get("bars", []):
-            task_type, _ = _parse_trace_name(bar["name"])
+            task_type, _, _ = _parse_trace_name(bar["name"])
             bars.append({
                 "start": bar["start"],
                 "end": bar["end"],
@@ -1226,7 +1688,7 @@ def _whatif_legend(rows_per_tab):
     for rows in rows_per_tab:
         for row in rows:
             for bar in row.get("bars", []):
-                task_type, _ = _parse_trace_name(bar["name"])
+                task_type, _, _ = _parse_trace_name(bar["name"])
                 seen.setdefault(bar["color"], whatif_short_name(task_type))
     return [{"color": color, "name": name} for color, name in seen.items()]
 
@@ -1506,6 +1968,7 @@ h1{{color:#e0e0e0;margin-bottom:5px}}
 <div class="ctrls">
 <button class="active" onclick="sw('pip',this)">Pipeline Phases</button>
 <button onclick="sw('tt',this)">By Task Type</button>
+<button onclick="sw('data',this)">Data Overlap</button>
 <button onclick="sw('blk',this)">Per Block</button>
 <button class="help-toggle" onclick="document.getElementById('blk-help').classList.toggle('show')">? Help</button>
 <div class="zoom-ctrl">
@@ -1518,6 +1981,7 @@ h1{{color:#e0e0e0;margin-bottom:5px}}
 <div id="tt-tip"></div>
 <div id="pip" class="tab active"><div class="tc"><div class="tl" id="tl-pip"></div></div></div>
 <div id="tt" class="tab"><div class="tc"><div class="tl" id="tl-tt"></div></div></div>
+<div id="data" class="tab"><div class="tc"><div class="tl" id="tl-data"></div></div></div>
 <div id="blk" class="tab">
 <div class="help-panel" id="blk-help">
 <h4>Per-Block View Guide</h4>
@@ -1542,10 +2006,12 @@ h1{{color:#e0e0e0;margin-bottom:5px}}
 <p style="font-size:12px;color:#888;margin:0 0 10px">How well the task scheduler utilized the GPU blocks. Covers block utilization, queue wait times, straggler effects, and the critical dependency path.</p>
 {sched_analysis}
 </div>
+{data_analysis}
 <script>
 const G={js_global_start},D={js_total_dur};
 const pipR={js_pipeline};
 const ttR={js_tasktype};
+const dataR={js_data};
 const blkR={js_blocks};
 const legI={js_legend};
 const GD={js_group_deps};
@@ -1607,17 +2073,18 @@ function renderBlk(cid,rows){{
       const be=document.createElement('div');be.className='bar';
       const left=b.start/D*bw,w=Math.max(1,(b.end-b.start)/D*bw);
       be.style.left=left+'px';be.style.width=w+'px';be.style.background=b.color;
-      const gd=GD[b.name];
+      const groupKey=b.trace_key||b.name;
+      const gd=GD[groupKey];
 
       /* straggler detection */
       if(gd&&gd.ad>0&&b.avg_dur>gd.ad*STRAGGLER_RATIO)be.classList.add('straggler');
 
       /* register in barMap */
-      if(!barMap[b.name])barMap[b.name]=[];
-      barMap[b.name].push({{el:be,ri:ri,s:b.start,e:b.end}});
+      if(!barMap[groupKey])barMap[groupKey]=[];
+      barMap[groupKey].push({{el:be,ri:ri,s:b.start,e:b.end}});
 
       /* click -> show dependency arrows */
-      be.addEventListener('click',e=>{{e.stopPropagation();showDeps(b.name)}});
+      be.addEventListener('click',e=>{{e.stopPropagation();showDeps(groupKey)}});
 
       /* tooltip */
       be.addEventListener('mouseenter',e=>{{
@@ -1715,6 +2182,7 @@ function sw(id,btn){{
   if(!document.getElementById(tlId).hasChildNodes()){{
     if(id==='pip')render(tlId,pipR);
     else if(id==='tt')render(tlId,ttR);
+    else if(id==='data')render(tlId,dataR);
     else renderBlk(tlId,blkR);
   }}
 }}
@@ -1731,6 +2199,7 @@ function zoom(dir){{
     const tlId='tl-'+id;
     if(id==='pip')render(tlId,pipR);
     else if(id==='tt')render(tlId,ttR);
+    else if(id==='data')render(tlId,dataR);
     else renderBlk(tlId,blkR);
   }}
 }}
@@ -1945,6 +2414,19 @@ def main():
     print(f"  {len(dag_groups)} task groups, "
           f"{sum(len(v) for v in adjacency.values())} edges")
 
+    data_nodes = []
+    data_adj = {}
+    data_reverse_adj = {}
+    if graph_data["schema_version"] >= 2 and graph_data["resident_tasks"]:
+        print("Building data dependency DAG …")
+        data_nodes, data_adj, data_reverse_adj = build_data_dependency_dag(graph_data)
+        print(f"  {len(data_nodes)} data nodes, "
+              f"{sum(len(v) for v in data_adj.values())} data edges")
+
+    slices, dropped_slices = filter_trace_slices_to_graph(slices, dag_groups, data_nodes)
+    if dropped_slices:
+        print(f"  Filtered out {dropped_slices} nested/non-graph trace slices")
+
     print("Building views …")
     pip_rows, tt_rows, blk_rows, g_start, t_dur, t_stats = \
         build_views(slices, track_names, stage_seq)
@@ -1955,6 +2437,25 @@ def main():
     group_deps, group_timing, dag_to_trace = map_trace_to_graph(
         slices, dag_groups, adjacency, reverse_adj, g_start)
     print(f"  Mapped {len(group_deps)} trace groups to DAG")
+
+    data_rows = []
+    data_sched_metrics = None
+    if data_nodes:
+        print("Mapping trace to data DAG …")
+        data_deps, data_timing, data_to_trace = map_data_trace_to_graph(
+            slices, data_nodes, data_adj, data_reverse_adj, g_start)
+        print(f"  Mapped {len(data_deps)} data-aware trace groups to DAG")
+        stage_order = _topo_sort(dag_groups, adjacency)
+        data_rows = build_data_overlap_rows(data_nodes, data_timing, stage_order, g_start)
+        data_sched_metrics = compute_data_schedule_metrics(
+            data_nodes, data_timing, data_adj, data_reverse_adj, group_timing)
+        if data_sched_metrics is not None:
+            ds = data_sched_metrics["summary"]
+            print(
+                f"  Data overlap ratio: {ds['overall_overlap_ratio'] * 100:.1f}%, "
+                f"data critical path: {ds['critical_path_us']:.1f} us, "
+                f"avg data queue wait: {ds['avg_queue_wait_us']:.1f} us"
+            )
 
     print("Computing schedule metrics …")
     sched_metrics = compute_schedule_metrics(
@@ -2002,10 +2503,12 @@ def main():
         generate_whatif_html(whatif_data, args.output)
     else:
         print("Writing HTML …")
-        generate_html(pip_rows, tt_rows, blk_rows, g_start, t_dur, t_stats,
+        generate_html(pip_rows, tt_rows, blk_rows, data_rows,
+                      g_start, t_dur, t_stats,
                       (len(events), graph_data["graph_task_count"]),
                       group_deps,
                       sched_metrics,
+                      data_sched_metrics,
                       args.output)
 
     if args.svg:

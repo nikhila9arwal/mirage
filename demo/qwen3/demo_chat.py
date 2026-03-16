@@ -79,7 +79,7 @@ def build_mirage_graph(model, world_size, rank, args, tokens_tensor, step_tensor
 
     # --- Profiler Setup ---
     profiler_tensor = (
-        torch.empty(3000 * 128, dtype=torch.uint64, device="cuda").contiguous()
+        torch.empty(20000 * 128, dtype=torch.uint64, device="cuda").contiguous()
         if args.profiling
         else None
     )

@@ -261,7 +261,7 @@ def create_persistent_kernel(args, world_size, rank, input_data, config, eos_tok
     if args.profiling:
         block_dim_for_profiler = get_block_dim()
         profiler_tensor = torch.zeros(
-            3000 * block_dim_for_profiler, dtype=torch.uint64, device="cuda"
+            20000 * block_dim_for_profiler, dtype=torch.uint64, device="cuda"
         ).contiguous()
     else:
         profiler_tensor = None

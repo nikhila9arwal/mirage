@@ -44,6 +44,7 @@ constexpr uint32_t EVENT_NO_SHIFT = 19;
 constexpr uint32_t EVENT_BEGIN = 0x0;
 constexpr uint32_t EVENT_END = 0x1;
 constexpr uint32_t EVENT_INSTANT = 0x2;
+constexpr uint32_t EVENT_METADATA = 0x3;
 
 __device__ __forceinline__ void sleep_cycles(uint32_t cycles) {
   uint32_t start = 0, now = 0;
@@ -79,6 +80,13 @@ __device__ __forceinline__ uint32_t make_event_tag_instant(uint32_t base_tag,
                                                            uint32_t event_no) {
   return base_tag | (event_id << EVENT_IDX_SHIFT) |
          (event_no << EVENT_NO_SHIFT) | EVENT_INSTANT;
+}
+
+__device__ __forceinline__ uint32_t make_event_tag_metadata(uint32_t base_tag,
+                                                            uint32_t event_id,
+                                                            uint32_t event_no) {
+  return base_tag | (event_id << EVENT_IDX_SHIFT) |
+         (event_no << EVENT_NO_SHIFT) | EVENT_METADATA;
 }
 
 __device__ __forceinline__ uint32_t get_timestamp() {
@@ -154,6 +162,17 @@ struct ProfilerEntry {
         tb::make_event_tag_instant(profiler_entry_tag_base, event, event_no);  \
     entry.delta_time = tb::get_timestamp();                                    \
     *profiler_write_ptr = entry.raw;                                           \
+  }                                                                            \
+  __threadfence_block();
+
+#define PROFILER_EVENT_METADATA(event, event_no, payload)                      \
+  __threadfence_block();                                                       \
+  if (profiler_write_thread_predicate) {                                       \
+    entry.tag = tb::make_event_tag_metadata(                                   \
+        profiler_entry_tag_base, event, event_no);                             \
+    entry.delta_time = static_cast<uint32_t>(payload);                         \
+    *profiler_write_ptr = entry.raw;                                           \
+    profiler_write_ptr += profiler_write_stride;                               \
   }                                                                            \
   __threadfence_block();
 

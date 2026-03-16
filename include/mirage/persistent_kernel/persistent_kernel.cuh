@@ -211,14 +211,10 @@ __device__ __forceinline__ bool
         }
       }
       config.step[request_id] = step + num_tokens;
-#ifdef MPK_ENABLE_PROFILING
-      if (true)
-#else
       if ((step + num_tokens + 1 >= config.max_seq_length) ||
           ((config.tokens[request_id * MPK_MAX_SEQ_LENGTH + step +
                           num_tokens] == config.eos_token_id) &&
            (step + num_tokens >= prompt_len)))
-#endif
       {
         // Request is done
         config.request_ids[i] = -1;

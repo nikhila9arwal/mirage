@@ -212,7 +212,7 @@ if __name__ == "__main__":
 
         if args.profiling:
             profiler_tensor = torch.zeros(
-                3000 * 128, dtype=torch.uint64, device="cuda"
+                20000 * 128, dtype=torch.uint64, device="cuda"
             ).contiguous()
         else:
             profiler_tensor = None
