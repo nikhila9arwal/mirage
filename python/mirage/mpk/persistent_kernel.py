@@ -114,7 +114,7 @@ PyMODINIT_FUNC PyInit___mirage_launcher(void) {
 """
 
 valid_persistent_kernel_modes = {"offline", "online", "online_notoken", "onepass", "online_multi_turn"}
-valid_task_graph_modes = {"legacy_event", "resident_data"}
+valid_task_graph_modes = {"legacy_event", "resident_data", "streaming_data"}
 
 def get_compile_command(
     mpk,
@@ -334,6 +334,10 @@ class PersistentKernel:
     def generate_task_graph(self):
         if self.task_graph_mode == "resident_data":
             return self.kn_graph.generate_resident_task_graph(
+                num_gpus=self.world_size, my_gpu_id=self.mpi_rank
+            )
+        if self.task_graph_mode == "streaming_data":
+            return self.kn_graph.generate_streaming_task_graph(
                 num_gpus=self.world_size, my_gpu_id=self.mpi_rank
             )
         return self.kn_graph.generate_task_graph(

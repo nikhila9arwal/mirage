@@ -29,6 +29,17 @@ constexpr DataId DATA_INVALID_ID = 0xFFFFFFFFu;
 enum ResidentExecutionMode : uint32_t {
   RESIDENT_EXECUTION_SCHEDULER_DISPATCH = 0,
   RESIDENT_EXECUTION_HYBRID_PRELAUNCH = 1,
+  RESIDENT_EXECUTION_STREAMING = 2,
+};
+
+enum ResidentTaskExecutionKind : uint32_t {
+  RESIDENT_TASK_EXECUTION_PRELAUNCHED = 0,
+  RESIDENT_TASK_EXECUTION_STREAMING = 1,
+};
+
+enum StreamingBaseExecutionMode : uint32_t {
+  STREAMING_BASE_EXECUTION_LEGACY_EVENT = 0,
+  STREAMING_BASE_EXECUTION_HYBRID_PRELAUNCH = 1,
 };
 
 using TaskMetadata = FullTaskDesc::TaskMetadata;
@@ -37,15 +48,18 @@ struct ResidentTaskDesc {
   ResidentTaskDesc()
       : task_type(TASK_TERMINATE), variant_id(0),
         profiler_group_id(INVALID_PROFILER_GROUP_ID), num_inputs(0),
-        num_outputs(0), max_parallelism(1), total_data_count(0) {}
+        num_outputs(0), execution_kind(RESIDENT_TASK_EXECUTION_PRELAUNCHED),
+        max_parallelism(1), total_data_count(0) {}
   ResidentTaskDesc(TaskType t, unsigned variant)
       : task_type(t), variant_id(variant),
         profiler_group_id(INVALID_PROFILER_GROUP_ID), num_inputs(0),
-        num_outputs(0), max_parallelism(1), total_data_count(0) {}
+        num_outputs(0), execution_kind(RESIDENT_TASK_EXECUTION_PRELAUNCHED),
+        max_parallelism(1), total_data_count(0) {}
   TaskType task_type;
   unsigned variant_id;
   uint32_t profiler_group_id;
   int num_inputs, num_outputs;
+  uint32_t execution_kind;
   int max_parallelism;
   int total_data_count;
 };
@@ -247,6 +261,7 @@ static_assert(alignof(ResolvedTaskDesc) == alignof(TaskDesc),
 
 struct ResidentRuntimeConfig : public RuntimeConfig {
   uint32_t resident_execution_mode;
+  uint32_t streaming_base_execution_mode;
   int begin_event_index;
   int end_event_index;
   int num_resident_tasks;
@@ -270,11 +285,21 @@ struct ResidentRuntimeConfig : public RuntimeConfig {
   DataId *task_to_data_id;
   TaskId *data_to_task_id;
   int *worker_owner_scheduler;
+  int *resident_owner_worker;
+  uint32_t *worker_streaming_resident_offsets;
+  ResidentTaskId *worker_streaming_resident_ids;
   DataId *resident_ready_data_head;
+  DataId *resident_ready_data_tail;
   DataId *data_ready_next;
+  uint32_t *resident_ready_queue_offsets;
+  uint32_t *resident_ready_head_positions;
+  uint32_t *resident_ready_next_free_positions;
+  uint32_t *resident_ready_tail_positions;
+  DataId *resident_ready_queue_storage;
   uint32_t *resident_active_workers;
   uint32_t *resident_completed_data;
   uint32_t *completed_terminal_data_count;
+  uint32_t *completed_streaming_data_count;
   uint32_t *completed_data_this_iteration_count;
   uint32_t *current_iteration;
   DataId *first_data_ids;

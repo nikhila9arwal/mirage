@@ -34,14 +34,20 @@ Current layout:
   - `include/mirage/persistent_kernel/resident_tma.cuh`
   - `include/mirage/persistent_kernel/resident_persistent_kernel.cuh`
   - `src/kernel/runtime_resident.cc`
+- streaming path reuses the resident low-level machinery but has its own
+  top-level compiler/runtime entrypoints:
+  - `include/mirage/persistent_kernel/streaming_persistent_kernel.cuh`
+  - `Graph::generate_streaming_task_graph(...)`
 
 Selection is now above the runtime layer, not inside the old runtime:
 
 - Python/Cython exposes both:
   - `generate_task_graph(...)` for the legacy event path
   - `generate_resident_task_graph(...)` for the resident/data path
+  - `generate_streaming_task_graph(...)` for the streaming path
 - `PersistentKernel` chooses between them using:
-  - constructor arg `task_graph_mode="legacy_event" | "resident_data"`
+  - constructor arg
+    `task_graph_mode="legacy_event" | "resident_data" | "streaming_data"`
   - or environment variable `MIRAGE_TASK_GRAPH_MODE`
   - default mode is `legacy_event`
 
@@ -56,6 +62,29 @@ the same schema-v2 public graph model:
   - this is the faster resident execution feature added later
   - enable with `MIRAGE_RESIDENT_EXECUTION_MODE=hybrid_prelaunch`
 
+`streaming_data` is a separate compiler/runtime path. It does not use
+the old resident scheduler-dispatch runtime for non-streaming work anymore.
+Instead, it is now a mixed path with its own base-mode selection:
+
+- default base mode: legacy MPK event semantics
+  - non-streaming compatibility tasks behave like the old
+    `legacy_event` runtime
+  - streaming is layered on top only for whitelisted operators
+- optional base mode: hybrid prelaunch
+  - enable with `MIRAGE_STREAMING_BASE_MODE=hybrid_prelaunch`
+  - for backward compatibility, `MIRAGE_RESIDENT_EXECUTION_MODE=hybrid_prelaunch`
+    is also treated as the streaming hybrid-base request when
+    `MIRAGE_TASK_GRAPH_MODE=streaming_data`
+
+The streaming execution mode itself:
+
+- keeps the resident/data graph abstraction,
+- uses a different resident grouping strategy than `resident_data`,
+- keeps non-streaming work on compatibility-task execution,
+- uses resident ready queues only for streaming residents,
+- currently restricts streaming grouping to a MoE whitelist
+  (`TASK_MOE_W13_LINEAR_*`, `TASK_MOE_W2_LINEAR_*`).
+
 So the selection hierarchy is now:
 
 - `MIRAGE_TASK_GRAPH_MODE=legacy_event`
@@ -64,6 +93,231 @@ So the selection hierarchy is now:
   - use the resident/data compiler path
   - then choose the resident execution strategy with
     `MIRAGE_RESIDENT_EXECUTION_MODE`
+- `MIRAGE_TASK_GRAPH_MODE=streaming_data`
+  - use the streaming compiler/runtime path
+  - default substrate is legacy MPK event behavior
+  - optional secondary env var:
+    `MIRAGE_STREAMING_BASE_MODE=hybrid_prelaunch`
+
+Current status of `streaming_data` in this checkout:
+
+- the runtime has been corrected so the default streaming substrate is legacy
+  MPK event semantics rather than resident-wide finer-grained prelaunch,
+- `hybrid_prelaunch + streaming` is now the only combination that layers both
+  local prelaunch gating and streaming together,
+- the C++ runtime rebuilt successfully inside `mirage.sif` after this change,
+- the Python extension had to be relinked manually on `node-gpu01` because
+  `setup.py build_ext --inplace --force` kept hanging in environment-specific
+  Rust/distutils steps before finishing file operations,
+- `import mirage` succeeds with the updated extension,
+- full `transformers`-based model validation is still blocked on this node
+  because `from transformers ...` times out before Mirage execution begins,
+- lightweight custom-graph `generate_*_task_graph()` probes still segfault in
+  `register_mugraph(...)`, but that is a shared generator limitation that also
+  affects the legacy path and is not specific to the streaming changes.
+
+## If you are taking over this work
+
+This section is the shortest path to becoming productive without reading chat
+history.
+
+### What is true right now
+
+- `legacy_event` is still the baseline MPK runtime.
+- `resident_data` still has two execution modes:
+  - `scheduler_dispatch`
+  - `hybrid_prelaunch`
+- `streaming_data` now defaults to legacy MPK behavior for non-streaming work.
+- `streaming_data + MIRAGE_STREAMING_BASE_MODE=hybrid_prelaunch` is the opt-in
+  path that combines hybrid-prelaunch behavior with streaming residents.
+- The streaming whitelist is intentionally small right now:
+  - `TASK_MOE_W13_LINEAR_*`
+  - `TASK_MOE_W2_LINEAR_*`
+- The current unresolved problem is not a known runtime compile error. The
+  remaining blocker is environment-dependent end-to-end validation on the live
+  model path.
+
+### Read these files in this order
+
+If you need to understand the current implementation quickly, read these in
+order:
+
+1. this note
+2. `src/kernel/runtime_resident.cc`
+   - compiler pass and schema-v2 emission
+   - search for:
+     - `get_streaming_base_execution_mode`
+     - `build_data_aware_task_graph`
+     - `print_task_graph`
+     - `generate_streaming_task_graph`
+3. `include/mirage/persistent_kernel/resident_runtime_header.h`
+   - runtime enums and descriptor/state layout
+   - search for:
+     - `ResidentExecutionMode`
+     - `StreamingBaseExecutionMode`
+     - `ResidentRuntimeConfig`
+4. `include/mirage/persistent_kernel/resident_persistent_kernel.cuh`
+   - actual runtime behavior
+   - search for:
+     - `streaming_uses_legacy_base`
+     - `prelaunched_task_ready_nonblocking`
+     - `trigger_data_event`
+     - `release_completed_data_streaming`
+     - `execute_worker_streaming`
+     - `execute_scheduler_streaming`
+5. `include/mirage/persistent_kernel/persistent_kernel.cuh`
+   - legacy baseline semantics for comparison
+6. if you are debugging tooling/trace behavior:
+   - `include/mirage/persistent_kernel/profiler.h`
+   - `python/mirage/mpk/profiler_persistent.py`
+   - `scripts/display_task_graph_timeline.py`
+   - `scripts/whatif_model.py`
+
+### Mode matrix
+
+Use this table as ground truth:
+
+- `MIRAGE_TASK_GRAPH_MODE=legacy_event`
+  - old MPK event runtime
+- `MIRAGE_TASK_GRAPH_MODE=resident_data`
+  - schema-v2 resident/data graph
+  - choose one:
+    - `MIRAGE_RESIDENT_EXECUTION_MODE=scheduler_dispatch`
+    - `MIRAGE_RESIDENT_EXECUTION_MODE=hybrid_prelaunch`
+- `MIRAGE_TASK_GRAPH_MODE=streaming_data`
+  - schema-v2 streaming graph
+  - default base mode is legacy/event semantics for non-streaming work
+  - optional:
+    - `MIRAGE_STREAMING_BASE_MODE=hybrid_prelaunch`
+
+Important:
+
+- do not assume `streaming_data` means “all work uses the resident/hybrid
+  substrate”
+- it now means “legacy MPK plus streaming on whitelisted ops” unless
+  `MIRAGE_STREAMING_BASE_MODE=hybrid_prelaunch` is set
+
+### Rebuild checklist
+
+Work inside `mirage.sif` from a Slurm allocation. The reconnect pattern is
+documented later in this note.
+
+Recommended rebuild order:
+
+1. rebuild the runtime library
+
+```bash
+cd /home/nikhilag/mirage
+export CC=/usr/bin/gcc
+export CXX=/usr/bin/g++
+export CUDACXX=/usr/local/cuda/bin/nvcc
+cmake -S . -B build
+cmake --build build --target mirage_runtime -j4
+```
+
+2. then rebuild or relink the Python extension
+
+Preferred path:
+
+```bash
+cd /home/nikhilag/mirage
+export MIRAGE_HOME=/home/nikhilag/mirage
+export PYTHONPATH=/home/nikhilag/mirage/python${PYTHONPATH:+:$PYTHONPATH}
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+python3 setup.py build_ext --inplace --force
+```
+
+Fallback path if `setup.py build_ext --inplace --force` hangs in the Rust or
+distutils steps on a specific node:
+
+```bash
+cd /home/nikhilag/mirage
+EXT=$(python3 - <<'PY'
+import sysconfig
+print(sysconfig.get_config_var("EXT_SUFFIX"))
+PY
+)
+Z3=$(python3 - <<'PY'
+import os, z3
+print(os.path.dirname(z3.__file__))
+PY
+)
+g++ -shared -fPIC -std=c++17 -fopenmp -O2 -Wall \
+  -DMIRAGE_BACKEND_USE_CUDA -DMIRAGE_FINGERPRINT_USE_CUDA \
+  -I/usr/include/python3.10 \
+  -Iinclude \
+  -Ideps/json/include \
+  -Ideps/cutlass/include \
+  -Ideps/cutlass/tools/util/include \
+  -Ibuild/abstract_subexpr/release \
+  -Ibuild/formal_verifier/release \
+  -I${Z3}/include \
+  -I/usr/local/cuda/targets/x86_64-linux/include \
+  python/mirage/_cython/core.cpp \
+  -Lbuild \
+  -L${Z3}/lib \
+  -Lbuild/abstract_subexpr/release \
+  -Lbuild/formal_verifier/release \
+  -L/usr/local/cuda/lib64 \
+  -L/usr/local/cuda/lib64/stubs \
+  -lmirage_runtime -lcudadevrt -lcudart_static -lcudart -lcuda \
+  -lz3 -lgomp -lrt -labstract_subexpr -lformal_verifier \
+  -o python/mirage/core${EXT}.tmp \
+  -Wl,-rpath,'$ORIGIN/lib' \
+  -Wl,-rpath,'$ORIGIN/../../build/abstract_subexpr/release' \
+  -Wl,-rpath,'$ORIGIN/../../build/formal_verifier/release'
+mv python/mirage/core${EXT}.tmp python/mirage/core${EXT}
+```
+
+3. confirm the updated extension loads
+
+```bash
+cd /home/nikhilag/mirage
+export PYTHONPATH=/home/nikhilag/mirage/python${PYTHONPATH:+:$PYTHONPATH}
+python3 - <<'PY'
+import mirage
+print("mirage_import_ok")
+PY
+```
+
+### Validation order
+
+If you have a healthy node/container where `transformers` startup is responsive,
+do validation in this order:
+
+1. `legacy_event`
+2. `resident_data + scheduler_dispatch`
+3. `resident_data + hybrid_prelaunch`
+4. `streaming_data`
+5. `streaming_data + MIRAGE_STREAMING_BASE_MODE=hybrid_prelaunch`
+
+For the live MoE path, use:
+
+- `demo/qwen3/demo_30B_A3B_hopper.py`
+
+Start with:
+
+- `--max-num-batched-tokens 1`
+- `--max-num-batched-requests 1`
+- `--max-seq-length 40`
+
+Then rerun with:
+
+- `--max-num-batched-tokens 8`
+- `--max-num-batched-requests 4`
+- `--max-seq-length 40`
+
+### Validation traps to avoid
+
+- Do not treat small custom-graph `generate_*_task_graph()` probes as a clean
+  signal for this work. They still hit a shared `register_mugraph(...)`
+  segfault in both legacy and streaming generators.
+- Do not treat profiling-mode latency as normal runtime latency. The profiled
+  path is much slower and is only useful for timeline/overlap analysis.
+- Do not assume a failed live run means the runtime is broken. On the current
+  `node-gpu01` allocation, the Python model stack stalls before Mirage
+  execution begins.
 
 ## Quick background: what Mirage MPK is
 
@@ -193,6 +447,20 @@ It holds information that does not change across many instances of the same work
 - profiler group identity.
 
 Think of a resident task as "the code and static execution personality of this stage".
+
+One important nuance in the current codebase is that there are now two
+different ways to choose that resident-task identity:
+
+- `resident_data`
+  - the original resident compiler path
+  - groups fairly coarsely, originally around operator-family execution stages
+- `streaming_data`
+  - the newer streaming compiler path
+  - uses a stricter resident grouping key so the resident unit is closer to the
+    original MPK task partition that owns a fixed weight or expert shard
+  - the first implementation is intentionally conservative and only applies the
+    finer grouping to a whitelist of stream-friendly task types, primarily the
+    MoE linears
 
 ### Data
 
@@ -624,15 +892,97 @@ For a v2 graph it renders:
 
 This makes it visually obvious that the graph is now "resident stage + many flowing data instances" instead of a flat event-bound task list.
 
+### Profiler and trace export
+
+The resident/data visualization only works if the runtime emits enough
+information to distinguish one data item from another in the trace.
+
+The low-level profiler used by MPK lives in:
+
+- `include/mirage/persistent_kernel/profiler.h`
+- `python/mirage/mpk/profiler_persistent.py`
+
+At the device level, the profiler writes a stream of 64-bit entries:
+
+- one header entry with `(num_blocks, num_groups)`,
+- then one entry per emitted event.
+
+The event tag is still packed into 32 bits:
+
+- bits `[31:19]`: event number
+  - in practice, this is the DAG-stable `profiler_group_id` for profiled graph
+    tasks,
+- bits `[18:11]`: block/group id,
+- bits `[10:2]`: task type / event id,
+- bits `[1:0]`: event kind.
+
+The event kinds are now:
+
+- `begin`
+- `end`
+- `instant`
+- `metadata`
+
+The important new piece is `metadata`.
+
+For resident compute tasks:
+
+1. the worker emits a normal `begin`,
+2. if the task is associated with a real `data_id`, it immediately emits a
+   `metadata` event carrying that `data_id`,
+3. the worker later emits the normal `end`.
+
+The exporter in `python/mirage/mpk/profiler_persistent.py` reconstructs slices
+from those entries:
+
+- legacy or control-style slices still become `TASK_TYPE_<group_id>`,
+- resident data-aware slices become `TASK_TYPE_<group_id>_d<data_id>`.
+
+That naming convention is what makes the rest of the tooling possible.
+
+One subtle but important detail is that resident traces can still contain
+nested/internal profiler slices from generated task bodies that are not actual
+graph nodes. The timeline script now filters those out before DAG mapping so
+the reported stage/data metrics are built only from graph-backed tasks.
+
 ### Timeline visualization
 
 `scripts/display_task_graph_timeline.py` now understands v2 graphs.
 
-For schema v2:
+For schema v2 it now builds two views of the same execution:
 
-- the dependency DAG is built from `resident_tasks` and `data_edges`,
-- resident tasks become the grouping unit for trace mapping,
-- dependency analysis no longer assumes that event fan-in equals compute fan-in.
+- a stage-level DAG over `resident_tasks`,
+- a data-level DAG over `all_data` and `data_edges`.
+
+The stage-level path is still useful because it keeps the old high-level view:
+
+- one row per resident task / operator stage,
+- stage start = earliest observed block start,
+- stage end = latest observed block end,
+- stage critical path,
+- stage-level queue wait.
+
+The data-level path is the new important one.
+
+The script now:
+
+- parses trace names with optional `data_id` suffixes,
+- maps `TASK_TYPE_<group_id>_d<data_id>` back to the exact `DataDesc`,
+- computes data-ready time from predecessor data completion,
+- computes a true data-level critical path,
+- computes per-data queue wait,
+- computes per-stage-edge overlap ratios,
+- renders a `Data Overlap` tab with one bar per data item.
+
+The most important metric it now exposes is the overlap ratio for a resident
+stage edge:
+
+- numerator: downstream data items that started before the upstream resident
+  stage fully ended,
+- denominator: total downstream data items on that edge.
+
+That is the direct signal for whether the resident/data DAG is actually
+unlocking overlap.
 
 This is important because the main visible result of the new system is overlap:
 
@@ -686,6 +1036,51 @@ This is the resident/data runtime implementation. It contains:
 - end-of-graph detection using terminal data completion,
 - kernel launch selection between the two resident execution strategies.
 
+It also now contains the resident-side profiler emission changes:
+
+- data-aware profiler-group selection,
+- metadata emission for `data_id`,
+- the profiled serving-path completion fix described later in this note.
+
+### `include/mirage/persistent_kernel/profiler.h`
+
+This is the low-level profiler wire-format change.
+
+It now defines the new `metadata` event kind used to carry `data_id` through
+the existing profiler buffer without inventing a separate side channel.
+
+### `python/mirage/mpk/profiler_persistent.py`
+
+This is the Perfetto export path for MPK traces.
+
+It now:
+
+- reconstructs slices from begin/end pairs,
+- attaches `data_id` from resident metadata events when present,
+- emits trace names in the `TASK_TYPE_<group_id>_d<data_id>` format.
+
+### Python/demo profiler buffer allocation
+
+- `python/mirage/mpk/mpk.py`
+- `demo/qwen3/demo.py`
+- `demo/qwen3/demo_hopper.py`
+- `demo/qwen3/demo_30B_A3B.py`
+- `demo/qwen3/demo_30B_A3B_hopper.py`
+- `demo/qwen3/demo_sampling.py`
+- `demo/qwen3/demo_debug.py`
+- `demo/qwen3/demo_mpk_wrapper.py`
+- `demo/qwen3/demo_chat.py`
+- `demo/llama3/demo.py`
+
+These files were updated to allocate a much larger profiler buffer.
+
+That was necessary because the data-aware resident trace emits more profiler
+events than the old stage-only trace:
+
+- start,
+- metadata carrying `data_id`,
+- end.
+
 ### `include/mirage/persistent_kernel/resident_tma.cuh`
 
 This adds the resident-path TMA bridge:
@@ -730,11 +1125,17 @@ Changed to:
 - parse schema v2,
 - build stage structure from resident tasks,
 - build dependency DAG from `data_edges`,
-- map Perfetto trace groups against resident-task profiler groups.
+- map Perfetto trace groups against resident-task profiler groups,
+- map data-aware trace groups against exact `data_id`s,
+- compute data-level overlap / queue-wait / critical-path metrics,
+- filter nested non-graph slices before DAG mapping,
+- render the new `Data Overlap` timeline tab.
 
 ### `scripts/whatif_model.py`
 
-Changed so analytical fan-in and dependency scoring work with the resident/data DAG instead of only with legacy event fan-in.
+Changed so analytical fan-in and dependency scoring work with the resident/data
+DAG instead of only with legacy event fan-in, while still collapsing trace
+names back to stage-level keys when the trace includes `_d<data_id>` suffixes.
 
 ## Validation that was performed
 
@@ -787,8 +1188,14 @@ singularity exec --nv --fakeroot \
 Inside that container:
 
 - the main CMake build completed successfully,
-- the in-tree Python extension rebuilt successfully,
-- the containerized Python runtime was confirmed to load `python/mirage/core.cpython-310-x86_64-linux-gnu.so`.
+- the Python extension was loadable from inside the container,
+- on some nodes, `python3 setup.py build_ext --inplace --force` completed
+  normally,
+- on `node-gpu01`, that command later hung in Rust/distutils steps, so the
+  reliable fallback was:
+  - rebuild `mirage_runtime` with CMake first,
+  - then relink `python/mirage/core.cpython-310-x86_64-linux-gnu.so` manually
+    against the updated static library.
 
 Earlier `z3++.h` failures came from a host-configured build cache, not from this resident/data work. They are not the current blocker.
 
@@ -902,10 +1309,81 @@ Important caveat:
 - these runs validated that all three live paths compile, launch, and return,
 - they validated that the visible decoded one-token output matched across
   legacy, resident-default, and resident-hybrid on the tested prompt,
-- they did not redo the earlier larger-batch validation after layering the two
-  resident execution modes into one resident runtime file,
 - they did not validate multi-token semantic correctness exhaustively, and they
   did not validate multi-GPU/NVSHMEM model outputs end-to-end.
+
+### Profiled larger-batch resident validation
+
+After the data-aware profiler and timeline changes were added, the resident
+hybrid-prelaunch path was revalidated on the earlier larger-batch shape:
+
+- mode:
+  - `MIRAGE_TASK_GRAPH_MODE=resident_data`
+  - `MIRAGE_RESIDENT_EXECUTION_MODE=hybrid_prelaunch`
+- shape:
+  - `--max-num-batched-tokens 8`
+  - `--max-num-batched-requests 4`
+  - `--max-seq-length 40`
+- artifacts:
+  - `validation_visualization/resident_hybrid_multi_v4/task_graph_rank0.json`
+  - `validation_visualization/resident_hybrid_multi_v4/resident_hybrid_multi_v4.perfetto-trace`
+  - `validation_visualization/resident_hybrid_multi_v4/resident_hybrid_multi_v4_timeline.html`
+  - `validation_visualization/resident_hybrid_multi_v4/resident_hybrid_multi_v4_whatif.html`
+  - `validation_visualization/resident_hybrid_multi_v4/run.log`
+
+What this validation proved:
+
+- the profiled resident run returned the expected visible decoded output again,
+- `generate length` returned to `1`,
+- the data-aware trace mapped cleanly to both the stage DAG and the data DAG,
+- the updated timeline script generated HTML successfully,
+- the updated what-if script still generated HTML successfully.
+
+Observed profiled latency on that run:
+
+- `1651.482 ms/token`
+
+This number is much slower than the non-profiled resident run and should not be
+used as a performance comparison. It mostly reflects heavy profiling overhead
+plus the larger trace size.
+
+### Profiled-path bug that was found and fixed
+
+While validating the new profiler/display path, the resident profiled run
+initially produced obviously wrong output:
+
+- truncated decoded text,
+- `generate length -30`,
+- a last token of `0` instead of the expected generated token.
+
+The root cause was not in the exporter or the HTML tooling.
+
+The root cause was a hardcoded profiling-only serving shortcut in both:
+
+- `include/mirage/persistent_kernel/persistent_kernel.cuh`
+- `include/mirage/persistent_kernel/resident_persistent_kernel.cuh`
+
+Inside `prepare_next_batch(...)`, the code had:
+
+- `#ifdef MPK_ENABLE_PROFILING`
+- `if (true)`
+
+in the request-completion path.
+
+That forced every request to be treated as complete immediately after the first
+batch-finalization step, which is why the prompt was truncated and the computed
+generated length became negative.
+
+That profiling-only shortcut has now been removed from both the legacy and
+resident serving loops.
+
+There was also a second profiling issue:
+
+- the old profiler buffer allocation (`3000 * 128`) was too small once every
+  resident compute task emitted an extra metadata event for `data_id`.
+
+The buffer allocations were increased to `20000 * 128` (or the corresponding
+scaled value in the Llama demo) to avoid profiler-buffer exhaustion.
 
 ### Compiler warning notes from the live run
 
@@ -923,7 +1401,7 @@ used during this rewrite.
 
 ## Known limitations and current status
 
-This section is the handoff state as of March 12, 2026.
+This section is the handoff state as of March 16, 2026.
 
 ### 1. All three execution paths now work end-to-end from one checkout
 
@@ -964,6 +1442,8 @@ What has been checked:
 
 - the visible decoded one-token output matched across legacy,
   resident-default, and resident-hybrid on the validated single-GPU prompt,
+- after the profiled-path fix above, the profiled resident larger-batch run
+  also returned the expected visible decoded output shape again,
 - the earlier resident-only milestone had deeper checks against legacy/Hugging
   Face, but those checks were not rerun after layering both resident execution
   modes into one resident runtime file.
@@ -1001,16 +1481,63 @@ If someone picks this up from here, the highest-value next steps are:
 
 1. run a real multi-GPU/NVSHMEM validation once an allocation exposes more than
    one GPU and a usable sharded model path is available.
-2. capture a profiling trace on a larger batched shape and confirm, from the
-   actual timeline, that downstream resident stages begin before all sibling
-   upstream slices finish.
-3. rerun the earlier larger-batch resident validation after the new
-   resident-mode layering so both resident execution modes are covered on more
-   than the `1 token / 1 request` shape.
-4. validate longer-generation token correctness against Hugging Face, not just
+2. validate longer-generation token correctness against Hugging Face, not just
    the current one-token visible-output check.
-5. rerun end-to-end validation on at least one non-MoE graph so the hybrid
+3. rerun end-to-end validation on at least one non-MoE graph so the hybrid
    prelaunch runtime is not only validated on this MoE workload.
+4. if the profiler overhead becomes a problem, reduce trace volume or make the
+   profiler buffer size configurable instead of hardcoding the larger buffers
+   in the demos.
+
+## Running log
+
+This section is meant to be a short rolling handoff, not a full changelog.
+
+### 2026-03-16: streaming default substrate corrected
+
+What changed:
+
+- `streaming_data` no longer treats non-streaming work as resident-wide
+  finer-grained prelaunch by default.
+- The default streaming substrate is now legacy MPK event behavior.
+- `hybrid_prelaunch + streaming` is the explicit opt-in path that combines
+  local predecessor-count gating with streaming residents.
+- The runtime now carries an explicit streaming base mode in
+  `ResidentRuntimeConfig`.
+- The generated streaming CUDA now bakes both:
+  - `MIRAGE_RESIDENT_EXECUTION_MODE_VALUE=RESIDENT_EXECUTION_STREAMING`
+  - `MIRAGE_STREAMING_BASE_EXECUTION_MODE_VALUE=...`
+- In legacy-based streaming mode, data tasks still trigger legacy events after
+  completion, and streaming `data_edges` are used only to wake streaming
+  residents early.
+- In hybrid-based streaming mode, the previous local predecessor-count behavior
+  remains available for the non-streaming compatibility tasks.
+
+What was validated:
+
+- `mirage_runtime` rebuilt successfully inside `mirage.sif` on Slurm job
+  `86948` on `node-gpu01`.
+- The Python extension was manually relinked against the updated static
+  `libmirage_runtime.a` because `setup.py build_ext --inplace --force` kept
+  hanging in node-specific Rust/distutils steps.
+- `import mirage` succeeds inside the container with the updated extension.
+
+What is still blocked:
+
+- Real end-to-end model validation on this node is still blocked before Mirage
+  execution because `transformers` import/startup times out.
+- Lightweight custom-graph `generate_streaming_task_graph(...)` probes still
+  hit the existing `register_mugraph(...)` segmentation fault that also affects
+  the legacy generator path, so they are not a clean validation route either.
+
+Where we are going next:
+
+1. rerun the streaming validation on a node/container path where the Python
+   model stack is responsive enough to reach Mirage execution,
+2. compare `streaming_data` default legacy-base behavior against
+   `streaming_data + MIRAGE_STREAMING_BASE_MODE=hybrid_prelaunch`,
+3. widen the streamable-op whitelist only after the default mixed architecture
+   is validated end-to-end.
 
 ## The conceptual difference in one example
 

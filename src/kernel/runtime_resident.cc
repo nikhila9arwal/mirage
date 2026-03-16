@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <queue>
+#include <sstream>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
@@ -122,6 +123,63 @@ struct ResidentTaskGraph {
   std::vector<TaskId> data_to_task_id;
 };
 
+enum class DataAwareTaskGraphFlavor {
+  RESIDENT,
+  STREAMING,
+};
+
+bool is_streaming_whitelist_task(TaskType task_type) {
+  return task_type == TASK_MOE_W13_LINEAR_SM90 ||
+         task_type == TASK_MOE_W2_LINEAR_SM90 ||
+         task_type == TASK_MOE_W13_LINEAR_SM100 ||
+         task_type == TASK_MOE_W2_LINEAR_SM100;
+}
+
+ResidentTaskExecutionKind get_streaming_execution_kind(TaskType task_type) {
+  return is_streaming_whitelist_task(task_type)
+             ? RESIDENT_TASK_EXECUTION_STREAMING
+             : RESIDENT_TASK_EXECUTION_PRELAUNCHED;
+}
+
+void append_tensor_signature(std::ostringstream &oss,
+                             TensorDesc const &tensor_desc,
+                             bool include_base_ptr) {
+  if (include_base_ptr) {
+    oss << '@' << reinterpret_cast<uintptr_t>(tensor_desc.base_ptr);
+  }
+  oss << ':' << tensor_desc.data_type << ':' << tensor_desc.num_dims;
+  for (int dim = 0; dim < tensor_desc.num_dims; dim++) {
+    oss << ':' << tensor_desc.dim[dim] << ':' << tensor_desc.stride[dim];
+  }
+}
+
+std::string build_streaming_resident_key(kernel::KNOperator const *op,
+                                         TaskId task_id,
+                                         FullTaskDesc const &task) {
+  std::ostringstream oss;
+  oss << reinterpret_cast<uintptr_t>(op) << ':'
+      << static_cast<int>(task.task_type) << ':' << task.variant_id << ':'
+      << task.num_inputs << ':' << task.num_outputs;
+  if (!is_streaming_whitelist_task(task.task_type)) {
+    // Unsupported operators stay at original MPK task granularity in the
+    // streaming pass. Only whitelisted operators collapse multiple data
+    // slices into one resident task.
+    oss << ":task=" << task_id;
+    return oss.str();
+  }
+
+  // First-cut streaming groups keep the MoE weight shard and expert slot
+  // fixed, and stream only the dynamic token/request slices through them.
+  oss << ":expert=" << task.task_metadata.expert_offset;
+  if (task.num_inputs > 1) {
+    append_tensor_signature(oss, task.inputs[1], true /*include_base_ptr*/);
+  }
+  for (int output_idx = 0; output_idx < task.num_outputs; output_idx++) {
+    append_tensor_signature(oss, task.outputs[output_idx], false);
+  }
+  return oss.str();
+}
+
 size_t runtime_dtype_size(int data_type) {
   switch (static_cast<type::DataType>(data_type)) {
     case type::DT_FLOAT8:
@@ -197,16 +255,37 @@ ResidentExecutionMode get_resident_execution_mode() {
       "\"scheduler_dispatch\" or \"hybrid_prelaunch\".");
 }
 
-ResidentTaskGraph build_resident_task_graph(
+StreamingBaseExecutionMode get_streaming_base_execution_mode() {
+  char const *mode_env = std::getenv("MIRAGE_STREAMING_BASE_MODE");
+  if (mode_env == nullptr || std::strcmp(mode_env, "") == 0) {
+    mode_env = std::getenv("MIRAGE_RESIDENT_EXECUTION_MODE");
+  }
+  if (mode_env == nullptr || std::strcmp(mode_env, "") == 0 ||
+      std::strcmp(mode_env, "legacy_event") == 0 ||
+      std::strcmp(mode_env, "scheduler_dispatch") == 0) {
+    return STREAMING_BASE_EXECUTION_LEGACY_EVENT;
+  }
+  if (std::strcmp(mode_env, "hybrid_prelaunch") == 0) {
+    return STREAMING_BASE_EXECUTION_HYBRID_PRELAUNCH;
+  }
+  throw std::runtime_error(
+      "Invalid streaming base mode. Expected \"legacy_event\" or "
+      "\"hybrid_prelaunch\".");
+}
+
+ResidentTaskGraph build_data_aware_task_graph(
     mirage::kernel::Graph const &graph,
     std::vector<FullTaskDesc> const &all_tasks,
     std::vector<EventDesc> const &all_events,
     std::map<kernel::KNOperator *,
              std::map<dim3, std::vector<TaskId>, Dim3Comparator>> const
         &all_task_maps,
-    ResidentExecutionMode execution_mode) {
+    DataAwareTaskGraphFlavor flavor,
+    ResidentExecutionMode execution_mode,
+    StreamingBaseExecutionMode streaming_base_mode) {
   ResidentTaskGraph result;
   result.task_to_data_id.assign(all_tasks.size(), DATA_INVALID_ID);
+  std::unordered_map<std::string, ResidentTaskId> streaming_resident_ids;
 
   for (auto const &op : graph.operators) {
     if (op->op_type == type::KNOperatorType::KN_INPUT_OP) {
@@ -220,30 +299,84 @@ ResidentTaskGraph build_resident_task_graph(
     if (task_map.empty()) {
       continue;
     }
+    if (flavor == DataAwareTaskGraphFlavor::RESIDENT) {
+      TaskId sample_task_id = task_map.begin()->second.front();
+      FullTaskDesc const &sample_task = all_tasks[sample_task_id];
+      ResidentTaskId resident_task_id =
+          static_cast<ResidentTaskId>(result.resident_tasks.size());
+      ResidentTaskDesc resident_task(sample_task.task_type, sample_task.variant_id);
+      resident_task.profiler_group_id = resident_task_id;
+      resident_task.num_inputs = sample_task.num_inputs;
+      resident_task.num_outputs = sample_task.num_outputs;
+      resident_task.execution_kind = RESIDENT_TASK_EXECUTION_PRELAUNCHED;
+      resident_task.max_parallelism = 0;
+      int op_data_count = 0;
 
-    TaskId sample_task_id = task_map.begin()->second.front();
-    FullTaskDesc const &sample_task = all_tasks[sample_task_id];
-    ResidentTaskId resident_task_id =
-        static_cast<ResidentTaskId>(result.resident_tasks.size());
-    ResidentTaskDesc resident_task(sample_task.task_type, sample_task.variant_id);
-    resident_task.profiler_group_id = resident_task_id;
-    resident_task.num_inputs = sample_task.num_inputs;
-    resident_task.num_outputs = sample_task.num_outputs;
-    resident_task.max_parallelism = 0;
-    int op_data_count = 0;
+      for (auto const &entry : task_map) {
+        resident_task.max_parallelism += static_cast<int>(entry.second.size());
+        for (TaskId task_id : entry.second) {
+          FullTaskDesc const &task = all_tasks[task_id];
+          if (task.task_type != sample_task.task_type ||
+              task.variant_id != sample_task.variant_id ||
+              task.num_inputs != sample_task.num_inputs ||
+              task.num_outputs != sample_task.num_outputs) {
+            throw std::runtime_error(
+                "Resident task builder grouped heterogeneous task signatures "
+                "into one resident task. Split by subtask family instead.");
+          }
+          FullDataDesc data_desc;
+          data_desc.resident_task_id = resident_task_id;
+          data_desc.profiler_group_id = resident_task_id;
+          data_desc.trigger_event = task.trigger_event;
+          data_desc.dependent_event = task.dependent_event;
+          data_desc.task_metadata = task.task_metadata;
+          for (int i = 0; i < task.num_inputs; i++) {
+            data_desc.inputs[i] = task.inputs[i];
+          }
+          for (int i = 0; i < task.num_outputs; i++) {
+            data_desc.outputs[i] = task.outputs[i];
+          }
+          DataId data_id = static_cast<DataId>(result.all_data.size());
+          result.task_to_data_id[task_id] = data_id;
+          result.all_data.push_back(data_desc);
+          op_data_count++;
+        }
+      }
+      resident_task.total_data_count = op_data_count;
+      result.resident_tasks.push_back(resident_task);
+      continue;
+    }
 
     for (auto const &entry : task_map) {
-      resident_task.max_parallelism += static_cast<int>(entry.second.size());
       for (TaskId task_id : entry.second) {
         FullTaskDesc const &task = all_tasks[task_id];
-        if (task.task_type != sample_task.task_type ||
-            task.variant_id != sample_task.variant_id ||
-            task.num_inputs != sample_task.num_inputs ||
-            task.num_outputs != sample_task.num_outputs) {
-          throw std::runtime_error(
-              "Resident task builder grouped heterogeneous task signatures "
-              "into one resident task. Split by subtask family instead.");
+        std::string resident_key =
+            build_streaming_resident_key(op, task_id, task);
+        auto const [resident_it, inserted] = streaming_resident_ids.emplace(
+            resident_key, static_cast<ResidentTaskId>(result.resident_tasks.size()));
+        ResidentTaskId resident_task_id = resident_it->second;
+        if (inserted) {
+          ResidentTaskDesc resident_task(task.task_type, task.variant_id);
+          resident_task.profiler_group_id = resident_task_id;
+          resident_task.num_inputs = task.num_inputs;
+          resident_task.num_outputs = task.num_outputs;
+          resident_task.execution_kind =
+              get_streaming_execution_kind(task.task_type);
+          resident_task.max_parallelism = 1;
+          resident_task.total_data_count = 0;
+          result.resident_tasks.push_back(resident_task);
+        } else {
+          ResidentTaskDesc const &existing = result.resident_tasks.at(resident_task_id);
+          if (existing.task_type != task.task_type ||
+              existing.variant_id != task.variant_id ||
+              existing.num_inputs != task.num_inputs ||
+              existing.num_outputs != task.num_outputs) {
+            throw std::runtime_error(
+                "Streaming task builder grouped heterogeneous task signatures "
+                "into one resident task.");
+          }
         }
+
         FullDataDesc data_desc;
         data_desc.resident_task_id = resident_task_id;
         data_desc.profiler_group_id = resident_task_id;
@@ -259,11 +392,9 @@ ResidentTaskGraph build_resident_task_graph(
         DataId data_id = static_cast<DataId>(result.all_data.size());
         result.task_to_data_id[task_id] = data_id;
         result.all_data.push_back(data_desc);
-        op_data_count++;
+        result.resident_tasks.at(resident_task_id).total_data_count += 1;
       }
     }
-    resident_task.total_data_count = op_data_count;
-    result.resident_tasks.push_back(resident_task);
   }
 
   std::unordered_map<uint32_t, std::vector<TaskId>> event_producers;
@@ -281,9 +412,12 @@ ResidentTaskGraph build_resident_task_graph(
   }
 
   for (size_t event_idx = 0; event_idx < all_events.size(); event_idx++) {
-    bool const hybrid_prelaunch =
-        execution_mode == RESIDENT_EXECUTION_HYBRID_PRELAUNCH;
-    if (hybrid_prelaunch && is_control_event(all_events[event_idx])) {
+    bool const local_data_dependencies =
+        execution_mode == RESIDENT_EXECUTION_HYBRID_PRELAUNCH ||
+        execution_mode == RESIDENT_EXECUTION_STREAMING ||
+        (flavor == DataAwareTaskGraphFlavor::STREAMING &&
+         streaming_base_mode == STREAMING_BASE_EXECUTION_HYBRID_PRELAUNCH);
+    if (local_data_dependencies && is_control_event(all_events[event_idx])) {
       continue;
     }
     auto producer_it = event_producers.find(static_cast<uint32_t>(event_idx));
@@ -293,7 +427,7 @@ ResidentTaskGraph build_resident_task_graph(
     }
     auto const &producer_tasks = producer_it->second;
     auto const &consumer_tasks = consumer_it->second;
-    if (hybrid_prelaunch) {
+    if (local_data_dependencies) {
       bool nvshmem_event = false;
       for (TaskId producer_task_id : producer_tasks) {
         if (is_nvshmem_event(all_tasks[producer_task_id].trigger_event)) {
@@ -932,23 +1066,37 @@ TaskGraphResult print_task_graph(
     std::unordered_map<kn::KNOperator const *,
                        std::tuple<int, int, TaskType, int>> const &task_configs,
     std::map<mirage::type::GuidType, IODesc> const &io_configs,
+    DataAwareTaskGraphFlavor flavor,
     bool use_json_format) {
   using mirage::runtime::IODesc;
   ResidentExecutionMode resident_execution_mode =
-      get_resident_execution_mode();
+      flavor == DataAwareTaskGraphFlavor::STREAMING
+          ? RESIDENT_EXECUTION_STREAMING
+          : get_resident_execution_mode();
+  StreamingBaseExecutionMode streaming_base_mode =
+      flavor == DataAwareTaskGraphFlavor::STREAMING
+          ? get_streaming_base_execution_mode()
+          : STREAMING_BASE_EXECUTION_LEGACY_EVENT;
   ResidentTaskGraph resident_graph =
-      build_resident_task_graph(graph,
-                                all_tasks,
-                                all_events,
-                                all_task_maps,
-                                resident_execution_mode);
+      build_data_aware_task_graph(graph,
+                                  all_tasks,
+                                  all_events,
+                                  all_task_maps,
+                                  flavor,
+                                  resident_execution_mode,
+                                  streaming_base_mode);
   validate_resident_task_graph(resident_graph);
   mirage::transpiler::CodeKeeper code;
   mirage::transpiler::CodeKeeper tgbody;
   tgbody.inc_indent();
   code.e("#define MIRAGE_RESIDENT_EXECUTION_MODE_VALUE $",
          static_cast<uint32_t>(resident_execution_mode));
-  code.e("#include \"resident_persistent_kernel.cuh\"");
+  code.e("#define MIRAGE_STREAMING_BASE_EXECUTION_MODE_VALUE $",
+         static_cast<uint32_t>(streaming_base_mode));
+  code.e("#include \"$\"",
+         flavor == DataAwareTaskGraphFlavor::STREAMING
+             ? "streaming_persistent_kernel.cuh"
+             : "resident_persistent_kernel.cuh");
   if (use_json_format) {
     code.e("#include <nlohmann/json.hpp>");
     code.e("#include <fstream>");
@@ -1106,6 +1254,9 @@ TaskGraphResult print_task_graph(
            "task.at(\"profiler_group_id\").get<uint32_t>();");
     code.e("resident_task.num_inputs = task.at(\"num_inputs\").get<int>();");
     code.e("resident_task.num_outputs = task.at(\"num_outputs\").get<int>();");
+    code.e("resident_task.execution_kind = task.contains(\"execution_kind\") ? "
+           "task.at(\"execution_kind\").get<uint32_t>() : "
+           "static_cast<uint32_t>(RESIDENT_TASK_EXECUTION_PRELAUNCHED);");
     code.e("resident_task.max_parallelism = "
            "task.at(\"max_parallelism\").get<int>();");
     code.e("resident_task.total_data_count = "
@@ -1306,6 +1457,10 @@ TaskGraphResult print_task_graph(
     }
   }
   json json_task_graph = {{"schema_version", 2},
+                          {"resident_execution_mode",
+                           static_cast<uint32_t>(resident_execution_mode)},
+                          {"streaming_base_execution_mode",
+                           static_cast<uint32_t>(streaming_base_mode)},
                           {"all_tasks", {}},
                           {"all_events", {}},
                           {"first_tasks", {}},
@@ -1795,6 +1950,7 @@ TaskGraphResult print_task_graph(
              {"profiler_group_id", resident_task.profiler_group_id},
              {"num_inputs", resident_task.num_inputs},
              {"num_outputs", resident_task.num_outputs},
+             {"execution_kind", resident_task.execution_kind},
              {"max_parallelism", resident_task.max_parallelism},
              {"total_data_count", resident_task.total_data_count}});
   }
@@ -1978,6 +2134,49 @@ TaskGraphResult Graph::generate_resident_task_graph(int _num_gpus, int _my_gpu_i
                           all_task_maps,
                           task_config,
                           io_config,
+                          DataAwareTaskGraphFlavor::RESIDENT,
+                          true /*use_json_format*/);
+}
+
+TaskGraphResult Graph::generate_streaming_task_graph(int _num_gpus,
+                                                     int _my_gpu_id) {
+  if (_num_gpus != 1) {
+    throw std::runtime_error(
+        "streaming_data currently supports only single-GPU execution.");
+  }
+  std::vector<FullTaskDesc> all_tasks;
+  std::vector<EventDesc> all_events;
+  std::vector<TaskId> first_tasks;
+  int num_gpus, my_gpu_id;
+  std::map<kernel::KNOperator *,
+           std::map<dim3, std::vector<TaskId>, Dim3Comparator>>
+      all_task_maps;
+  num_gpus = _num_gpus;
+  my_gpu_id = _my_gpu_id;
+  EventDesc e(EVENT_TERMINATION, 1, 0, 0);
+  all_events.push_back(e);
+  FullTaskDesc t(TASK_TERMINATE, 0 /*variant_id*/);
+  all_tasks.push_back(t);
+  register_mugraph(*this,
+                   num_gpus,
+                   my_gpu_id,
+                   all_tasks,
+                   all_events,
+                   first_tasks,
+                   all_task_maps,
+                   task_config);
+  assign_profiler_group_ids(all_tasks);
+  assert(sanity_check(*this, all_tasks, all_events, first_tasks));
+  return print_task_graph(*this,
+                          num_gpus,
+                          my_gpu_id,
+                          all_tasks,
+                          all_events,
+                          first_tasks,
+                          all_task_maps,
+                          task_config,
+                          io_config,
+                          DataAwareTaskGraphFlavor::STREAMING,
                           true /*use_json_format*/);
 }
 

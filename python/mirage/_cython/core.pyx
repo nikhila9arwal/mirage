@@ -1022,6 +1022,13 @@ cdef class CyKNGraph:
             "cuda_code": result.cuda_code.decode("UTF-8"),
             "json_file": result.json_file.decode("UTF-8"),
         }
+
+    def generate_streaming_task_graph(self, int num_gpus, int my_gpu_id):
+        cdef TaskGraphResult result = self.p_kgraph.generate_streaming_task_graph(num_gpus, my_gpu_id)
+        return {
+            "cuda_code": result.cuda_code.decode("UTF-8"),
+            "json_file": result.json_file.decode("UTF-8"),
+        }
      
 
 cdef class CyTBGraph:

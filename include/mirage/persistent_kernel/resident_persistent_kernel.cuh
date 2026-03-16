@@ -94,6 +94,23 @@ using namespace kernel;
 #ifndef MIRAGE_RESIDENT_EXECUTION_MODE_VALUE
 #define MIRAGE_RESIDENT_EXECUTION_MODE_VALUE RESIDENT_EXECUTION_SCHEDULER_DISPATCH
 #endif
+#ifndef MIRAGE_STREAMING_BASE_EXECUTION_MODE_VALUE
+#define MIRAGE_STREAMING_BASE_EXECUTION_MODE_VALUE \
+  STREAMING_BASE_EXECUTION_LEGACY_EVENT
+#endif
+
+#ifdef MIRAGE_STREAMING_BUILD
+#define MIRAGE_COMPILE_RESIDENT_SCHEDULER_DISPATCH 0
+#define MIRAGE_COMPILE_RESIDENT_HYBRID_PRELAUNCH 0
+#define MIRAGE_COMPILE_STREAMING_RUNTIME 1
+#else
+#define MIRAGE_COMPILE_RESIDENT_SCHEDULER_DISPATCH 1
+#define MIRAGE_COMPILE_RESIDENT_HYBRID_PRELAUNCH 1
+#define MIRAGE_COMPILE_STREAMING_RUNTIME 0
+#endif
+
+#define MIRAGE_STREAMING_BURST_QUOTA 8
+#define MIRAGE_STREAMING_MAX_READY_SUCCESSORS 1024
 
 __device__ __forceinline__ void
     _execute_task(TaskDesc const *task_desc,
@@ -146,6 +163,66 @@ resident_uses_hybrid_prelaunch(ResidentRuntimeConfig const &config) {
          RESIDENT_EXECUTION_HYBRID_PRELAUNCH;
 }
 
+__host__ __device__ __forceinline__ bool
+resident_uses_streaming(ResidentRuntimeConfig const &config) {
+  return get_resident_execution_mode(config) == RESIDENT_EXECUTION_STREAMING;
+}
+
+__host__ __device__ __forceinline__ StreamingBaseExecutionMode
+get_streaming_base_execution_mode(ResidentRuntimeConfig const &config) {
+  return static_cast<StreamingBaseExecutionMode>(
+      config.streaming_base_execution_mode);
+}
+
+__host__ __device__ __forceinline__ bool
+streaming_uses_hybrid_base(ResidentRuntimeConfig const &config) {
+  return resident_uses_streaming(config) &&
+         get_streaming_base_execution_mode(config) ==
+             STREAMING_BASE_EXECUTION_HYBRID_PRELAUNCH;
+}
+
+__host__ __device__ __forceinline__ bool
+streaming_uses_legacy_base(ResidentRuntimeConfig const &config) {
+  return resident_uses_streaming(config) &&
+         get_streaming_base_execution_mode(config) ==
+             STREAMING_BASE_EXECUTION_LEGACY_EVENT;
+}
+
+__host__ __device__ __forceinline__ bool
+resident_task_is_streaming(ResidentTaskDesc const &resident_task_desc) {
+  return resident_task_desc.execution_kind ==
+         RESIDENT_TASK_EXECUTION_STREAMING;
+}
+
+__host__ __device__ __forceinline__ bool
+resident_task_is_prelaunched(ResidentTaskDesc const &resident_task_desc) {
+  return resident_task_desc.execution_kind ==
+         RESIDENT_TASK_EXECUTION_PRELAUNCHED;
+}
+
+constexpr uint32_t STREAMING_RESIDENT_WORK_ITEM_TAG = 0x80000000u;
+
+__device__ __forceinline__ bool
+is_streaming_resident_work_item(TaskId task_id) {
+  return (get_task_position_index(task_id) & STREAMING_RESIDENT_WORK_ITEM_TAG) !=
+         0;
+}
+
+__device__ __forceinline__ ResidentTaskId
+get_streaming_resident_task_id(TaskId task_id) {
+  return static_cast<ResidentTaskId>(
+      get_task_position_index(task_id) & ~STREAMING_RESIDENT_WORK_ITEM_TAG);
+}
+
+__device__ __forceinline__ TaskId
+compute_streaming_resident_work_item(size_t iteration_num,
+                                     ResidentTaskId resident_task_id) {
+  return compute_task_id(
+      iteration_num,
+      STREAMING_RESIDENT_WORK_ITEM_TAG |
+          static_cast<uint32_t>(resident_task_id));
+}
+
 __global__ void init_kernel(ResidentRuntimeConfig config) {
   assert(gridDim.x == 1);
   assert(gridDim.y == 1);
@@ -194,11 +271,13 @@ __global__ void prepare_kernel(ResidentRuntimeConfig config,
     config.sched_queue_last_ready_event_id[i] = 0;
     config.sched_queue_next_free_event_id[i] = 0;
   }
-  for (int i = blockIdx.x * blockDim.x + threadIdx.x;
-       i < max(1, config.num_local_schedulers);
-       i += blockDim.x * gridDim.x) {
-    config.completion_queue_last_ready_data_id[i] = 0;
-    config.completion_queue_next_free_data_id[i] = 0;
+  if (!resident_uses_streaming(config)) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x;
+         i < max(1, config.num_local_schedulers);
+         i += blockDim.x * gridDim.x) {
+      config.completion_queue_last_ready_data_id[i] = 0;
+      config.completion_queue_next_free_data_id[i] = 0;
+    }
   }
   // Initialize all event counters
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < config.num_events;
@@ -214,6 +293,10 @@ __global__ void prepare_kernel(ResidentRuntimeConfig config,
     *config.completed_terminal_data_count = 0;
     *config.completed_data_this_iteration_count = 0;
     *config.current_iteration = 0;
+    if (resident_uses_streaming(config) &&
+        config.completed_streaming_data_count != nullptr) {
+      *config.completed_streaming_data_count = 0;
+    }
   }
   // Send event to scheduler[0]
   if (blockIdx.x == 0 && threadIdx.x == 0) {
@@ -249,14 +332,10 @@ __device__ __forceinline__ bool
         }
       }
       config.step[request_id] = step + num_tokens;
-#ifdef MPK_ENABLE_PROFILING
-      if (true)
-#else
       if ((step + num_tokens + 1 >= config.max_seq_length) ||
           ((config.tokens[request_id * MPK_MAX_SEQ_LENGTH + step +
                           num_tokens] == config.eos_token_id) &&
            (step + num_tokens >= prompt_len)))
-#endif
       {
         // Request is done
         config.request_ids[i] = -1;
@@ -483,6 +562,118 @@ __device__ __forceinline__ void terminate_schedulers(ResidentRuntimeConfig confi
   }
 }
 
+__device__ __forceinline__ bool
+event_ready_nonblocking(ResidentRuntimeConfig const &config,
+                        EventId event_id,
+                        TaskId current_task_id) {
+  if (event_id == EVENT_INVALID_ID) {
+    return true;
+  }
+  size_t event_index = get_event_position_index(event_id);
+  EventCounter needed_counts =
+      static_cast<EventCounter>(config.all_event_num_triggers[event_index]) *
+      get_task_iteration_num(current_task_id);
+  EventCounter actual_counts =
+      ld_acquire_sys_u64(&config.all_event_counters[event_index]);
+  return actual_counts >= needed_counts;
+}
+
+__device__ __forceinline__ bool
+prelaunched_task_ready_nonblocking(ResidentRuntimeConfig const &config,
+                                   TaskDesc const *task_desc,
+                                   TaskId current_task_id,
+                                   DataId current_data_id) {
+  if (current_data_id == DATA_INVALID_ID) {
+    return event_ready_nonblocking(
+        config, task_desc->dependent_event, current_task_id);
+  }
+  DataDesc const &data_desc = config.all_data[current_data_id];
+  ResidentTaskDesc const &resident_task_desc =
+      config.resident_tasks[data_desc.resident_task_id];
+  assert(resident_task_is_prelaunched(resident_task_desc));
+  if (streaming_uses_legacy_base(config)) {
+    return event_ready_nonblocking(
+        config, data_desc.dependent_event, current_task_id);
+  }
+  if (data_desc.dependent_event != EVENT_INVALID_ID &&
+      is_nvshmem_event(data_desc.dependent_event)) {
+    return event_ready_nonblocking(
+        config, data_desc.dependent_event, current_task_id);
+  }
+  return atomicAdd(&config.data_pending_predecessor_counts[current_data_id], 0u) ==
+         0u;
+}
+
+__device__ __forceinline__ bool
+compat_task_is_prelaunched(ResidentRuntimeConfig const &config,
+                           TaskId task_position) {
+  if (task_position < static_cast<TaskId>(config.num_control_tasks)) {
+    return true;
+  }
+  DataId data_id = config.task_to_data_id[task_position];
+  if (data_id == DATA_INVALID_ID) {
+    return true;
+  }
+  ResidentTaskId resident_task_id = config.all_data[data_id].resident_task_id;
+  return resident_task_is_prelaunched(config.resident_tasks[resident_task_id]);
+}
+
+__device__ __forceinline__ void
+enqueue_prelaunched_task_range(ResidentRuntimeConfig const &config,
+                               int my_first_worker,
+                               int my_last_worker,
+                               int *next_worker,
+                               size_t *worker_queue_next_free_task_pos,
+                               size_t iteration_num,
+                               TaskId first_task_id,
+                               TaskId last_task_id) {
+  for (TaskId task_pos = first_task_id; task_pos < last_task_id; task_pos++) {
+    if (!compat_task_is_prelaunched(config, task_pos)) {
+      continue;
+    }
+    enqueue_worker_item(
+        config,
+        *next_worker,
+        &worker_queue_next_free_task_pos[*next_worker - my_first_worker],
+        compute_task_id(iteration_num, task_pos));
+    *next_worker = (*next_worker == my_last_worker - 1) ? my_first_worker
+                                                        : *next_worker + 1;
+  }
+}
+
+__device__ __forceinline__ void
+enqueue_prelaunched_dependent_tasks_partitioned(
+    ResidentRuntimeConfig const &config,
+    int my_first_worker,
+    int my_last_worker,
+    int *next_worker,
+    size_t *worker_queue_next_free_task_pos,
+    size_t iteration_num,
+    EventDesc const &event_desc) {
+  for (size_t chunk_idx = 0;
+       chunk_idx <
+       (event_desc.last_task_id - event_desc.first_task_id +
+        config.num_workers - 1) /
+           config.num_workers;
+       chunk_idx++) {
+    for (size_t worker = my_first_worker; worker < my_last_worker; worker++) {
+      size_t position_index =
+          event_desc.first_task_id + chunk_idx * config.num_workers + worker;
+      if (position_index >= event_desc.last_task_id ||
+          !compat_task_is_prelaunched(config, position_index)) {
+        continue;
+      }
+      enqueue_worker_item(
+          config,
+          *next_worker,
+          &worker_queue_next_free_task_pos[*next_worker - my_first_worker],
+          compute_task_id(iteration_num, position_index));
+      *next_worker = (*next_worker == my_last_worker - 1) ? my_first_worker
+                                                          : *next_worker + 1;
+    }
+  }
+}
+
 __device__ __forceinline__ void worker_checker(ResidentRuntimeConfig config) {
   assert(gridDim.y == 1);
   assert(gridDim.z == 1);
@@ -594,12 +785,73 @@ enqueue_worker_item(ResidentRuntimeConfig const &config,
                            1);
 }
 
+__device__ __forceinline__ uint32_t
+streaming_resident_queue_capacity(ResidentRuntimeConfig const &config,
+                                  ResidentTaskId resident_task_id) {
+  return config.resident_ready_queue_offsets[resident_task_id + 1] -
+         config.resident_ready_queue_offsets[resident_task_id];
+}
+
+__device__ __forceinline__ uint32_t
+streaming_worker_resident_begin(ResidentRuntimeConfig const &config,
+                                int worker_id) {
+  return config.worker_streaming_resident_offsets[worker_id];
+}
+
+__device__ __forceinline__ uint32_t
+streaming_worker_resident_end(ResidentRuntimeConfig const &config,
+                              int worker_id) {
+  return config.worker_streaming_resident_offsets[worker_id + 1];
+}
+
+__device__ __forceinline__ void
+publish_streaming_resident_ready_data(ResidentRuntimeConfig const &config,
+                                      ResidentTaskId resident_task_id,
+                                      DataId data_id) {
+  uint32_t queue_capacity =
+      streaming_resident_queue_capacity(config, resident_task_id);
+  assert(queue_capacity > 0);
+  uint32_t queue_offset = config.resident_ready_queue_offsets[resident_task_id];
+  uint32_t next_pos =
+      atomicAdd(&config.resident_ready_next_free_positions[resident_task_id], 1u);
+  uint32_t head_pos =
+      atomicAdd(&config.resident_ready_head_positions[resident_task_id], 0u);
+  assert(next_pos < head_pos + queue_capacity);
+  config.resident_ready_queue_storage[queue_offset + (next_pos % queue_capacity)] =
+      data_id;
+  __threadfence();
+  while (atomicCAS(&config.resident_ready_tail_positions[resident_task_id],
+                   next_pos,
+                   next_pos + 1) != next_pos) {
+  }
+}
+
+__device__ __forceinline__ bool
+pop_streaming_resident_ready_data(ResidentRuntimeConfig const &config,
+                                  ResidentTaskId resident_task_id,
+                                  DataId *data_id) {
+  uint32_t head_pos = config.resident_ready_head_positions[resident_task_id];
+  uint32_t last_ready =
+      atomicAdd(&config.resident_ready_tail_positions[resident_task_id], 0u);
+  if (head_pos >= last_ready) {
+    return false;
+  }
+  uint32_t queue_capacity =
+      streaming_resident_queue_capacity(config, resident_task_id);
+  uint32_t queue_offset = config.resident_ready_queue_offsets[resident_task_id];
+  *data_id = config.resident_ready_queue_storage[queue_offset +
+                                                 (head_pos % queue_capacity)];
+  config.resident_ready_head_positions[resident_task_id] = head_pos + 1;
+  return true;
+}
+
 __device__ __forceinline__ void
 trigger_task_event(ResidentRuntimeConfig const &config,
                    TaskDesc const *task_desc,
                    TaskId current_task_id,
                    int worker_id) {
-  EventId event_id = task_desc->trigger_event;
+  EventId const event_id = task_desc->trigger_event;
+  TaskType const task_type = task_desc->task_type;
   if (event_id == EVENT_INVALID_ID) {
     return;
   }
@@ -631,7 +883,49 @@ trigger_task_event(ResidentRuntimeConfig const &config,
       }
     }
   } else {
-    assert(task_desc->task_type == TASK_NVSHMEM_ALLGATHER_STRIDED_PUT);
+    assert(task_type == TASK_NVSHMEM_ALLGATHER_STRIDED_PUT);
+  }
+}
+
+__device__ __forceinline__ void
+trigger_data_event(ResidentRuntimeConfig const &config,
+                   DataDesc const *data_desc,
+                   TaskType task_type,
+                   TaskId current_task_id,
+                   int worker_id) {
+  EventId const event_id = data_desc->trigger_event;
+  if (event_id == EVENT_INVALID_ID) {
+    return;
+  }
+  size_t event_index = get_event_position_index(event_id);
+  if (!is_nvshmem_event(event_id)) {
+    size_t gpu_id = get_event_gpu_id(event_id);
+    assert(gpu_id == config.my_gpu_id);
+    EventCounter count =
+        atom_add_release_gpu_u64(&config.all_event_counters[event_index], 1);
+    int num_triggers = config.all_event_num_triggers[event_index];
+    if ((count + 1) ==
+        static_cast<EventCounter>(num_triggers) *
+            get_task_iteration_num(current_task_id)) {
+      EventDesc event_desc = config.all_events[event_index];
+      if (event_desc.event_type != EVENT_EMPTY) {
+        bool use_bcast_queue = false;
+        if (event_desc.event_type == EVENT_LAUNCH_MASSIVE_TASKS ||
+            event_desc.event_type == EVENT_LAUNCH_DEPENDENT_TASKS) {
+          use_bcast_queue = true;
+        }
+        int sched_id =
+            use_bcast_queue
+                ? config.num_local_schedulers + config.num_remote_schedulers
+                : get_rand_sched_id(event_index,
+                                    worker_id,
+                                    config.num_workers,
+                                    config.num_local_schedulers);
+        publish_scheduler_event(config, sched_id, event_index);
+      }
+    }
+  } else {
+    assert(task_type == TASK_NVSHMEM_ALLGATHER_STRIDED_PUT);
   }
 }
 
@@ -665,6 +959,26 @@ reset_iteration_state_parallel(ResidentRuntimeConfig const &config,
 }
 
 __device__ __forceinline__ void
+reset_streaming_iteration_state_parallel(ResidentRuntimeConfig const &config,
+                                         int lane_id,
+                                         int lane_count) {
+  reset_iteration_state_parallel(config, lane_id, lane_count);
+  for (ResidentTaskId resident_task_id = lane_id;
+       resident_task_id < config.num_resident_tasks;
+       resident_task_id += lane_count) {
+    config.resident_ready_head_positions[resident_task_id] = 0u;
+    config.resident_ready_next_free_positions[resident_task_id] = 0u;
+    config.resident_ready_tail_positions[resident_task_id] = 0u;
+  }
+  if (lane_id == 0) {
+    *config.completed_streaming_data_count = 0u;
+  }
+  __syncwarp();
+  __threadfence();
+  __syncwarp();
+}
+
+__device__ __forceinline__ void
 release_completed_data(ResidentRuntimeConfig const &config,
                        DataId data_id,
                        EventId trigger_event) {
@@ -690,6 +1004,78 @@ release_completed_data(ResidentRuntimeConfig const &config,
     if (completed_terminal ==
         static_cast<unsigned int>(config.num_terminal_data)) {
       publish_scheduler_event(config, 0, config.end_event_index);
+    }
+  }
+}
+
+__device__ __forceinline__ void
+release_completed_data_streaming(ResidentRuntimeConfig const &config,
+                                 DataId data_id,
+                                 bool count_streaming_completion,
+                                 bool count_terminal_completion,
+                                 uint32_t *ready_streaming_edge_bits) {
+  __threadfence();
+  __syncthreads();
+
+  DataId edge_begin = config.data_edge_offsets[data_id];
+  DataId edge_end = config.data_edge_offsets[data_id + 1];
+  DataId edge_count = edge_end - edge_begin;
+  if (threadIdx.x == 0) {
+    assert(edge_count <= MIRAGE_STREAMING_MAX_READY_SUCCESSORS);
+  }
+  for (int word_idx = threadIdx.x;
+       word_idx < MIRAGE_STREAMING_MAX_READY_SUCCESSORS / 32;
+       word_idx += blockDim.x) {
+    ready_streaming_edge_bits[word_idx] = 0u;
+  }
+  __syncthreads();
+
+  for (DataId edge_idx = edge_begin + threadIdx.x; edge_idx < edge_end;
+       edge_idx += blockDim.x) {
+    DataId succ_data_id = config.data_edge_targets[edge_idx];
+    unsigned int remaining =
+        atomicSub(&config.data_pending_predecessor_counts[succ_data_id], 1u);
+    assert(remaining > 0);
+    if (remaining == 1u) {
+      ResidentTaskId succ_resident_task_id =
+          config.all_data[succ_data_id].resident_task_id;
+      if (resident_task_is_streaming(
+              config.resident_tasks[succ_resident_task_id])) {
+        DataId local_edge_idx = edge_idx - edge_begin;
+        atomicOr(&ready_streaming_edge_bits[local_edge_idx / 32],
+                 1u << (local_edge_idx % 32));
+      }
+    }
+  }
+
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    if (count_streaming_completion) {
+      atomicAdd(config.completed_streaming_data_count, 1u);
+    }
+    for (DataId local_edge_idx = 0; local_edge_idx < edge_count;
+         local_edge_idx++) {
+      if ((ready_streaming_edge_bits[local_edge_idx / 32] &
+           (1u << (local_edge_idx % 32))) == 0u) {
+        continue;
+      }
+      DataId succ_data_id = config.data_edge_targets[edge_begin + local_edge_idx];
+      ResidentTaskId succ_resident_task_id =
+          config.all_data[succ_data_id].resident_task_id;
+      publish_streaming_resident_ready_data(
+          config, succ_resident_task_id, succ_data_id);
+    }
+    bool const has_remote_trigger =
+        config.all_data[data_id].trigger_event != EVENT_INVALID_ID &&
+        is_nvshmem_event(config.all_data[data_id].trigger_event);
+    if (count_terminal_completion && edge_begin == edge_end &&
+        !has_remote_trigger) {
+      unsigned int completed_terminal =
+          atomicAdd(config.completed_terminal_data_count, 1u) + 1u;
+      if (completed_terminal ==
+          static_cast<unsigned int>(config.num_terminal_data)) {
+        publish_scheduler_event(config, 0, config.end_event_index);
+      }
     }
   }
 }
@@ -832,11 +1218,17 @@ execute_worker_scheduler_dispatch(ResidentRuntimeConfig config) {
 
 #ifdef MPK_ENABLE_PROFILING
     uint32_t profiler_event_no = task_counter;
-    if (uses_dag_profiler_group(task_desc->task_type)) {
+    if (current_data_id != DATA_INVALID_ID) {
+      profiler_event_no = config.all_data[current_data_id].profiler_group_id;
+    } else if (uses_dag_profiler_group(task_desc->task_type)) {
       profiler_event_no = task_desc->profiler_group_id;
     }
     if (task_desc->task_type != TASK_TERMINATE) {
       PROFILER_EVENT_START(task_desc->task_type, profiler_event_no);
+      if (current_data_id != DATA_INVALID_ID) {
+        PROFILER_EVENT_METADATA(
+            task_desc->task_type, profiler_event_no, current_data_id);
+      }
     }
 #endif
 
@@ -1018,11 +1410,17 @@ execute_worker_hybrid_prelaunch(ResidentRuntimeConfig config) {
 
 #ifdef MPK_ENABLE_PROFILING
     uint32_t profiler_event_no = task_counter;
-    if (uses_dag_profiler_group(task_desc->task_type)) {
+    if (current_data_id != DATA_INVALID_ID) {
+      profiler_event_no = config.all_data[current_data_id].profiler_group_id;
+    } else if (uses_dag_profiler_group(task_desc->task_type)) {
       profiler_event_no = task_desc->profiler_group_id;
     }
     if (task_desc->task_type != TASK_TERMINATE) {
       PROFILER_EVENT_START(task_desc->task_type, profiler_event_no);
+      if (current_data_id != DATA_INVALID_ID) {
+        PROFILER_EVENT_METADATA(
+            task_desc->task_type, profiler_event_no, current_data_id);
+      }
     }
 #endif
 
@@ -1047,6 +1445,462 @@ execute_worker_hybrid_prelaunch(ResidentRuntimeConfig config) {
     }
     __syncthreads();
     queue_pos += 1;
+  }
+}
+
+__device__ __forceinline__ void
+execute_worker_streaming(ResidentRuntimeConfig config) {
+  constexpr int TASK_DESCS_BUFFER_LENGTH = std::min(
+      (mirage::runtime::WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE - 256) /
+          (int)(sizeof(TaskDesc) + sizeof(TaskId)),
+      16);
+  __shared__ TaskDesc task_descs[TASK_DESCS_BUFFER_LENGTH];
+  __shared__ TaskId task_ids[TASK_DESCS_BUFFER_LENGTH];
+  __shared__ TaskId current_task_id;
+  __shared__ DataId current_data_id;
+  __shared__ ResidentTaskId current_streaming_resident_id;
+  __shared__ int current_queue_idx;
+  __shared__ int queue_pos;
+  __shared__ int queue_len;
+  __shared__ bool queue_task_ready;
+  __shared__ bool executed_streaming_work;
+  __shared__ uint32_t next_streaming_resident_slot;
+  __shared__ uint32_t ready_streaming_edge_bits
+      [MIRAGE_STREAMING_MAX_READY_SUCCESSORS / 32];
+  __shared__ TaskId *worker_queues[2];
+  __shared__ int worker_queue_ids[2];
+  __shared__ size_t next_task_pos[2];
+  __shared__ size_t last_task_pos[2];
+
+#ifdef MPK_ENABLE_PROFILING
+  PROFILER_CLOSURE_PARAMS_DECL;
+  PROFILER_INIT(static_cast<uint64_t *>(config.profiler_buffer),
+                0,
+                1,
+                (threadIdx.x % WORKER_NUM_THREADS == 0));
+#endif
+
+  int const worker_id = blockIdx.x;
+  worker_queues[0] = config.worker_queues[worker_id];
+  worker_queue_ids[0] = worker_id;
+  int num_worker_queues = 1;
+  if (config.num_gpus > 1) {
+    worker_queues[num_worker_queues] =
+        config.worker_queues[worker_id + config.num_workers];
+    worker_queue_ids[num_worker_queues] = worker_id + config.num_workers;
+    num_worker_queues++;
+  }
+
+  if (threadIdx.x == 0) {
+    for (int i = 0; i < 2; i++) {
+      next_task_pos[i] = 0;
+      last_task_pos[i] = 0;
+    }
+    queue_pos = 0;
+    queue_len = 0;
+    next_streaming_resident_slot = 0;
+  }
+
+#ifdef MPK_ENABLE_PROFILING
+  size_t task_counter = 0;
+#endif
+
+  while (true) {
+    if (queue_pos == queue_len) {
+      if (threadIdx.x == 0) {
+        current_queue_idx = -1;
+        for (int attempt = 0; attempt < num_worker_queues; attempt++) {
+          int queue_idx = attempt;
+          last_task_pos[queue_idx] =
+              ld_acquire_gpu_u64(&config.worker_queue_last_ready_task_id
+                                      [worker_queue_ids[queue_idx]]);
+          if (next_task_pos[queue_idx] < last_task_pos[queue_idx]) {
+            current_queue_idx = queue_idx;
+            break;
+          }
+        }
+      }
+      __syncthreads();
+      if (current_queue_idx >= 0) {
+        int num_loaded_tasks =
+            min((int)(last_task_pos[current_queue_idx] -
+                      next_task_pos[current_queue_idx]),
+                TASK_DESCS_BUFFER_LENGTH);
+        if (threadIdx.x < num_loaded_tasks) {
+          task_ids[threadIdx.x] = ld_relaxed_gpu_u64(
+              &worker_queues[current_queue_idx]
+                            [(next_task_pos[current_queue_idx] + threadIdx.x) %
+                             config.per_worker_queue_len]);
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+          next_task_pos[current_queue_idx] += num_loaded_tasks;
+        }
+        static_assert(sizeof(TaskDesc) % 16 == 0);
+        constexpr int TASK_SIZE = sizeof(TaskDesc) / 16;
+        for (int i = threadIdx.x; i < num_loaded_tasks * TASK_SIZE;
+             i += blockDim.x) {
+          int task_idx = i / TASK_SIZE;
+          int offset = i % TASK_SIZE;
+          load_smem(reinterpret_cast<char *>(task_descs) + i * 16,
+                    reinterpret_cast<char *>(
+                        config.all_tasks +
+                        get_task_position_index(task_ids[task_idx])) +
+                        offset * 16);
+        }
+        kernel::cp_async_fence();
+        kernel::cp_async_wait<0>();
+        __syncthreads();
+        if (threadIdx.x == 0) {
+          queue_pos = 0;
+          queue_len = num_loaded_tasks;
+        }
+      } else if (threadIdx.x == 0) {
+        queue_pos = 0;
+        queue_len = 0;
+      }
+      __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+      current_task_id = TASK_INVALID_ID;
+      current_data_id = DATA_INVALID_ID;
+      queue_task_ready = false;
+      if (queue_pos < queue_len) {
+        TaskDesc const *task_desc = task_descs + queue_pos;
+        current_task_id = task_ids[queue_pos];
+        size_t position_index = get_task_position_index(current_task_id);
+        if (position_index >= static_cast<size_t>(config.num_control_tasks)) {
+          current_data_id = config.task_to_data_id[position_index];
+          if (current_data_id != DATA_INVALID_ID) {
+            ResidentTaskId resident_task_id =
+                config.all_data[current_data_id].resident_task_id;
+            assert(resident_task_is_prelaunched(
+                config.resident_tasks[resident_task_id]));
+          }
+        }
+        queue_task_ready = prelaunched_task_ready_nonblocking(
+            config, task_desc, current_task_id, current_data_id);
+      }
+    }
+    __syncthreads();
+
+    if (queue_task_ready) {
+      TaskDesc *task_desc = task_descs + queue_pos;
+      if (task_desc->task_type == TASK_TERMINATE) {
+        return;
+      }
+
+#ifdef MPK_ENABLE_PROFILING
+      uint32_t profiler_event_no = task_counter;
+      if (current_data_id != DATA_INVALID_ID) {
+        profiler_event_no = config.all_data[current_data_id].profiler_group_id;
+      } else if (uses_dag_profiler_group(task_desc->task_type)) {
+        profiler_event_no = task_desc->profiler_group_id;
+      }
+      PROFILER_EVENT_START(task_desc->task_type, profiler_event_no);
+      if (current_data_id != DATA_INVALID_ID) {
+        PROFILER_EVENT_METADATA(
+            task_desc->task_type, profiler_event_no, current_data_id);
+      }
+#endif
+
+      if (task_desc->task_type != TASK_BEGIN_TASK_GRAPH) {
+        _execute_task(task_desc, config);
+      }
+      __syncthreads();
+
+#ifdef MPK_ENABLE_PROFILING
+      PROFILER_EVENT_END(task_desc->task_type, profiler_event_no);
+      task_counter++;
+#endif
+
+      if (current_data_id != DATA_INVALID_ID) {
+        release_completed_data_streaming(
+            config, current_data_id, false /*count_streaming_completion*/,
+            streaming_uses_hybrid_base(config) /*count_terminal_completion*/,
+            ready_streaming_edge_bits);
+        if (threadIdx.x == 0 && streaming_uses_legacy_base(config)) {
+          trigger_data_event(
+              config, config.all_data + current_data_id, task_desc->task_type,
+              current_task_id, worker_id);
+        }
+      } else if (threadIdx.x == 0) {
+        trigger_task_event(config, task_desc, current_task_id, worker_id);
+      }
+      __syncthreads();
+      if (threadIdx.x == 0) {
+        queue_pos += 1;
+      }
+      __syncthreads();
+      continue;
+    }
+
+    if (threadIdx.x == 0) {
+      current_streaming_resident_id = RESIDENT_TASK_INVALID_ID;
+      current_data_id = DATA_INVALID_ID;
+      executed_streaming_work = false;
+      uint32_t resident_begin = streaming_worker_resident_begin(config, worker_id);
+      uint32_t resident_end = streaming_worker_resident_end(config, worker_id);
+      uint32_t resident_count = resident_end - resident_begin;
+      for (uint32_t attempt = 0; attempt < resident_count; attempt++) {
+        uint32_t resident_slot =
+            resident_begin +
+            ((next_streaming_resident_slot + attempt) % resident_count);
+        ResidentTaskId resident_task_id =
+            config.worker_streaming_resident_ids[resident_slot];
+        if (!pop_streaming_resident_ready_data(
+                config, resident_task_id, &current_data_id)) {
+          continue;
+        }
+        current_streaming_resident_id = resident_task_id;
+        next_streaming_resident_slot =
+            (next_streaming_resident_slot + attempt + 1) % resident_count;
+        executed_streaming_work = true;
+        break;
+      }
+    }
+    __syncthreads();
+
+    if (!executed_streaming_work) {
+      __nanosleep(10);
+      continue;
+    }
+
+    for (int burst = 0; burst < MIRAGE_STREAMING_BURST_QUOTA; burst++) {
+      ResidentTaskDesc const *resident_task_desc =
+          config.resident_tasks + current_streaming_resident_id;
+      DataDesc const *data_desc = config.all_data + current_data_id;
+      assert(resident_task_is_streaming(*resident_task_desc));
+      if (threadIdx.x == 0 &&
+          data_desc->dependent_event != EVENT_INVALID_ID) {
+        assert(!is_nvshmem_event(data_desc->dependent_event) &&
+               "streaming_data supports only single-GPU execution");
+      }
+      __syncthreads();
+
+#ifdef MPK_ENABLE_PROFILING
+      uint32_t profiler_event_no = data_desc->profiler_group_id;
+      PROFILER_EVENT_START(resident_task_desc->task_type, profiler_event_no);
+      PROFILER_EVENT_METADATA(
+          resident_task_desc->task_type, profiler_event_no, current_data_id);
+#endif
+
+      _execute_task(resident_task_desc, data_desc, config);
+      __syncthreads();
+
+#ifdef MPK_ENABLE_PROFILING
+      PROFILER_EVENT_END(resident_task_desc->task_type, profiler_event_no);
+      task_counter++;
+#endif
+
+      release_completed_data_streaming(
+          config, current_data_id, true /*count_streaming_completion*/,
+          streaming_uses_hybrid_base(config) /*count_terminal_completion*/,
+          ready_streaming_edge_bits);
+      if (threadIdx.x == 0 && streaming_uses_legacy_base(config)) {
+        TaskId compat_task_id =
+            compute_task_id(atomicAdd(config.current_iteration, 0u),
+                            config.data_to_task_id[current_data_id]);
+        trigger_data_event(config,
+                           data_desc,
+                           resident_task_desc->task_type,
+                           compat_task_id,
+                           worker_id);
+      }
+      __syncthreads();
+
+      if (burst == MIRAGE_STREAMING_BURST_QUOTA - 1) {
+        break;
+      }
+      if (threadIdx.x == 0) {
+        if (!pop_streaming_resident_ready_data(config,
+                                               current_streaming_resident_id,
+                                               &current_data_id)) {
+          current_streaming_resident_id = RESIDENT_TASK_INVALID_ID;
+        }
+      }
+      __syncthreads();
+      if (current_streaming_resident_id == RESIDENT_TASK_INVALID_ID) {
+        break;
+      }
+    }
+  }
+}
+
+__device__ __forceinline__ void
+seed_streaming_first_data(ResidentRuntimeConfig const &config) {
+  if (threadIdx.x != 0) {
+    return;
+  }
+  for (int i = 0; i < config.num_first_data_ids; i++) {
+    DataId data_id = config.first_data_ids[i];
+    ResidentTaskId resident_task_id = config.all_data[data_id].resident_task_id;
+    if (!resident_task_is_streaming(config.resident_tasks[resident_task_id])) {
+      continue;
+    }
+    publish_streaming_resident_ready_data(config, resident_task_id, data_id);
+  }
+}
+
+__device__ __forceinline__ void
+execute_scheduler_streaming(ResidentRuntimeConfig config) {
+  int const sched_id = blockIdx.x;
+  if (sched_id >= config.num_local_schedulers) {
+    return;
+  }
+
+  __shared__ size_t cur_event_pos[2];
+  __shared__ size_t last_event_pos[2];
+  __shared__ int queue_idx;
+  __shared__ EventId current_event_id;
+  __shared__ EventDesc current_event_desc;
+  __shared__ bool continue_iteration;
+
+  if (threadIdx.x == 0) {
+    cur_event_pos[0] = 0;
+    cur_event_pos[1] = 0;
+    last_event_pos[0] = 0;
+    last_event_pos[1] = 0;
+    queue_idx = 0;
+  }
+  __syncthreads();
+
+  EventId *sched_queues[2];
+  int sched_queue_ids[2];
+  int num_sched_queues = 1;
+  sched_queues[0] = config.sched_queues[sched_id];
+  sched_queue_ids[0] = sched_id;
+  int num_schedulers =
+      config.num_local_schedulers + config.num_remote_schedulers;
+  sched_queues[num_sched_queues] = config.sched_queues[num_schedulers];
+  sched_queue_ids[num_sched_queues] = num_schedulers;
+  num_sched_queues++;
+
+  unsigned long long int my_first_worker, my_last_worker;
+  get_first_last_ids(config.num_workers,
+                     config.num_local_schedulers,
+                     sched_id,
+                     &my_first_worker,
+                     &my_last_worker);
+  size_t worker_queue_next_free_task_pos[MAX_WORKER_PER_SCHEDULER];
+  for (int i = 0; i < MAX_WORKER_PER_SCHEDULER; i++) {
+    worker_queue_next_free_task_pos[i] = 0;
+  }
+
+  size_t iteration_num = 0;
+  while (true) {
+    if (threadIdx.x == 0) {
+      while (cur_event_pos[queue_idx] == last_event_pos[queue_idx]) {
+        last_event_pos[queue_idx] = ld_acquire_gpu_u64(
+            &config.sched_queue_last_ready_event_id[sched_queue_ids[queue_idx]]);
+        if (cur_event_pos[queue_idx] < last_event_pos[queue_idx]) {
+          break;
+        }
+        queue_idx = (queue_idx == num_sched_queues - 1) ? 0 : queue_idx + 1;
+        __nanosleep(10);
+      }
+      assert(cur_event_pos[queue_idx] + config.per_sched_queue_len >
+             last_event_pos[queue_idx]);
+      current_event_id = ld_relaxed_gpu_u64(
+          &sched_queues[queue_idx]
+                       [cur_event_pos[queue_idx] % config.per_sched_queue_len]);
+      current_event_desc = config.all_events[current_event_id];
+      cur_event_pos[queue_idx] += 1;
+    }
+    __syncthreads();
+
+    if (is_termination_event(current_event_id, current_event_desc)) {
+      if (threadIdx.x == 0) {
+        for (int worker = my_first_worker; worker < my_last_worker; worker++) {
+          publish_worker_item(config, worker, 0);
+        }
+      }
+      return;
+    }
+
+    if (current_event_desc.event_type == EVENT_END_OF_TASK_GRAPH) {
+      if (threadIdx.x == 0) {
+#ifdef MODE_ONLINE_NOTOKEN
+        continue_iteration = prepare_next_batch(config, iteration_num);
+#else
+        continue_iteration = prepare_next_batch(config);
+#endif
+      }
+      __syncthreads();
+      if (!continue_iteration) {
+        if (threadIdx.x == 0) {
+          terminate_schedulers(config);
+        }
+        return;
+      }
+
+      reset_streaming_iteration_state_parallel(config, threadIdx.x, blockDim.x);
+      if (threadIdx.x == 0) {
+        int next_worker = static_cast<int>(my_first_worker);
+        enqueue_worker_item(
+            config,
+            next_worker,
+            &worker_queue_next_free_task_pos[next_worker - my_first_worker],
+            compute_task_id(iteration_num + 1, BEGIN_TASK_GRAPH_TASK_ID));
+      }
+      __syncthreads();
+      continue;
+    }
+
+    if (current_event_desc.event_type == EVENT_LAUNCH_DEPENDENT_TASKS) {
+      if (threadIdx.x == 0) {
+        iteration_num += 1;
+        if (current_event_id == static_cast<EventId>(config.begin_event_index)) {
+          *config.current_iteration = static_cast<uint32_t>(iteration_num);
+        }
+        int next_worker = static_cast<int>(my_first_worker);
+        enqueue_prelaunched_dependent_tasks_partitioned(
+            config,
+            my_first_worker,
+            my_last_worker,
+            &next_worker,
+            worker_queue_next_free_task_pos,
+            iteration_num,
+            current_event_desc);
+      }
+      __syncthreads();
+      if (sched_id == 0 &&
+          current_event_id == static_cast<EventId>(config.begin_event_index)) {
+        seed_streaming_first_data(config);
+      }
+      __syncthreads();
+      continue;
+    }
+
+    if (current_event_desc.event_type == EVENT_LAUNCH_TASKS ||
+        current_event_desc.event_type == EVENT_LAUNCH_MASSIVE_TASKS) {
+      TaskId my_first_task = current_event_desc.first_task_id;
+      TaskId my_last_task = current_event_desc.last_task_id;
+      if (current_event_desc.event_type == EVENT_LAUNCH_MASSIVE_TASKS) {
+        get_first_last_ids(current_event_desc.last_task_id -
+                               current_event_desc.first_task_id,
+                           config.num_local_schedulers,
+                           sched_id,
+                           &my_first_task,
+                           &my_last_task);
+        my_first_task += current_event_desc.first_task_id;
+        my_last_task += current_event_desc.first_task_id;
+      }
+      if (threadIdx.x == 0) {
+        int next_worker = static_cast<int>(my_first_worker);
+        enqueue_prelaunched_task_range(config,
+                                       my_first_worker,
+                                       my_last_worker,
+                                       &next_worker,
+                                       worker_queue_next_free_task_pos,
+                                       iteration_num,
+                                       my_first_task,
+                                       my_last_task);
+      }
+      __syncthreads();
+      continue;
+    }
   }
 }
 
@@ -1468,6 +2322,7 @@ execute_scheduler_hybrid_prelaunch(ResidentRuntimeConfig config, int offset) {
   }
 }
 
+#if MIRAGE_COMPILE_RESIDENT_SCHEDULER_DISPATCH
 __global__ __launch_bounds__(WORKER_NUM_THREADS,
                              1) void
 persistent_kernel_scheduler_dispatch(ResidentRuntimeConfig config) {
@@ -1491,7 +2346,9 @@ __global__ void scheduler_kernel_scheduler_dispatch(
   scheduler_checker(config);
   execute_scheduler_scheduler_dispatch(config, 0);
 }
+#endif
 
+#if MIRAGE_COMPILE_RESIDENT_HYBRID_PRELAUNCH
 __global__ __launch_bounds__(WORKER_NUM_THREADS,
                              1) void
 persistent_kernel_hybrid_prelaunch(ResidentRuntimeConfig config) {
@@ -1515,6 +2372,21 @@ __global__ void scheduler_kernel_hybrid_prelaunch(
   scheduler_checker(config);
   execute_scheduler_hybrid_prelaunch(config, 0);
 }
+#endif
+
+#if MIRAGE_COMPILE_STREAMING_RUNTIME
+__global__ __launch_bounds__(WORKER_NUM_THREADS,
+                             1) void
+worker_kernel_streaming(ResidentRuntimeConfig config) {
+  worker_checker(config);
+  execute_worker_streaming(config);
+}
+
+__global__ void scheduler_kernel_streaming(ResidentRuntimeConfig config) {
+  scheduler_checker(config);
+  execute_scheduler_streaming(config);
+}
+#endif
 
 template <typename DT>
 DT *gpu_malloc(size_t size) {
@@ -1664,9 +2536,16 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
   global_runtime_config.num_graphs = 1;
   global_runtime_config.resident_execution_mode =
       MIRAGE_RESIDENT_EXECUTION_MODE_VALUE;
+  global_runtime_config.streaming_base_execution_mode =
+      MIRAGE_STREAMING_BASE_EXECUTION_MODE_VALUE;
+  if (resident_uses_streaming(global_runtime_config)) {
+    assert(npes == 1 && "streaming_data currently supports only single-GPU execution");
+  }
   global_runtime_config.split_worker_scheduler =
-      resident_uses_hybrid_prelaunch(global_runtime_config) ? (npes == 1)
-                                                            : true;
+      resident_uses_streaming(global_runtime_config)
+          ? true
+          : (resident_uses_hybrid_prelaunch(global_runtime_config) ? (npes == 1)
+                                                                   : true);
   global_runtime_config.num_control_tasks = 2;
   global_runtime_config.completion_queue_last_ready_data_id = nullptr;
   global_runtime_config.completion_queue_next_free_data_id = nullptr;
@@ -1674,11 +2553,21 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
   global_runtime_config.data_last_executed_iteration = nullptr;
   global_runtime_config.data_to_task_id = nullptr;
   global_runtime_config.worker_owner_scheduler = nullptr;
+  global_runtime_config.resident_owner_worker = nullptr;
+  global_runtime_config.worker_streaming_resident_offsets = nullptr;
+  global_runtime_config.worker_streaming_resident_ids = nullptr;
   global_runtime_config.resident_ready_data_head = nullptr;
+  global_runtime_config.resident_ready_data_tail = nullptr;
   global_runtime_config.data_ready_next = nullptr;
+  global_runtime_config.resident_ready_queue_offsets = nullptr;
+  global_runtime_config.resident_ready_head_positions = nullptr;
+  global_runtime_config.resident_ready_next_free_positions = nullptr;
+  global_runtime_config.resident_ready_tail_positions = nullptr;
+  global_runtime_config.resident_ready_queue_storage = nullptr;
   global_runtime_config.resident_active_workers = nullptr;
   global_runtime_config.resident_completed_data = nullptr;
   global_runtime_config.completed_data_this_iteration_count = nullptr;
+  global_runtime_config.completed_streaming_data_count = nullptr;
   global_runtime_config.first_data_ids = nullptr;
   global_runtime_config.completion_queues = nullptr;
 
@@ -1755,9 +2644,13 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
     bool const no_local_successors =
         host_data_edge_offsets[data_id] == host_data_edge_offsets[data_id + 1];
     bool const remote_trigger_only =
-        resident_uses_hybrid_prelaunch(global_runtime_config) &&
+        (resident_uses_hybrid_prelaunch(global_runtime_config) ||
+         resident_uses_streaming(global_runtime_config)) &&
         all_data[data_id].trigger_event != EVENT_INVALID_ID &&
         is_nvshmem_event(all_data[data_id].trigger_event);
+    if (streaming_uses_legacy_base(global_runtime_config)) {
+      continue;
+    }
     if (no_local_successors && !remote_trigger_only) {
       num_terminal_data++;
     }
@@ -1896,6 +2789,8 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
              cudaMemcpyHostToDevice);
   global_runtime_config.completed_terminal_data_count =
       gpu_malloc<uint32_t>(sizeof(uint32_t));
+  global_runtime_config.completed_streaming_data_count =
+      gpu_malloc<uint32_t>(sizeof(uint32_t));
   global_runtime_config.completed_data_this_iteration_count =
       gpu_malloc<uint32_t>(sizeof(uint32_t));
   global_runtime_config.current_iteration = gpu_malloc<uint32_t>(sizeof(uint32_t));
@@ -1905,6 +2800,114 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
              first_data_ids.data(),
              first_data_ids.size() * sizeof(DataId),
              cudaMemcpyHostToDevice);
+  if (resident_uses_streaming(global_runtime_config)) {
+    std::vector<TaskId> host_resident_canonical_task_id(
+        resident_tasks.size(), TASK_INVALID_ID);
+    for (TaskId task_id = 0; task_id < task_to_data_id.size(); task_id++) {
+      DataId data_id = task_to_data_id[task_id];
+      if (data_id == DATA_INVALID_ID) {
+        continue;
+      }
+      ResidentTaskId resident_task_id = all_data[data_id].resident_task_id;
+      if (resident_task_id >= host_resident_canonical_task_id.size()) {
+        continue;
+      }
+      if (host_resident_canonical_task_id[resident_task_id] ==
+          TASK_INVALID_ID) {
+        host_resident_canonical_task_id[resident_task_id] = task_id;
+      }
+    }
+    std::vector<int> host_resident_owner_worker(resident_tasks.size(), 0);
+    std::vector<uint32_t> host_worker_streaming_resident_counts(
+        num_workers + 1, 0u);
+    for (size_t resident_task_id = 0; resident_task_id < resident_tasks.size();
+         resident_task_id++) {
+      if (!resident_task_is_streaming(resident_tasks[resident_task_id])) {
+        continue;
+      }
+      TaskId canonical_task_id =
+          host_resident_canonical_task_id[resident_task_id];
+      if (canonical_task_id == TASK_INVALID_ID) {
+        canonical_task_id = static_cast<TaskId>(resident_task_id);
+      }
+      host_resident_owner_worker[resident_task_id] =
+          static_cast<int>(canonical_task_id % std::max(1, num_workers));
+      host_worker_streaming_resident_counts[host_resident_owner_worker
+                                                [resident_task_id] +
+                                            1] += 1u;
+    }
+    global_runtime_config.resident_owner_worker =
+        gpu_malloc<int>(host_resident_owner_worker.size() * sizeof(int));
+    cudaMemcpy(global_runtime_config.resident_owner_worker,
+               host_resident_owner_worker.data(),
+               host_resident_owner_worker.size() * sizeof(int),
+               cudaMemcpyHostToDevice);
+
+    for (int worker_id = 1; worker_id <= num_workers; worker_id++) {
+      host_worker_streaming_resident_counts[worker_id] +=
+          host_worker_streaming_resident_counts[worker_id - 1];
+    }
+    std::vector<ResidentTaskId> host_worker_streaming_resident_ids(
+        host_worker_streaming_resident_counts.back(),
+        RESIDENT_TASK_INVALID_ID);
+    std::vector<uint32_t> host_worker_streaming_cursor =
+        host_worker_streaming_resident_counts;
+    for (size_t resident_task_id = 0; resident_task_id < resident_tasks.size();
+         resident_task_id++) {
+      if (!resident_task_is_streaming(resident_tasks[resident_task_id])) {
+        continue;
+      }
+      int owner_worker = host_resident_owner_worker[resident_task_id];
+      uint32_t cursor = host_worker_streaming_cursor[owner_worker]++;
+      host_worker_streaming_resident_ids[cursor] =
+          static_cast<ResidentTaskId>(resident_task_id);
+    }
+    global_runtime_config.worker_streaming_resident_offsets =
+        gpu_malloc<uint32_t>(host_worker_streaming_resident_counts.size() *
+                             sizeof(uint32_t));
+    cudaMemcpy(global_runtime_config.worker_streaming_resident_offsets,
+               host_worker_streaming_resident_counts.data(),
+               host_worker_streaming_resident_counts.size() * sizeof(uint32_t),
+               cudaMemcpyHostToDevice);
+    global_runtime_config.worker_streaming_resident_ids =
+        gpu_malloc<ResidentTaskId>(std::max<size_t>(
+            1, host_worker_streaming_resident_ids.size()) *
+                                   sizeof(ResidentTaskId));
+    if (!host_worker_streaming_resident_ids.empty()) {
+      cudaMemcpy(global_runtime_config.worker_streaming_resident_ids,
+                 host_worker_streaming_resident_ids.data(),
+                 host_worker_streaming_resident_ids.size() *
+                     sizeof(ResidentTaskId),
+                 cudaMemcpyHostToDevice);
+    }
+
+    std::vector<uint32_t> host_streaming_queue_offsets(
+        resident_tasks.size() + 1, 0);
+    for (size_t resident_task_id = 0; resident_task_id < resident_tasks.size();
+         resident_task_id++) {
+      host_streaming_queue_offsets[resident_task_id + 1] =
+          host_streaming_queue_offsets[resident_task_id] +
+          (resident_task_is_streaming(resident_tasks[resident_task_id])
+               ? static_cast<uint32_t>(
+                     resident_tasks[resident_task_id].total_data_count)
+               : 0u);
+    }
+    global_runtime_config.resident_ready_queue_offsets = gpu_malloc<uint32_t>(
+        host_streaming_queue_offsets.size() * sizeof(uint32_t));
+    cudaMemcpy(global_runtime_config.resident_ready_queue_offsets,
+               host_streaming_queue_offsets.data(),
+               host_streaming_queue_offsets.size() * sizeof(uint32_t),
+               cudaMemcpyHostToDevice);
+    global_runtime_config.resident_ready_head_positions = gpu_malloc<uint32_t>(
+        resident_tasks.size() * sizeof(uint32_t));
+    global_runtime_config.resident_ready_next_free_positions =
+        gpu_malloc<uint32_t>(resident_tasks.size() * sizeof(uint32_t));
+    global_runtime_config.resident_ready_tail_positions = gpu_malloc<uint32_t>(
+        resident_tasks.size() * sizeof(uint32_t));
+    global_runtime_config.resident_ready_queue_storage =
+        gpu_malloc<DataId>(std::max<size_t>(
+            1, host_streaming_queue_offsets.back()) * sizeof(DataId));
+  }
   {
     std::vector<int> host_worker_owner_scheduler(num_workers, 0);
     int owner_scheduler_count = std::max(1, num_local_schedulers);
@@ -1963,25 +2966,27 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
                cudaMemcpyHostToDevice);
   }
   {
-    int num_completion_queues = std::max(1, num_local_schedulers);
-    global_runtime_config.completion_queue_last_ready_data_id =
-        gpu_malloc<unsigned long long int>(num_completion_queues *
-                                           sizeof(unsigned long long int));
-    global_runtime_config.completion_queue_next_free_data_id =
-        gpu_malloc<unsigned long long int>(num_completion_queues *
-                                           sizeof(unsigned long long int));
-    std::vector<TaskId *> host_completion_queues;
-    for (int i = 0; i < num_completion_queues; i++) {
-      TaskId *completion_queue = gpu_malloc<TaskId>(
-          global_runtime_config.per_completion_queue_len * sizeof(TaskId));
-      host_completion_queues.push_back(completion_queue);
+    if (!resident_uses_streaming(global_runtime_config)) {
+      int num_completion_queues = std::max(1, num_local_schedulers);
+      global_runtime_config.completion_queue_last_ready_data_id =
+          gpu_malloc<unsigned long long int>(num_completion_queues *
+                                             sizeof(unsigned long long int));
+      global_runtime_config.completion_queue_next_free_data_id =
+          gpu_malloc<unsigned long long int>(num_completion_queues *
+                                             sizeof(unsigned long long int));
+      std::vector<TaskId *> host_completion_queues;
+      for (int i = 0; i < num_completion_queues; i++) {
+        TaskId *completion_queue = gpu_malloc<TaskId>(
+            global_runtime_config.per_completion_queue_len * sizeof(TaskId));
+        host_completion_queues.push_back(completion_queue);
+      }
+      global_runtime_config.completion_queues =
+          gpu_malloc<TaskId *>(num_completion_queues * sizeof(TaskId *));
+      cudaMemcpy(global_runtime_config.completion_queues,
+                 host_completion_queues.data(),
+                 num_completion_queues * sizeof(TaskId *),
+                 cudaMemcpyHostToDevice);
     }
-    global_runtime_config.completion_queues =
-        gpu_malloc<TaskId *>(num_completion_queues * sizeof(TaskId *));
-    cudaMemcpy(global_runtime_config.completion_queues,
-               host_completion_queues.data(),
-               num_completion_queues * sizeof(TaskId *),
-               cudaMemcpyHostToDevice);
   }
   // Initialize first tasks
   {
@@ -1994,24 +2999,46 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
   }
 
   // Set configuration for kernels
+#if MIRAGE_COMPILE_RESIDENT_SCHEDULER_DISPATCH
   cudaFuncSetAttribute(worker_kernel_scheduler_dispatch,
                        cudaFuncAttributeMaxDynamicSharedMemorySize,
                        MAX_DYNAMIC_SHARED_MEMORY_SIZE);
+#endif
+#if MIRAGE_COMPILE_RESIDENT_HYBRID_PRELAUNCH
   cudaFuncSetAttribute(worker_kernel_hybrid_prelaunch,
                        cudaFuncAttributeMaxDynamicSharedMemorySize,
                        MAX_DYNAMIC_SHARED_MEMORY_SIZE);
+#endif
+#if MIRAGE_COMPILE_STREAMING_RUNTIME
+  cudaFuncSetAttribute(worker_kernel_streaming,
+                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       MAX_DYNAMIC_SHARED_MEMORY_SIZE);
+#endif
+#if MIRAGE_COMPILE_RESIDENT_SCHEDULER_DISPATCH
   cudaFuncSetAttribute(scheduler_kernel_scheduler_dispatch,
                        cudaFuncAttributeMaxDynamicSharedMemorySize,
                        1024);
+#endif
+#if MIRAGE_COMPILE_RESIDENT_HYBRID_PRELAUNCH
   cudaFuncSetAttribute(scheduler_kernel_hybrid_prelaunch,
                        cudaFuncAttributeMaxDynamicSharedMemorySize,
                        1024);
+#endif
+#if MIRAGE_COMPILE_STREAMING_RUNTIME
+  cudaFuncSetAttribute(scheduler_kernel_streaming,
+                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       1024);
+#endif
+#if MIRAGE_COMPILE_RESIDENT_SCHEDULER_DISPATCH
   cudaFuncSetAttribute(persistent_kernel_scheduler_dispatch,
                        cudaFuncAttributeMaxDynamicSharedMemorySize,
                        MAX_DYNAMIC_SHARED_MEMORY_SIZE);
+#endif
+#if MIRAGE_COMPILE_RESIDENT_HYBRID_PRELAUNCH
   cudaFuncSetAttribute(persistent_kernel_hybrid_prelaunch,
                        cudaFuncAttributeMaxDynamicSharedMemorySize,
                        MAX_DYNAMIC_SHARED_MEMORY_SIZE);
+#endif
   // Create worker and scheduler streams
   cudaStreamCreateWithFlags(&global_runtime_config.worker_stream,
                             cudaStreamNonBlocking);
@@ -2069,7 +3096,26 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
     // The split kernel does not support NVSHMEM because
     // nvshmemx_collective_launch launches kernels sequentially, which blocks
     // the interaction between the worker kernel and the scheduler kernel
-    if (resident_uses_hybrid_prelaunch(global_runtime_config)) {
+    if (resident_uses_streaming(global_runtime_config)) {
+#if MIRAGE_COMPILE_STREAMING_RUNTIME
+      worker_kernel_streaming<<<dim3(global_runtime_config.num_workers, 1, 1),
+                                dim3(WORKER_NUM_THREADS, 1, 1),
+                                MAX_DYNAMIC_SHARED_MEMORY_SIZE /*smem*/,
+                                global_runtime_config.worker_stream>>>(
+          global_runtime_config);
+
+      scheduler_kernel_streaming<<<dim3(global_runtime_config.num_local_schedulers,
+                                         1,
+                                         1),
+                                   dim3(32, 1, 1),
+                                   0 /*smem*/,
+                                   global_runtime_config.scheduler_stream>>>(
+          global_runtime_config);
+#else
+      assert(false && "streaming kernels are not compiled into this TU");
+#endif
+    } else if (resident_uses_hybrid_prelaunch(global_runtime_config)) {
+#if MIRAGE_COMPILE_RESIDENT_HYBRID_PRELAUNCH
       worker_kernel_hybrid_prelaunch<<<dim3(global_runtime_config.num_workers, 1, 1),
                                        dim3(WORKER_NUM_THREADS, 1, 1),
                                        MAX_DYNAMIC_SHARED_MEMORY_SIZE /*smem*/,
@@ -2083,7 +3129,11 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                                           0 /*smem*/,
                                           global_runtime_config.scheduler_stream>>>(
           global_runtime_config);
+#else
+      assert(false && "hybrid resident kernels are not compiled into this TU");
+#endif
     } else {
+#if MIRAGE_COMPILE_RESIDENT_SCHEDULER_DISPATCH
       worker_kernel_scheduler_dispatch<<<dim3(global_runtime_config.num_workers, 1, 1),
                                          dim3(WORKER_NUM_THREADS, 1, 1),
                                          MAX_DYNAMIC_SHARED_MEMORY_SIZE /*smem*/,
@@ -2097,6 +3147,10 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                                             0 /*smem*/,
                                             global_runtime_config.scheduler_stream>>>(
           global_runtime_config);
+#else
+      assert(false &&
+             "scheduler-dispatch resident kernels are not compiled into this TU");
+#endif
     }
 
     cudaEventRecord(global_runtime_config.worker_done_event,
@@ -2109,6 +3163,111 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
     cudaStreamWaitEvent(
         default_stream, global_runtime_config.scheduler_done_event, 0);
     printf("Finished Launching Persistent Kernel (Async)\n");
+
+    char const *debug_progress_env =
+        std::getenv("MIRAGE_STREAMING_DEBUG_PROGRESS");
+    if (resident_uses_streaming(global_runtime_config) &&
+        debug_progress_env != nullptr && std::strcmp(debug_progress_env, "0") != 0) {
+      std::vector<uint32_t> host_ready_head(
+          std::max(1, global_runtime_config.num_resident_tasks), 0u);
+      std::vector<uint32_t> host_ready_tail(
+          std::max(1, global_runtime_config.num_resident_tasks), 0u);
+      std::vector<uint32_t> host_worker_resident_offsets(
+          std::max(1, global_runtime_config.num_workers + 1), 0u);
+      CUDA_CHECK(cudaMemcpy(host_worker_resident_offsets.data(),
+                            global_runtime_config.worker_streaming_resident_offsets,
+                            (global_runtime_config.num_workers + 1) *
+                                sizeof(uint32_t),
+                            cudaMemcpyDeviceToHost));
+      std::vector<ResidentTaskId> host_worker_resident_ids(
+          std::max<uint32_t>(1, host_worker_resident_offsets.back()),
+          RESIDENT_TASK_INVALID_ID);
+      if (host_worker_resident_offsets.back() > 0) {
+        CUDA_CHECK(cudaMemcpy(host_worker_resident_ids.data(),
+                              global_runtime_config.worker_streaming_resident_ids,
+                              host_worker_resident_offsets.back() *
+                                  sizeof(ResidentTaskId),
+                              cudaMemcpyDeviceToHost));
+      }
+      int debug_step = 0;
+      while (true) {
+        cudaError_t worker_status =
+            cudaEventQuery(global_runtime_config.worker_done_event);
+        cudaError_t scheduler_status =
+            cudaEventQuery(global_runtime_config.scheduler_done_event);
+        if (worker_status == cudaSuccess && scheduler_status == cudaSuccess) {
+          break;
+        }
+        if (worker_status != cudaSuccess && worker_status != cudaErrorNotReady) {
+          CUDA_CHECK(worker_status);
+        }
+        if (scheduler_status != cudaSuccess &&
+            scheduler_status != cudaErrorNotReady) {
+          CUDA_CHECK(scheduler_status);
+        }
+        uint32_t host_completed_terminal = 0;
+        uint32_t host_completed_streaming = 0;
+        uint32_t host_current_iteration = 0;
+        CUDA_CHECK(cudaMemcpy(&host_completed_terminal,
+                              global_runtime_config.completed_terminal_data_count,
+                              sizeof(uint32_t),
+                              cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&host_completed_streaming,
+                              global_runtime_config.completed_streaming_data_count,
+                              sizeof(uint32_t),
+                              cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&host_current_iteration,
+                              global_runtime_config.current_iteration,
+                              sizeof(uint32_t),
+                              cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(host_ready_head.data(),
+                              global_runtime_config.resident_ready_head_positions,
+                              global_runtime_config.num_resident_tasks *
+                                  sizeof(uint32_t),
+                              cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(host_ready_tail.data(),
+                              global_runtime_config.resident_ready_tail_positions,
+                              global_runtime_config.num_resident_tasks *
+                                  sizeof(uint32_t),
+                              cudaMemcpyDeviceToHost));
+        uint32_t active_residents = 0;
+        uint32_t max_worker_active = 0;
+        uint32_t workers_with_active = 0;
+        for (int resident_task_id = 0;
+             resident_task_id < global_runtime_config.num_resident_tasks;
+             resident_task_id++) {
+          active_residents +=
+              (host_ready_head[resident_task_id] < host_ready_tail[resident_task_id]);
+        }
+        for (int worker_id = 0; worker_id < global_runtime_config.num_workers;
+             worker_id++) {
+          uint32_t worker_active = 0;
+          for (uint32_t cursor = host_worker_resident_offsets[worker_id];
+               cursor < host_worker_resident_offsets[worker_id + 1];
+               cursor++) {
+            ResidentTaskId resident_task_id = host_worker_resident_ids[cursor];
+            if (resident_task_id == RESIDENT_TASK_INVALID_ID) {
+              continue;
+            }
+            worker_active +=
+                (host_ready_head[resident_task_id] <
+                 host_ready_tail[resident_task_id]);
+          }
+          max_worker_active = max(max_worker_active, worker_active);
+          workers_with_active += (worker_active > 0);
+        }
+        printf("[streaming-debug] tick=%d iteration=%u terminal=%u/%d streaming_completed=%u active_residents=%u workers_with_active=%u max_worker_active=%u\n",
+               debug_step++,
+               host_current_iteration,
+               host_completed_terminal,
+               global_runtime_config.num_terminal_data,
+               host_completed_streaming,
+               active_residents,
+               workers_with_active,
+               max_worker_active);
+        usleep(500000);
+      }
+    }
   } else {
     printf("a single persistent kernel\n");
     int num_sms_to_use = global_runtime_config.num_workers + num_schedulers / 4;
@@ -2116,8 +3275,17 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
     void *args[] = {&global_runtime_config};
     void const *kernel_ptr =
         resident_uses_hybrid_prelaunch(global_runtime_config)
+#if MIRAGE_COMPILE_RESIDENT_HYBRID_PRELAUNCH
             ? (void const *)persistent_kernel_hybrid_prelaunch
+#else
+            ? nullptr
+#endif
+#if MIRAGE_COMPILE_RESIDENT_SCHEDULER_DISPATCH
             : (void const *)persistent_kernel_scheduler_dispatch;
+#else
+            : nullptr;
+#endif
+    assert(kernel_ptr != nullptr);
     nvshmemx_collective_launch(kernel_ptr,
                                dim3(num_sms_to_use, 1, 1),
                                dim3(SINGLE_KERNEL_NUM_THREADS, 1, 1),
@@ -2125,16 +3293,51 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                                MAX_DYNAMIC_SHARED_MEMORY_SIZE /*sharedmem*/,
                                0 /*stream*/);
 #else
-    if (resident_uses_hybrid_prelaunch(global_runtime_config)) {
+    if (resident_uses_streaming(global_runtime_config)) {
+#if MIRAGE_COMPILE_STREAMING_RUNTIME
+      worker_kernel_streaming<<<dim3(global_runtime_config.num_workers, 1, 1),
+                                dim3(WORKER_NUM_THREADS, 1, 1),
+                                MAX_DYNAMIC_SHARED_MEMORY_SIZE /*smem*/,
+                                global_runtime_config.worker_stream>>>(
+          global_runtime_config);
+      scheduler_kernel_streaming<<<dim3(global_runtime_config.num_local_schedulers,
+                                         1,
+                                         1),
+                                   dim3(32, 1, 1),
+                                   0 /*smem*/,
+                                   global_runtime_config.scheduler_stream>>>(
+          global_runtime_config);
+      cudaEventRecord(global_runtime_config.worker_done_event,
+                      global_runtime_config.worker_stream);
+      cudaEventRecord(global_runtime_config.scheduler_done_event,
+                      global_runtime_config.scheduler_stream);
+      cudaStreamWaitEvent(
+          default_stream, global_runtime_config.worker_done_event, 0);
+      cudaStreamWaitEvent(
+          default_stream, global_runtime_config.scheduler_done_event, 0);
+      return;
+#else
+      assert(false && "streaming kernels are not compiled into this TU");
+#endif
+    } else if (resident_uses_hybrid_prelaunch(global_runtime_config)) {
+#if MIRAGE_COMPILE_RESIDENT_HYBRID_PRELAUNCH
       persistent_kernel_hybrid_prelaunch<<<dim3(num_sms_to_use, 1, 1),
                                            dim3(SINGLE_KERNEL_NUM_THREADS, 1, 1),
                                            MAX_DYNAMIC_SHARED_MEMORY_SIZE /*smem*/>>>(
           global_runtime_config);
+#else
+      assert(false && "hybrid resident kernel is not compiled into this TU");
+#endif
     } else {
+#if MIRAGE_COMPILE_RESIDENT_SCHEDULER_DISPATCH
       persistent_kernel_scheduler_dispatch<<<dim3(num_sms_to_use, 1, 1),
                                              dim3(SINGLE_KERNEL_NUM_THREADS, 1, 1),
                                              MAX_DYNAMIC_SHARED_MEMORY_SIZE /*smem*/>>>(
           global_runtime_config);
+#else
+      assert(false &&
+             "scheduler-dispatch resident kernel is not compiled into this TU");
+#endif
     }
 #endif
     cudaError_t err = cudaDeviceSynchronize();
@@ -2163,10 +3366,21 @@ extern "C" void finalize_persistent_kernel() {
   gpu_free(global_runtime_config.task_to_data_id);
   gpu_free(global_runtime_config.data_to_task_id);
   gpu_free(global_runtime_config.worker_owner_scheduler);
+  gpu_free(global_runtime_config.resident_owner_worker);
+  gpu_free(global_runtime_config.worker_streaming_resident_offsets);
+  gpu_free(global_runtime_config.worker_streaming_resident_ids);
+  gpu_free(global_runtime_config.resident_ready_queue_offsets);
+  gpu_free(global_runtime_config.resident_ready_head_positions);
+  gpu_free(global_runtime_config.resident_ready_next_free_positions);
+  gpu_free(global_runtime_config.resident_ready_tail_positions);
+  gpu_free(global_runtime_config.resident_ready_queue_storage);
   gpu_free(global_runtime_config.completed_terminal_data_count);
+  gpu_free(global_runtime_config.completed_streaming_data_count);
   gpu_free(global_runtime_config.completed_data_this_iteration_count);
   gpu_free(global_runtime_config.current_iteration);
   gpu_free(global_runtime_config.first_data_ids);
+  gpu_free(global_runtime_config.resident_active_workers);
+  gpu_free(global_runtime_config.resident_completed_data);
   gpu_free(global_runtime_config.all_tasks);
   gpu_free(global_runtime_config.all_events);
 #if defined(MODE_OFFLINE) || defined(MODE_ONLINE)
@@ -2196,15 +3410,17 @@ extern "C" void finalize_persistent_kernel() {
     gpu_free(host_sched_queues[i]);
   }
   gpu_free(global_runtime_config.sched_queues);
-  int num_completion_queues =
-      std::max(1, global_runtime_config.num_local_schedulers);
-  std::vector<TaskId *> host_completion_queues(num_completion_queues);
-  cudaMemcpy(host_completion_queues.data(),
-             global_runtime_config.completion_queues,
-             num_completion_queues * sizeof(TaskId *),
-             cudaMemcpyDeviceToHost);
-  for (int i = 0; i < num_completion_queues; i++) {
-    gpu_free(host_completion_queues[i]);
+  if (global_runtime_config.completion_queues != nullptr) {
+    int num_completion_queues =
+        std::max(1, global_runtime_config.num_local_schedulers);
+    std::vector<TaskId *> host_completion_queues(num_completion_queues);
+    cudaMemcpy(host_completion_queues.data(),
+               global_runtime_config.completion_queues,
+               num_completion_queues * sizeof(TaskId *),
+               cudaMemcpyDeviceToHost);
+    for (int i = 0; i < num_completion_queues; i++) {
+      gpu_free(host_completion_queues[i]);
+    }
   }
   gpu_free(global_runtime_config.completion_queues);
   gpu_free(global_runtime_config.first_tasks);
