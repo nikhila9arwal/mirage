@@ -25,8 +25,6 @@
 #include <nvshmem.h>
 #include <nvshmemx.h>
 #endif
-#include <thread>
-#include <unistd.h>
 #include <vector>
 
 #if defined(MIRAGE_GRACE_HOPPER)
@@ -289,6 +287,15 @@ __global__ void prepare_kernel(ResidentRuntimeConfig config,
     config.data_pending_predecessor_counts[i] =
         config.data_initial_predecessor_counts[i];
   }
+  if (resident_uses_streaming(config)) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x;
+         i < config.num_resident_tasks;
+         i += blockDim.x * gridDim.x) {
+      config.resident_ready_head_positions[i] = 0u;
+      config.resident_ready_next_free_positions[i] = 0u;
+      config.resident_ready_tail_positions[i] = 0u;
+    }
+  }
   if (blockIdx.x == 0 && threadIdx.x == 0) {
     *config.completed_terminal_data_count = 0;
     *config.completed_data_this_iteration_count = 0;
@@ -296,6 +303,10 @@ __global__ void prepare_kernel(ResidentRuntimeConfig config,
     if (resident_uses_streaming(config) &&
         config.completed_streaming_data_count != nullptr) {
       *config.completed_streaming_data_count = 0;
+    }
+    if (resident_uses_streaming(config) &&
+        config.streaming_terminate_flag != nullptr) {
+      *config.streaming_terminate_flag = 0u;
     }
   }
   // Send event to scheduler[0]
@@ -539,6 +550,11 @@ __device__ __forceinline__ void
 
 __device__ __forceinline__ void terminate_schedulers(ResidentRuntimeConfig config) {
   // Event ID 0 is the termination event
+  if (resident_uses_streaming(config) &&
+      config.streaming_terminate_flag != nullptr) {
+    *config.streaming_terminate_flag = 1u;
+    __threadfence();
+  }
   int num_schedulers =
       config.num_local_schedulers + config.num_remote_schedulers;
   for (int i = 0; i < num_schedulers; i++) {
@@ -617,6 +633,24 @@ compat_task_is_prelaunched(ResidentRuntimeConfig const &config,
   ResidentTaskId resident_task_id = config.all_data[data_id].resident_task_id;
   return resident_task_is_prelaunched(config.resident_tasks[resident_task_id]);
 }
+
+__device__ __forceinline__ size_t
+streaming_compat_task_iteration(ResidentRuntimeConfig const &config,
+                                DataDesc const *data_desc) {
+  (void)data_desc;
+  // In legacy-base streaming mode, compatibility events should be triggered for
+  // the current task-graph iteration, not for a per-phase completion count.
+  // Deriving the iteration from dependent-event counters over-advances the
+  // compat task id (for example, 25/26 in a single-token run), which causes
+  // downstream legacy-event waits to target the wrong iteration.
+  return atomicAdd(config.current_iteration, 0u);
+}
+
+__device__ __forceinline__ void
+enqueue_worker_item(ResidentRuntimeConfig const &config,
+                    int worker_queue_id,
+                    size_t *next_free_task_pos,
+                    TaskId work_item);
 
 __device__ __forceinline__ void
 enqueue_prelaunched_task_range(ResidentRuntimeConfig const &config,
@@ -716,23 +750,6 @@ __device__ __forceinline__ void persistent_checker(ResidentRuntimeConfig config)
   // collectively load it from device to shared memory
   static_assert(sizeof(TaskDesc) % sizeof(int) == 0);
   // assert(blockDim.x >= 128);
-}
-
-__device__ __forceinline__ void
-publish_worker_item(ResidentRuntimeConfig const &config,
-                    int worker_queue_id,
-                    TaskId work_item) {
-  unsigned long long int next_pos =
-      atomicAdd(&config.worker_queue_next_free_task_id[worker_queue_id], 1ull);
-  st_relaxed_gpu_u64(
-      &config.worker_queues[worker_queue_id][next_pos %
-                                             config.per_worker_queue_len],
-      work_item);
-  __threadfence();
-  while (atomicCAS(&config.worker_queue_last_ready_task_id[worker_queue_id],
-                   next_pos,
-                   next_pos + 1) != next_pos) {
-  }
 }
 
 __device__ __forceinline__ void
@@ -851,7 +868,6 @@ trigger_task_event(ResidentRuntimeConfig const &config,
                    TaskId current_task_id,
                    int worker_id) {
   EventId const event_id = task_desc->trigger_event;
-  TaskType const task_type = task_desc->task_type;
   if (event_id == EVENT_INVALID_ID) {
     return;
   }
@@ -883,7 +899,7 @@ trigger_task_event(ResidentRuntimeConfig const &config,
       }
     }
   } else {
-    assert(task_type == TASK_NVSHMEM_ALLGATHER_STRIDED_PUT);
+    assert(task_desc->task_type == TASK_NVSHMEM_ALLGATHER_STRIDED_PUT);
   }
 }
 
@@ -1017,8 +1033,11 @@ release_completed_data_streaming(ResidentRuntimeConfig const &config,
   __threadfence();
   __syncthreads();
 
+  assert(data_id < static_cast<DataId>(config.num_data));
   DataId edge_begin = config.data_edge_offsets[data_id];
   DataId edge_end = config.data_edge_offsets[data_id + 1];
+  assert(edge_begin <= edge_end);
+  assert(edge_end <= static_cast<DataId>(config.num_data_edges));
   DataId edge_count = edge_end - edge_begin;
   if (threadIdx.x == 0) {
     assert(edge_count <= MIRAGE_STREAMING_MAX_READY_SUCCESSORS);
@@ -1032,6 +1051,7 @@ release_completed_data_streaming(ResidentRuntimeConfig const &config,
 
   for (DataId edge_idx = edge_begin + threadIdx.x; edge_idx < edge_end;
        edge_idx += blockDim.x) {
+    assert(edge_idx < static_cast<DataId>(config.num_data_edges));
     DataId succ_data_id = config.data_edge_targets[edge_idx];
     unsigned int remaining =
         atomicSub(&config.data_pending_predecessor_counts[succ_data_id], 1u);
@@ -1126,6 +1146,10 @@ execute_worker_scheduler_dispatch(ResidentRuntimeConfig config) {
   size_t task_counter = 0;
 #endif
   while (true) {
+    if (config.streaming_terminate_flag != nullptr &&
+        atomicAdd(config.streaming_terminate_flag, 0u) != 0u) {
+      return;
+    }
     if (queue_pos == queue_len) {
       if (threadIdx.x == 0) {
         current_queue_idx = 0;
@@ -1506,6 +1530,10 @@ execute_worker_streaming(ResidentRuntimeConfig config) {
 #endif
 
   while (true) {
+    if (config.streaming_terminate_flag != nullptr &&
+        atomicAdd(config.streaming_terminate_flag, 0u) != 0u) {
+      return;
+    }
     if (queue_pos == queue_len) {
       if (threadIdx.x == 0) {
         current_queue_idx = -1;
@@ -1573,10 +1601,9 @@ execute_worker_streaming(ResidentRuntimeConfig config) {
         if (position_index >= static_cast<size_t>(config.num_control_tasks)) {
           current_data_id = config.task_to_data_id[position_index];
           if (current_data_id != DATA_INVALID_ID) {
-            ResidentTaskId resident_task_id =
-                config.all_data[current_data_id].resident_task_id;
             assert(resident_task_is_prelaunched(
-                config.resident_tasks[resident_task_id]));
+                config.resident_tasks[config.all_data[current_data_id]
+                                          .resident_task_id]));
           }
         }
         queue_task_ready = prelaunched_task_ready_nonblocking(
@@ -1699,8 +1726,10 @@ execute_worker_streaming(ResidentRuntimeConfig config) {
           streaming_uses_hybrid_base(config) /*count_terminal_completion*/,
           ready_streaming_edge_bits);
       if (threadIdx.x == 0 && streaming_uses_legacy_base(config)) {
+        size_t compat_iteration =
+            streaming_compat_task_iteration(config, data_desc);
         TaskId compat_task_id =
-            compute_task_id(atomicAdd(config.current_iteration, 0u),
+            compute_task_id(compat_iteration,
                             config.data_to_task_id[current_data_id]);
         trigger_data_event(config,
                            data_desc,
@@ -1813,7 +1842,11 @@ execute_scheduler_streaming(ResidentRuntimeConfig config) {
     if (is_termination_event(current_event_id, current_event_desc)) {
       if (threadIdx.x == 0) {
         for (int worker = my_first_worker; worker < my_last_worker; worker++) {
-          publish_worker_item(config, worker, 0);
+          enqueue_worker_item(
+              config,
+              worker,
+              &worker_queue_next_free_task_pos[worker - my_first_worker],
+              0);
         }
       }
       return;
@@ -1906,8 +1939,6 @@ execute_scheduler_streaming(ResidentRuntimeConfig config) {
 
 __device__ __forceinline__ void
 execute_scheduler_scheduler_dispatch(ResidentRuntimeConfig config, int offset) {
-  int const num_schedulers =
-      config.num_local_schedulers + config.num_remote_schedulers;
   int const num_schedulers_per_sm = std::min((int)blockDim.x / 32, 4);
   int const warp_id = threadIdx.x / 32;
   if (threadIdx.x % 32 != 0 || warp_id >= num_schedulers_per_sm) {
@@ -2148,8 +2179,6 @@ execute_scheduler_scheduler_dispatch(ResidentRuntimeConfig config, int offset) {
 // need to alter as there is only one warp per block
 __device__ __forceinline__ void
 execute_scheduler_hybrid_prelaunch(ResidentRuntimeConfig config, int offset) {
-  int const num_schedulers =
-      config.num_local_schedulers + config.num_remote_schedulers;
   int const num_schedulers_per_sm = std::min((int)blockDim.x / 32, 4);
   int const warp_id = threadIdx.x / 32;
   if (warp_id >= num_schedulers_per_sm) {
@@ -2568,6 +2597,7 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
   global_runtime_config.resident_completed_data = nullptr;
   global_runtime_config.completed_data_this_iteration_count = nullptr;
   global_runtime_config.completed_streaming_data_count = nullptr;
+  global_runtime_config.streaming_terminate_flag = nullptr;
   global_runtime_config.first_data_ids = nullptr;
   global_runtime_config.completion_queues = nullptr;
 
@@ -2794,6 +2824,8 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
   global_runtime_config.completed_data_this_iteration_count =
       gpu_malloc<uint32_t>(sizeof(uint32_t));
   global_runtime_config.current_iteration = gpu_malloc<uint32_t>(sizeof(uint32_t));
+  global_runtime_config.streaming_terminate_flag =
+      gpu_malloc<uint32_t>(sizeof(uint32_t));
   global_runtime_config.first_data_ids =
       gpu_malloc<DataId>(first_data_ids.size() * sizeof(DataId));
   cudaMemcpy(global_runtime_config.first_data_ids,
@@ -3163,115 +3195,10 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
     cudaStreamWaitEvent(
         default_stream, global_runtime_config.scheduler_done_event, 0);
     printf("Finished Launching Persistent Kernel (Async)\n");
-
-    char const *debug_progress_env =
-        std::getenv("MIRAGE_STREAMING_DEBUG_PROGRESS");
-    if (resident_uses_streaming(global_runtime_config) &&
-        debug_progress_env != nullptr && std::strcmp(debug_progress_env, "0") != 0) {
-      std::vector<uint32_t> host_ready_head(
-          std::max(1, global_runtime_config.num_resident_tasks), 0u);
-      std::vector<uint32_t> host_ready_tail(
-          std::max(1, global_runtime_config.num_resident_tasks), 0u);
-      std::vector<uint32_t> host_worker_resident_offsets(
-          std::max(1, global_runtime_config.num_workers + 1), 0u);
-      CUDA_CHECK(cudaMemcpy(host_worker_resident_offsets.data(),
-                            global_runtime_config.worker_streaming_resident_offsets,
-                            (global_runtime_config.num_workers + 1) *
-                                sizeof(uint32_t),
-                            cudaMemcpyDeviceToHost));
-      std::vector<ResidentTaskId> host_worker_resident_ids(
-          std::max<uint32_t>(1, host_worker_resident_offsets.back()),
-          RESIDENT_TASK_INVALID_ID);
-      if (host_worker_resident_offsets.back() > 0) {
-        CUDA_CHECK(cudaMemcpy(host_worker_resident_ids.data(),
-                              global_runtime_config.worker_streaming_resident_ids,
-                              host_worker_resident_offsets.back() *
-                                  sizeof(ResidentTaskId),
-                              cudaMemcpyDeviceToHost));
-      }
-      int debug_step = 0;
-      while (true) {
-        cudaError_t worker_status =
-            cudaEventQuery(global_runtime_config.worker_done_event);
-        cudaError_t scheduler_status =
-            cudaEventQuery(global_runtime_config.scheduler_done_event);
-        if (worker_status == cudaSuccess && scheduler_status == cudaSuccess) {
-          break;
-        }
-        if (worker_status != cudaSuccess && worker_status != cudaErrorNotReady) {
-          CUDA_CHECK(worker_status);
-        }
-        if (scheduler_status != cudaSuccess &&
-            scheduler_status != cudaErrorNotReady) {
-          CUDA_CHECK(scheduler_status);
-        }
-        uint32_t host_completed_terminal = 0;
-        uint32_t host_completed_streaming = 0;
-        uint32_t host_current_iteration = 0;
-        CUDA_CHECK(cudaMemcpy(&host_completed_terminal,
-                              global_runtime_config.completed_terminal_data_count,
-                              sizeof(uint32_t),
-                              cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(&host_completed_streaming,
-                              global_runtime_config.completed_streaming_data_count,
-                              sizeof(uint32_t),
-                              cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(&host_current_iteration,
-                              global_runtime_config.current_iteration,
-                              sizeof(uint32_t),
-                              cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(host_ready_head.data(),
-                              global_runtime_config.resident_ready_head_positions,
-                              global_runtime_config.num_resident_tasks *
-                                  sizeof(uint32_t),
-                              cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(host_ready_tail.data(),
-                              global_runtime_config.resident_ready_tail_positions,
-                              global_runtime_config.num_resident_tasks *
-                                  sizeof(uint32_t),
-                              cudaMemcpyDeviceToHost));
-        uint32_t active_residents = 0;
-        uint32_t max_worker_active = 0;
-        uint32_t workers_with_active = 0;
-        for (int resident_task_id = 0;
-             resident_task_id < global_runtime_config.num_resident_tasks;
-             resident_task_id++) {
-          active_residents +=
-              (host_ready_head[resident_task_id] < host_ready_tail[resident_task_id]);
-        }
-        for (int worker_id = 0; worker_id < global_runtime_config.num_workers;
-             worker_id++) {
-          uint32_t worker_active = 0;
-          for (uint32_t cursor = host_worker_resident_offsets[worker_id];
-               cursor < host_worker_resident_offsets[worker_id + 1];
-               cursor++) {
-            ResidentTaskId resident_task_id = host_worker_resident_ids[cursor];
-            if (resident_task_id == RESIDENT_TASK_INVALID_ID) {
-              continue;
-            }
-            worker_active +=
-                (host_ready_head[resident_task_id] <
-                 host_ready_tail[resident_task_id]);
-          }
-          max_worker_active = max(max_worker_active, worker_active);
-          workers_with_active += (worker_active > 0);
-        }
-        printf("[streaming-debug] tick=%d iteration=%u terminal=%u/%d streaming_completed=%u active_residents=%u workers_with_active=%u max_worker_active=%u\n",
-               debug_step++,
-               host_current_iteration,
-               host_completed_terminal,
-               global_runtime_config.num_terminal_data,
-               host_completed_streaming,
-               active_residents,
-               workers_with_active,
-               max_worker_active);
-        usleep(500000);
-      }
-    }
   } else {
     printf("a single persistent kernel\n");
-    int num_sms_to_use = global_runtime_config.num_workers + num_schedulers / 4;
 #ifdef USE_NVSHMEM
+    int num_sms_to_use = global_runtime_config.num_workers + num_schedulers / 4;
     void *args[] = {&global_runtime_config};
     void const *kernel_ptr =
         resident_uses_hybrid_prelaunch(global_runtime_config)
@@ -3321,6 +3248,7 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
 #endif
     } else if (resident_uses_hybrid_prelaunch(global_runtime_config)) {
 #if MIRAGE_COMPILE_RESIDENT_HYBRID_PRELAUNCH
+      int num_sms_to_use = global_runtime_config.num_workers + num_schedulers / 4;
       persistent_kernel_hybrid_prelaunch<<<dim3(num_sms_to_use, 1, 1),
                                            dim3(SINGLE_KERNEL_NUM_THREADS, 1, 1),
                                            MAX_DYNAMIC_SHARED_MEMORY_SIZE /*smem*/>>>(
@@ -3330,6 +3258,7 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
 #endif
     } else {
 #if MIRAGE_COMPILE_RESIDENT_SCHEDULER_DISPATCH
+      int num_sms_to_use = global_runtime_config.num_workers + num_schedulers / 4;
       persistent_kernel_scheduler_dispatch<<<dim3(num_sms_to_use, 1, 1),
                                              dim3(SINGLE_KERNEL_NUM_THREADS, 1, 1),
                                              MAX_DYNAMIC_SHARED_MEMORY_SIZE /*smem*/>>>(
@@ -3378,6 +3307,7 @@ extern "C" void finalize_persistent_kernel() {
   gpu_free(global_runtime_config.completed_streaming_data_count);
   gpu_free(global_runtime_config.completed_data_this_iteration_count);
   gpu_free(global_runtime_config.current_iteration);
+  gpu_free(global_runtime_config.streaming_terminate_flag);
   gpu_free(global_runtime_config.first_data_ids);
   gpu_free(global_runtime_config.resident_active_workers);
   gpu_free(global_runtime_config.resident_completed_data);

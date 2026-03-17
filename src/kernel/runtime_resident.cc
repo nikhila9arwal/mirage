@@ -1229,9 +1229,23 @@ TaskGraphResult print_task_graph(
     code.e("}");
     code.e("}");
     // load events
-    code.e("json event_jsons = json_task_graph.contains(\"control_events\") "
-           "? json_task_graph[\"control_events\"] "
-           ": json_task_graph[\"all_events\"];");
+    // In streaming legacy-base mode, data items' trigger_event and
+    // dependent_event fields are indices into the full all_events array.
+    // Loading only control_events (3 entries) leaves the runtime's
+    // all_event_counters array too small, causing out-of-bounds accesses
+    // and a deadlock because the EOG event never fires.
+    // In streaming hybrid-base or resident_data modes, only the 3 control
+    // events are needed (data-edge predecessor counts handle readiness).
+    bool const needs_full_events =
+        flavor == DataAwareTaskGraphFlavor::STREAMING &&
+        streaming_base_mode == STREAMING_BASE_EXECUTION_LEGACY_EVENT;
+    if (needs_full_events) {
+      code.e("json event_jsons = json_task_graph[\"all_events\"];");
+    } else {
+      code.e("json event_jsons = json_task_graph.contains(\"control_events\") "
+             "? json_task_graph[\"control_events\"] "
+             ": json_task_graph[\"all_events\"];");
+    }
     code.e("for (json const &e : event_jsons) {");
     code.e("EventType event_type = "
            "static_cast<EventType>(e.at(\"event_type\").get<int>());");

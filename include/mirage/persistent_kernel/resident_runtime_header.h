@@ -302,6 +302,7 @@ struct ResidentRuntimeConfig : public RuntimeConfig {
   uint32_t *completed_streaming_data_count;
   uint32_t *completed_data_this_iteration_count;
   uint32_t *current_iteration;
+  uint32_t *streaming_terminate_flag;
   DataId *first_data_ids;
   TaskId **completion_queues;
 };

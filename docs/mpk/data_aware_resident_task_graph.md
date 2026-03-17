@@ -101,20 +101,20 @@ So the selection hierarchy is now:
 
 Current status of `streaming_data` in this checkout:
 
-- the runtime has been corrected so the default streaming substrate is legacy
-  MPK event semantics rather than resident-wide finer-grained prelaunch,
-- `hybrid_prelaunch + streaming` is now the only combination that layers both
-  local prelaunch gating and streaming together,
-- the C++ runtime rebuilt successfully inside `mirage.sif` after this change,
-- the Python extension had to be relinked manually on `node-gpu01` because
-  `setup.py build_ext --inplace --force` kept hanging in environment-specific
-  Rust/distutils steps before finishing file operations,
-- `import mirage` succeeds with the updated extension,
-- full `transformers`-based model validation is still blocked on this node
-  because `from transformers ...` times out before Mirage execution begins,
-- lightweight custom-graph `generate_*_task_graph()` probes still segfault in
-  `register_mugraph(...)`, but that is a shared generator limitation that also
-  affects the legacy path and is not specific to the streaming changes.
+- default `streaming_data` builds on top of legacy MPK event semantics for
+  non-streaming work,
+- `MIRAGE_STREAMING_BASE_MODE=hybrid_prelaunch` is the opt-in path that layers
+  hybrid-prelaunch behavior underneath the same streaming residents,
+- the streamable whitelist is still intentionally narrow:
+  - `TASK_MOE_W13_LINEAR_*`
+  - `TASK_MOE_W2_LINEAR_*`
+- both streaming base modes now complete real single-GPU Qwen Hopper runs on
+  the short `max_seq_length=40` validation shape,
+- the temporary streaming-specific host/device debug scaffolding used during
+  the shutdown investigation has been removed again; the runtime now only keeps
+  the real functional fixes,
+- the next work is larger-batch validation and broader correctness checking,
+  not basic runtime bring-up.
 
 ## If you are taking over this work
 
@@ -133,9 +133,11 @@ history.
 - The streaming whitelist is intentionally small right now:
   - `TASK_MOE_W13_LINEAR_*`
   - `TASK_MOE_W2_LINEAR_*`
-- The current unresolved problem is not a known runtime compile error. The
-  remaining blocker is environment-dependent end-to-end validation on the live
-  model path.
+- The default bring-up problem is solved. The remaining work is validation and
+  scope expansion:
+  - larger-batch runs
+  - longer-output correctness checks
+  - widening the streaming whitelist only after those pass
 
 ### Read these files in this order
 
@@ -196,6 +198,26 @@ Important:
   substrate”
 - it now means “legacy MPK plus streaming on whitelisted ops” unless
   `MIRAGE_STREAMING_BASE_MODE=hybrid_prelaunch` is set
+
+If you only care about the data-aware family, there are effectively four
+runtime combinations today:
+
+1. fine-grain data-aware
+   - `MIRAGE_TASK_GRAPH_MODE=resident_data`
+   - `MIRAGE_RESIDENT_EXECUTION_MODE=scheduler_dispatch`
+2. prelaunched fine-grain data-aware
+   - `MIRAGE_TASK_GRAPH_MODE=resident_data`
+   - `MIRAGE_RESIDENT_EXECUTION_MODE=hybrid_prelaunch`
+3. base streaming
+   - `MIRAGE_TASK_GRAPH_MODE=streaming_data`
+   - default base mode, which means legacy/event substrate for non-streaming
+     work
+4. prelaunched streaming
+   - `MIRAGE_TASK_GRAPH_MODE=streaming_data`
+   - `MIRAGE_STREAMING_BASE_MODE=hybrid_prelaunch`
+
+So yes: if we ignore the old non-data-aware `legacy_event` path, the current
+system is easiest to think about as those four data-aware modes.
 
 ### Rebuild checklist
 
@@ -1517,27 +1539,367 @@ What was validated:
 
 - `mirage_runtime` rebuilt successfully inside `mirage.sif` on Slurm job
   `86948` on `node-gpu01`.
-- The Python extension was manually relinked against the updated static
-  `libmirage_runtime.a` because `setup.py build_ext --inplace --force` kept
-  hanging in node-specific Rust/distutils steps.
+- `python3 setup.py build_ext --inplace --force` completed successfully and the
+  Python extension was relinked against the updated static
+  `libmirage_runtime.a`.
 - `import mirage` succeeds inside the container with the updated extension.
+- real end-to-end Qwen3-30B-A3B Hopper runs now complete in:
+  - default `streaming_data` legacy-base mode
+  - `streaming_data` with `MIRAGE_STREAMING_BASE_MODE=hybrid_prelaunch`
 
 What is still blocked:
 
-- Real end-to-end model validation on this node is still blocked before Mirage
-  execution because `transformers` import/startup times out.
-- Lightweight custom-graph `generate_streaming_task_graph(...)` probes still
-  hit the existing `register_mugraph(...)` segmentation fault that also affects
-  the legacy generator path, so they are not a clean validation route either.
+- multi-token and larger-batch streaming validation still needs to be rerun
+  after the termination fixes.
+- output correctness has only been spot-checked on the short
+  `max_seq_length=40` case. We still need a broader comparison against
+  `resident_data` / legacy Mirage / HF on longer outputs.
+- at this point in the log, the temporary
+  `MIRAGE_STREAMING_DEBUG_PROGRESS=1` instrumentation was still present.
+  It was removed later in the cleanup pass recorded below.
 
 Where we are going next:
 
-1. rerun the streaming validation on a node/container path where the Python
-   model stack is responsive enough to reach Mirage execution,
-2. compare `streaming_data` default legacy-base behavior against
-   `streaming_data + MIRAGE_STREAMING_BASE_MODE=hybrid_prelaunch`,
-3. widen the streamable-op whitelist only after the default mixed architecture
-   is validated end-to-end.
+1. rerun streaming validation on the earlier larger-batch shapes,
+2. compare default legacy-base streaming against
+   `MIRAGE_STREAMING_BASE_MODE=hybrid_prelaunch` on those shapes,
+3. validate correctness against legacy Mirage / HF on longer outputs,
+4. only then widen the streamable-op whitelist beyond `TASK_MOE_W13` and
+   `TASK_MOE_W2`.
+
+### 2026-03-16: streaming legacy-base event loader bug found and fixed
+
+Root cause of the streaming kernel hang (`Terminated` after `Finished Launching
+Persistent Kernel (Async)` in `validation_streaming_mode/mirage_single_v5_run.log`
+and `mirage_single_v6_run.log`):
+
+The generated `construct_task_graph(...)` loader always loaded `control_events`
+(3 entries) when that key was present in the JSON, even in streaming legacy-base
+mode. But in streaming legacy-base mode, all data items' `trigger_event` and
+`dependent_event` fields are indices into the full `all_events` array (1142
+entries for the Qwen3-30B-A3B graph). This caused:
+
+- `all_event_counters` and `all_event_num_triggers` to be allocated for only 3
+  events,
+- every `trigger_data_event` call from a streaming or prelaunched data task to
+  access `all_event_counters[N]` with N >> 2, silently corrupting memory,
+- the EOG event counter (at index 1141 in the full events) to never reach its
+  threshold,
+- the kernel spinning forever with the scheduler never seeing the EOG event.
+
+The fix is in `src/kernel/runtime_resident.cc` around line 1232.  The generated
+event loader now conditionally chooses `all_events` vs `control_events` at
+code-generation time based on `streaming_base_mode`:
+
+- `streaming_data` with legacy base (`needs_full_events = true`): always
+  load `all_events` (the full 1142-entry event array).
+- `streaming_data` with hybrid base, and `resident_data` modes: keep the
+  existing behavior of preferring `control_events` when present.
+
+This is a compile-time (code-generation-time) decision so there is no runtime
+overhead.
+
+Second observation: validation artifacts from `validation_streaming_mode/`
+were generated by a binary built from commit `7afa884` (before `execution_kind`
+was added to the JSON emission in `bb560bd`). As a result, all resident tasks
+in those JSONs default to `RESIDENT_TASK_EXECUTION_PRELAUNCHED`, so no
+streaming ready queues were populated. Regenerating the task graph with the
+current binary (post-`bb560bd`) emits `execution_kind` correctly; these stale
+artifacts should not be used to judge the current streaming runtime.
+
+### 2026-03-16 later: rebuild and real-run revalidation after the loader fix
+
+The rebuild and rerun were done inside `mirage.sif` on Slurm job `86948`
+(`node-gpu01`).
+
+Rebuild status:
+
+- `cmake --build build -j4` completed successfully.
+- `python3 setup.py build_ext --inplace --force` completed successfully.
+- `transformers` import on this node/container path was no longer the blocker
+  (`from transformers import AutoTokenizer` returned in about 17 seconds).
+
+Real validation command used:
+
+```bash
+MIRAGE_TASK_GRAPH_MODE=streaming_data \
+python3 -u demo/qwen3/demo_30B_A3B_hopper.py \
+  --use-mirage \
+  --max-num-batched-tokens 1 \
+  --max-num-batched-requests 1 \
+  --max-seq-length 40 \
+  --output-dir validation_streaming_fixed/legacy_base_single_mirage_v3
+```
+
+What this rerun proved:
+
+- the generated graph is current, not stale:
+  - `schema_version = 2`
+  - `resident_tasks = 9859`
+  - `all_data = 21331`
+  - `data_edges = 128641`
+  - `all_events = 1142`
+  - `control_events = 3`
+  - `execution_kind` is present on resident tasks
+  - execution-kind counts are `{0: 9427, 1: 432}`
+- the generated CUDA is using the streaming path:
+  - [test_rank0.cu](/home/nikhilag/mirage/validation_streaming_fixed/legacy_base_single_mirage_v3/test_rank0.cu)
+    includes `streaming_persistent_kernel.cuh`
+  - the generated `construct_task_graph(...)` loader uses `json_task_graph["all_events"]`
+    for this legacy-base streaming run
+
+One more bug surfaced during the rerun:
+
+- the streaming TU failed to compile at first because
+  `enqueue_prelaunched_task_range(...)` and
+  `enqueue_prelaunched_dependent_tasks_partitioned(...)` called
+  `enqueue_worker_item(...)` before it had been declared in
+  `resident_persistent_kernel.cuh`
+- this was fixed by adding a forward declaration for
+  `enqueue_worker_item(...)`
+
+Current validation outcome after both fixes:
+
+- the streaming megakernel now compiles successfully
+- the run reaches:
+  - `Finished megakernel compilation...`
+  - `worker kernel & scheduler kernel`
+  - `Finished Launching Persistent Kernel (Async)`
+- this was enough to prove the loader fix was live, but it did not yet solve
+  the remaining post-launch hang
+
+Artifacts from this rerun:
+
+- [run.log](/home/nikhilag/mirage/validation_streaming_fixed/legacy_base_single_mirage_v3/run.log)
+- [task_graph_rank0.json](/home/nikhilag/mirage/validation_streaming_fixed/legacy_base_single_mirage_v3/task_graph_rank0.json)
+- [test_rank0.cu](/home/nikhilag/mirage/validation_streaming_fixed/legacy_base_single_mirage_v3/test_rank0.cu)
+
+Current conclusion from this stage:
+
+- the original loader bug was real and is fixed
+- the stale-JSON `execution_kind` issue is also gone in current artifacts
+- the streaming path now gets farther than before: graph generation, NVCC,
+  and persistent-kernel launch all succeed on a real run
+- there is still a remaining post-launch runtime stall in default
+  `streaming_data` with legacy base at this point in the log
+
+Additional narrowing from the next code-inspection pass:
+
+- `BEGIN_TASK_GRAPH` is still launching the full legacy-style compatibility
+  task range (`first_task_id = 2`, `last_task_id = 21333`) in the generated
+  `all_events` array, so this is not a "nothing got enqueued at launch" bug
+- the only `first_data_id` is data `0`, and its resident task is
+  `execution_kind = PRELAUNCHED`, so the run does not depend on an initial
+  streaming-ready seed to get started
+- the first actual prelaunched -> streaming boundary in the real graph is:
+  - resident `175` (`task_type = 260`, prelaunched, one data item)
+  - into resident `176` (`task_type = 161`, streaming, `24` data items)
+  - all first streaming data items `176..199` depend on the single prelaunched
+    predecessor data `175`
+- that means the remaining stall is more likely in the mixed handoff from a
+  prelaunched producer into a streaming resident queue, or in the event-driven
+  legacy-base prelaunched path before that boundary, than in the initial
+  `first_data_ids` seeding logic
+
+What needed to happen next from that point:
+
+1. Rerun the same legacy-base case with progress instrumentation:
+
+```bash
+MIRAGE_TASK_GRAPH_MODE=streaming_data \
+MIRAGE_STREAMING_DEBUG_PROGRESS=1 \
+python3 -u demo/qwen3/demo_30B_A3B_hopper.py \
+  --use-mirage \
+  --max-num-batched-tokens 1 \
+  --max-num-batched-requests 1 \
+  --max-seq-length 40 \
+  --output-dir validation_streaming_fixed/legacy_base_single_debug
+```
+
+2. Inspect whether `completed_terminal_data_count` /
+   `completed_streaming_data_count` advance after launch.
+
+3. Only if default legacy-base streaming returns cleanly: try
+   `MIRAGE_STREAMING_BASE_MODE=hybrid_prelaunch`.
+
+4. Only after both bases pass: widen the streaming whitelist beyond
+   `TASK_MOE_W13` and `TASK_MOE_W2`.
+
+### 2026-03-16 latest: post-launch hang root causes found and fixed
+
+The next debug pass used host-side progress polling with
+`MIRAGE_STREAMING_DEBUG_PROGRESS=1`. The important signal was:
+
+- the run advanced all the way to `iter=39`
+- `begin=39` and `end=39`
+- then `term=1` appeared, proving scheduler 0 had already decided there was no
+  next batch and had called `terminate_schedulers(...)`
+- but the process still did not exit cleanly
+
+That narrowed the remaining hang to shutdown, not to graph generation, not to
+the first streaming handoff, and not to EOG detection.
+
+#### Fix 1: scheduler termination was using the wrong worker-queue primitive
+
+The first post-launch hang root cause was in
+`include/mirage/persistent_kernel/resident_persistent_kernel.cuh`,
+inside `execute_scheduler_streaming(...)`.
+
+Streaming mode prelaunches compatibility tasks with
+`enqueue_worker_item(...)`, which advances a scheduler-local
+`worker_queue_next_free_task_pos[...]` cursor and only publishes readiness via
+`worker_queue_last_ready_task_id`.
+
+But the termination branch in `execute_scheduler_streaming(...)` was using
+`publish_worker_item(...)` to send `TASK_TERMINATE`. That path uses the global
+`worker_queue_next_free_task_id[...]` plus a CAS loop on
+`worker_queue_last_ready_task_id[...]`.
+
+In streaming mode, the global `worker_queue_next_free_task_id[...]` stayed near
+zero because the normal prelaunch path never touched it, while
+`worker_queue_last_ready_task_id[...]` had already advanced into the thousands.
+So when the scheduler tried to publish `TASK_TERMINATE`, the CAS loop compared
+against `next_pos = 0` while `last_ready` was already about `2848`, and it spun
+forever.
+
+The fix was to make the termination branch use the same queue primitive as the
+rest of streaming prelaunch:
+
+- replace `publish_worker_item(config, worker, 0)` with
+  `enqueue_worker_item(config, worker, &worker_queue_next_free_task_pos[...], 0)`
+
+After this fix:
+
+- `sched_done` became `1`
+- but `worker_done` was still `0`
+
+So the scheduler-side deadlock was fixed, but the workers still were not
+exiting.
+
+#### Fix 2: streaming workers were not checking the terminate flag
+
+The second root cause was simpler.
+
+I had previously added `streaming_terminate_flag`, but the actual
+`execute_worker_streaming(...)` loop was missing the check. The terminate check
+existed only in the scheduler-dispatch worker path, not in the streaming worker
+path.
+
+So after the scheduler exited, the streaming workers kept running forever
+because they never looked at the flag.
+
+The fix was to add the same early-exit check at the top of the
+`execute_worker_streaming(...)` outer loop:
+
+```cpp
+if (config.streaming_terminate_flag != nullptr &&
+    atomicAdd(config.streaming_terminate_flag, 0u) != 0u) {
+  return;
+}
+```
+
+After that change, the full single-token streaming run returned cleanly.
+
+#### Real validation after both fixes
+
+The following real runs were completed inside `mirage.sif` on Slurm job
+`86948` (`node-gpu01`) after rebuilding `mirage_runtime` and relinking the
+Python extension with `python3 setup.py build_ext --inplace --force`.
+
+Default `streaming_data` legacy-base run:
+
+- command:
+
+```bash
+MIRAGE_TASK_GRAPH_MODE=streaming_data \
+python3 -u demo/qwen3/demo_30B_A3B_hopper.py \
+  --use-mirage \
+  --max-num-batched-tokens 1 \
+  --max-num-batched-requests 1 \
+  --max-seq-length 40 \
+  --output-dir validation_streaming_fixed/legacy_base_single_mirage_v4
+```
+
+- artifacts:
+  - [legacy_base_single_mirage_v4.run.log](/home/nikhilag/mirage/validation_streaming_fixed/legacy_base_single_mirage_v4.run.log)
+  - [task_graph_rank0.json](/home/nikhilag/mirage/validation_streaming_fixed/legacy_base_single_mirage_v4/task_graph_rank0.json)
+- result:
+  - returned cleanly
+  - `Prompt length 39, generate length 1`
+  - `per-token latency (both prefill and decode): 69.834 ms`
+
+`streaming_data` with hybrid base:
+
+- command:
+
+```bash
+MIRAGE_TASK_GRAPH_MODE=streaming_data \
+MIRAGE_STREAMING_BASE_MODE=hybrid_prelaunch \
+python3 -u demo/qwen3/demo_30B_A3B_hopper.py \
+  --use-mirage \
+  --max-num-batched-tokens 1 \
+  --max-num-batched-requests 1 \
+  --max-seq-length 40 \
+  --output-dir validation_streaming_fixed/hybrid_base_single_mirage_v1
+```
+
+- artifacts:
+  - [hybrid_base_single_mirage_v1.run.log](/home/nikhilag/mirage/validation_streaming_fixed/hybrid_base_single_mirage_v1.run.log)
+  - [task_graph_rank0.json](/home/nikhilag/mirage/validation_streaming_fixed/hybrid_base_single_mirage_v1/task_graph_rank0.json)
+- result:
+  - returned cleanly
+  - `Prompt length 39, generate length 1`
+  - `per-token latency (both prefill and decode): 65.359 ms`
+
+Graph sanity from the successful runs:
+
+- both runs emitted schema-v2 graphs with:
+  - `resident_tasks = 9859`
+  - `all_data = 21331`
+  - `data_edges = 128641`
+  - `execution_kind` counts `{0: 9427, 1: 432}`
+
+Output sanity from the successful runs:
+
+- both successful runs produced the same visible one-token output on this short
+  `max_seq_length=40` case: the assistant output ended at `<think>`
+- this is only a limited correctness check because the run allows exactly one
+  generated token
+
+Current state after these fixes:
+
+- default `streaming_data` legacy-base mode is now working end-to-end on a real
+  single-GPU Qwen Hopper run
+- `streaming_data + MIRAGE_STREAMING_BASE_MODE=hybrid_prelaunch` is also
+  working end-to-end on the same shape
+- the original streaming hang is fixed
+- the next meaningful validation is larger-batch / longer-output behavior, not
+  more debugging of the old post-launch stall
+
+### 2026-03-16 cleanup pass: removed ad hoc debug scaffolding and revalidated
+
+After the streaming shutdown hang was understood and fixed, the temporary
+debug-only code was removed again so the runtime stayed tight:
+
+- removed the streaming debug-marker buffer from `ResidentRuntimeConfig`
+- removed the host-side `MIRAGE_STREAMING_DEBUG_PROGRESS` polling path
+- removed one-off device-side marker writes and special-case debug tracking
+- kept the real fixes:
+  - full-event loading for legacy-base streaming
+  - scheduler termination via `enqueue_worker_item(...)`
+  - worker termination checks via `streaming_terminate_flag`
+
+Revalidation after that cleanup:
+
+- default legacy-base streaming:
+  - [legacy_base_single_mirage_v5.run.log](/home/nikhilag/mirage/validation_streaming_fixed/legacy_base_single_mirage_v5.run.log)
+  - `67.918 ms/token`
+- hybrid-base streaming:
+  - [hybrid_base_single_mirage_v2.run.log](/home/nikhilag/mirage/validation_streaming_fixed/hybrid_base_single_mirage_v2.run.log)
+  - `63.886 ms/token`
+
+These runs completed cleanly and produced the same visible one-token output as
+the earlier successful streaming validations.
 
 ## The conceptual difference in one example
 
