@@ -1959,3 +1959,114 @@ If you only remember three things, remember these:
 1. the old graph was correct but too coarse because events acted like phase barriers,
 2. the new graph makes dependencies data-specific, not stage-wide,
 3. the current validated runtime keeps the resident/data graph for readiness, but executes batched legacy tasks to stay closer to Mirage's fast path.
+
+---
+
+### 2026-03-20: timeline visualization refactored — all modes now supported
+
+#### What changed
+
+The `scripts/display_task_graph_timeline.py` monolith (2522 lines) has been
+fully refactored into a `scripts/timeline/` package and replaced with a
+Canvas-based renderer. The old DOM-per-bar approach created hundreds of
+thousands of `<div>` elements for the streaming graph (21k+ data items) and
+had no streaming mode support at all.
+
+The rewrite was done in six phases:
+
+- **Phase 1** — extracted shared constants, parsers, mapper, and metrics into
+  importable modules under `scripts/timeline/`.
+- **Phase 2** — introduced a `ViewAdapter` ABC and a `VIEW_REGISTRY` list.
+  Every timeline tab is now a self-contained class with `is_applicable(mode)`,
+  `build_rows(ctx)`, and optional `build_analysis_html(ctx)` methods. Adding a
+  new execution strategy only requires adding a new subclass.
+- **Phase 3** — added `detect_mode(graph_data) → GraphMode`. The script now
+  automatically detects `legacy_event`, `resident_data`, or `streaming_data`
+  mode from the JSON, counts prelaunched vs streaming resident tasks, and gates
+  the Streaming Boundary tab on actual streaming graphs.
+- **Phase 4** — replaced the DOM renderer with a `TimelineRenderer` Canvas
+  class. Virtual scrolling (only visible rows are drawn), O(log N) binary-search
+  hit testing, zoom without DOM destruction, straggler glow via `shadowBlur`,
+  and streaming-bar cyan accent stripes. Scales to 21k+ data items without
+  creating any DOM per bar.
+- **Phase 5** — added `StreamingBoundaryView`: a new tab that splits prelaunched
+  (execution_kind=0) and streaming (execution_kind=1) resident tasks across a
+  visual boundary row, in topological order. Added `compute_streaming_metrics()`
+  with prelaunched/streaming time breakdowns and boundary-handoff latency.
+- **Phase 6** — added `CompactBarEncoder`: bar data is serialized as
+  9-element arrays with deduped color/name tables. ~3-4× JSON payload reduction
+  for the 21k-item streaming graph.
+
+#### New file layout
+
+```
+scripts/
+  display_task_graph_timeline.py   # ~650 lines, entry point only
+  timeline/
+    __init__.py                    # shared constants + helpers
+    graph_parser.py                # parse_task_graph, build_dependency_dag, etc.
+    trace_parser.py                # parse_perfetto_trace, filter_trace_slices_to_graph
+    mapper.py                      # map_trace_to_graph, map_data_trace_to_graph, etc.
+    metrics.py                     # schedule + data metrics + compute_streaming_metrics
+    mode_detector.py               # ExecutionMode enum, GraphMode dataclass, detect_mode()
+    html_generator.py              # template assembly + CompactBarEncoder
+    views/
+      __init__.py                  # BarData, RowData, ViewContext, ViewAdapter ABC
+      pipeline_phases.py           # PipelinePhasesView
+      by_task_type.py              # ByTaskTypeView
+      data_overlap.py              # DataOverlapView (streaming-aware coloring)
+      per_block.py                 # PerBlockView
+      streaming_boundary.py        # StreamingBoundaryView (streaming mode only)
+    templates/
+      shell.html                   # HTML skeleton
+      styles.css                   # all CSS
+      renderer.js                  # TimelineRenderer (Canvas + virtual scroll)
+      interactions.js              # tab switch, zoom, tooltip, dep highlight
+      whatif_shell.html            # what-if HTML skeleton
+```
+
+#### Key behavioral change
+
+The script output is functionally equivalent for legacy and resident graphs.
+For streaming graphs, two new things appear:
+
+- The `Streaming Boundary` tab is shown (was not present before).
+- Data items with `execution_kind=1` are cyan-tinted in the Data Overlap tab
+  and carry a 3px cyan left accent in Per Block / Streaming Boundary views.
+
+`detect_mode()` is the single source of truth for which tabs are shown and how
+bars are colored. If you add a new execution strategy, define a new
+`ExecutionMode` value, update `detect_mode()`, and add a `ViewAdapter` subclass
+to `VIEW_REGISTRY`.
+
+#### Pointers for the next AI
+
+All context and progress for this refactor is persisted in Claude Code memory.
+The memory directory is:
+
+```
+/home/nikhilag/.claude/projects/-home-nikhilag-mirage/memory/
+```
+
+Relevant memory files:
+
+| File | Contents |
+|------|----------|
+| `project_viz_refactor.md` | Phase status, key decisions, plan file pointer |
+| `project_mirage_context.md` | Overall Mirage MPK project context |
+| `project_streaming_bug_fix.md` | Streaming kernel hang root cause and fix |
+
+The detailed implementation plan (6-phase spec with file structure, function
+signatures, and verification steps) is at:
+
+```
+/home/nikhilag/.claude/plans/moonlit-waddling-stallman.md
+```
+
+All six phases are marked complete in `project_viz_refactor.md`.
+The next thing to do on the visualization side is to run the script against a
+real streaming trace (e.g.
+`validation_streaming_fixed/legacy_base_single_mirage_v4/task_graph_rank0.json`
+plus its `.perfetto-trace`) and verify the Streaming Boundary tab renders
+correctly with the current `execution_kind` counts
+(`{0: 9427, 1: 432}` expected for that graph).
