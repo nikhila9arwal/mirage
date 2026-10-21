@@ -29,7 +29,8 @@ public:
 public:
   static TaskRegister *get_instance();
   int register_embedding_task(threadblock::Graph const &bgraph,
-                              std::vector<int> const &params);
+                              std::vector<int> const &params,
+                              TaskType task_type = TASK_EMBEDDING);
   int register_rmsnorm_task(threadblock::Graph const &bgraph,
                             std::vector<int> const &params);
   int register_rmsnorm_linear_task(threadblock::Graph const &bgraph,
@@ -44,7 +45,8 @@ public:
                            std::vector<int> const &params,
                            bool with_residual);
   int register_silu_mul_task(threadblock::Graph const &bgraph,
-                             std::vector<int> const &params);
+                             std::vector<int> const &params,
+                             bool one_row_per_task = false);
   int register_identity_task(threadblock::Graph const &bgraph,
                              std::vector<int> const &params);
   int register_silu_mul_linear_with_residual_task(
@@ -67,11 +69,20 @@ public:
                                   bool with_residual);
   int register_paged_attention_hopper_task(threadblock::Graph const &bgraph,
                                            std::vector<int> const &params);
+  int register_attention_slot_hopper_task(threadblock::Graph const &bgraph,
+                                         std::vector<int> const &params);
+  int register_checksum_hopper_task(threadblock::Graph const &bgraph,
+                                   std::vector<int> const &params);
+  int register_moe_top1_row_task(threadblock::Graph const &bgraph,
+                               std::vector<int> const &params);
+  int register_moe_slot_task(threadblock::Graph const &bgraph,
+                            std::vector<int> const &params, bool w13_linear);
   int register_rmsnorm_hopper_task(threadblock::Graph const &bgraph,
                                    std::vector<int> const &params);
   int register_linear_swapAB_hopper_task(threadblock::Graph const &bgraph,
                                          std::vector<int> const &params,
-                                         bool with_residual);
+                                         bool with_residual,
+                                         TaskType task_type = TASK_LINEAR_SWAPAB_HOPPER);
   int register_linear_cutlass_hopper_task(threadblock::Graph const &bgraph,
                                           std::vector<int> const &params,
                                           bool with_residual);

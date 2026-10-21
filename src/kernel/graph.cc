@@ -22,6 +22,8 @@
 
 #include <algorithm>
 #include <iostream>
+#include <limits>
+#include <stdexcept>
 
 namespace mirage {
 namespace kernel {
@@ -80,21 +82,30 @@ int Graph::get_num_output_dtensors() const {
 int Graph::get_input_dtensor_shape_and_stride(DTensor const *input,
                                               int *strides,
                                               int *dims) const {
-  for (auto const &op : this->operators) {
-    if (op == input->owner_op) {
-      assert(op->op_type == mirage::type::KN_INPUT_OP &&
-             "input is not an KNInputOp");
-      KNInputOp *input_op = static_cast<KNInputOp *>(op);
-      int num_dims = (int)input_op->input_strides.size();
-      for (int i = 0; i < num_dims; i++) {
-        strides[i] = input_op->input_strides[i];
-        dims[i] = input->dim[i];
-      }
-      return num_dims;
+  if (input == nullptr || input->num_dims <= 0 ||
+      input->num_dims > config::MAX_TENSOR_DIMS) {
+    throw std::invalid_argument("Invalid tensor rank for shape/stride lookup");
+  }
+  // Virtual views have no owner_op. Check their root storage instead, then
+  // use the view's own dimensions and strides rather than the parent's shape.
+  bool belongs_to_graph = false;
+  for (auto const *op : operators) {
+    for (auto const &tensor : op->output_tensors) {
+      belongs_to_graph |= tensor.guid == input->resolve_base_guid();
     }
   }
-  assert(false && "Cannot find input dtensor");
-  return 0;
+  if (!belongs_to_graph) {
+    throw std::invalid_argument("Tensor storage does not belong to this graph");
+  }
+  for (int i = 0; i < input->num_dims; i++) {
+    if (input->stride[i] < std::numeric_limits<int>::min() ||
+        input->stride[i] > std::numeric_limits<int>::max()) {
+      throw std::invalid_argument("Tensor stride exceeds the Python binding range");
+    }
+    strides[i] = static_cast<int>(input->stride[i]);
+    dims[i] = input->dim[i];
+  }
+  return input->num_dims;
 }
 
 bool Graph::can_allocate(DTensor const &tensor,
@@ -442,10 +453,10 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
   assert(op->op_type == type::KN_CUSTOMIZED_OP);
   KNCustomizedOp const *customized = static_cast<KNCustomizedOp const *>(op);
   TaskRegister *task_register = TaskRegister::get_instance();
-  if (name == "embedding") {
-    int variant_id =
-        task_register->register_embedding_task(customized->bgraph, params);
-    task_config[op] = std::make_tuple(2, 1, TASK_EMBEDDING, variant_id);
+  if (name == "embedding" || name == "embedding_input") {
+    TaskType type = name == "embedding_input" ? TASK_EMBEDDING_INPUT : TASK_EMBEDDING;
+    int variant_id = task_register->register_embedding_task(customized->bgraph, params, type);
+    task_config[op] = std::make_tuple(2, 1, type, variant_id);
   } else if (name == "rmsnorm") {
     int variant_id =
         task_register->register_rmsnorm_task(customized->bgraph, params);
@@ -511,10 +522,10 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         customized->bgraph, params, true /*with_residual*/);
     task_config[op] =
         std::make_tuple(3, 1, TASK_LINEAR_WITH_RESIDUAL, variant_id);
-  } else if (name == "silu_mul") {
-    int variant_id =
-        task_register->register_silu_mul_task(customized->bgraph, params);
-    task_config[op] = std::make_tuple(1, 1, TASK_SILU_MUL, variant_id);
+  } else if (name == "silu_mul" || name == "silu_mul_row") {
+    bool const row = name == "silu_mul_row";
+    int variant_id = task_register->register_silu_mul_task(customized->bgraph, params, row);
+    task_config[op] = std::make_tuple(1, 1, row ? TASK_SILU_MUL_ROW : TASK_SILU_MUL, variant_id);
   } else if (name == "identity") {
     int variant_id =
         task_register->register_identity_task(customized->bgraph, params);
@@ -572,6 +583,24 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     int variant_id =
         task_register->register_rmsnorm_hopper_task(customized->bgraph, params);
     task_config[op] = std::make_tuple(2, 1, TASK_RMS_NORM_HOPPER, variant_id);
+  } else if (name == "attention_slot_hopper") {
+    int variant_id = task_register->register_attention_slot_hopper_task(customized->bgraph, params);
+    // K/V cache writes are outputs as well as inputs for ownership/dependencies.
+    task_config[op] = std::make_tuple(3, 3, TASK_ATTENTION_SLOT_HOPPER, variant_id);
+  } else if (name == "checksum_hopper") {
+    int variant_id = task_register->register_checksum_hopper_task(customized->bgraph, params);
+    task_config[op] = std::make_tuple(2, 1, TASK_CHECKSUM_HOPPER, variant_id);
+  } else if (name == "moe_top1_row") {
+    int variant_id = task_register->register_moe_top1_row_task(customized->bgraph, params);
+    task_config[op] = std::make_tuple(1, 2, TASK_MOE_TOP1_ROW, variant_id);
+  } else if (name == "moe_slot_w13" || name == "moe_slot_w2") {
+    bool const w13 = name == "moe_slot_w13";
+    int variant_id = task_register->register_moe_slot_task(customized->bgraph, params, w13);
+    task_config[op] = std::make_tuple(3, 1, w13 ? TASK_MOE_SLOT_W13 : TASK_MOE_SLOT_W2, variant_id);
+  } else if (name == "linear_qkv_hopper" || name == "linear_wo_hopper") {
+    TaskType type = name == "linear_qkv_hopper" ? TASK_LINEAR_QKV_HOPPER : TASK_LINEAR_WO_HOPPER;
+    int variant_id = task_register->register_linear_swapAB_hopper_task(customized->bgraph, params, false, type);
+    task_config[op] = std::make_tuple(2, 1, type, variant_id);
   } else if (name == "linear_swapAB_hopper") {
     int variant_id = task_register->register_linear_swapAB_hopper_task(
         customized->bgraph, params, false /*with_residual*/);

@@ -1134,7 +1134,32 @@ cdef class CyKNGraph:
             "cuda_code": result.cuda_code.decode("UTF-8"),
             "json_file": result.json_file.decode("UTF-8"),
         }
-     
+
+    def generate_resident_task_graph(self, int num_gpus, int my_gpu_id,
+                                     data_slot_ids=None):
+        """Generate native resident dataflow, optionally validating slot ownership.
+
+        Slot IDs are indexed by the DataIds in the native graph, not TaskIds
+        or ResidentTaskIds. None preserves the unannotated graph format.
+        """
+        from builtins import bool as py_bool
+        from operator import index
+        cdef vector[int] cslots
+        if data_slot_ids is not None:
+            slots = list(data_slot_ids)
+            if not slots:
+                raise ValueError("data_slot_ids must be nonempty; use None to disable slot metadata")
+            for slot in slots:
+                if isinstance(slot, py_bool):
+                    raise TypeError("Request slot IDs must be integers, not bools")
+                cslots.push_back(index(slot))
+        cdef TaskGraphResult result = self.p_kgraph.generate_resident_task_graph(
+            num_gpus, my_gpu_id, cslots)
+        return {
+            "cuda_code": result.cuda_code.decode("UTF-8"),
+            "json_file": result.json_file.decode("UTF-8"),
+        }
+
 
 cdef class CyTBGraph:
     cdef CppTBGraph *p_bgraph #Hold a CppTBGraph instance

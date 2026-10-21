@@ -347,6 +347,11 @@ def get_compile_command(
     flags = flags + [f"-DMPK_MAX_TOKENS_PER_REQUEST={mpk.max_tokens_per_request}"]
     flags = flags + [f"-DMPK_MAX_NUM_PAGES={mpk.max_num_pages}"]
     flags = flags + [f"-DMPK_NUM_KV_GROUPS={len(mpk.kv_groups)}"]
+    if mpk.task_graph_mode == "resident_data":
+        # The resident adapter retains one fixed-size KV group. Upstream's
+        # native path reads group sizes at runtime and no longer emits this
+        # legacy constant, which resident preparation still needs to compile.
+        flags = flags + [f"-DMPK_PAGE_SIZE={mpk.kv_groups[0].block_size}"]
     if "kv_event_log" in mpk.meta_tensors:
         flags = flags + [
             f"-DMPK_KV_EVENT_LOG={mpk.meta_tensors['kv_event_log'].numel()}"]
@@ -831,15 +836,23 @@ class PersistentKernel:
         assert is_row_major or is_col_major, \
             f"Tensor must be row-major or column-major, got dims={dims} strides={strides}"
         dtype = convert_torch_type_to_dtype(torch_tensor.dtype)
-        t = self.kn_graph.new_input(dims=dims, strides=strides, dtype=dtype)
         # FIXME: currently assert that name is not None
         assert name is not None
-        self.kn_graph.attach_torch_tensor(t, torch_tensor, name)
-        # Track tensor for kernel reuse - tensor pointer can be passed at runtime
-        self._model_tensors[name] = torch_tensor
-        # Sanitize name for C++ codegen (dots are illegal in identifiers)
         safe_name = name.replace('.', '_')
-        self.kn_graph.attach_torch_tensor(t, torch_tensor, safe_name)
+        if self.task_graph_mode == "resident_data" and safe_name in self._model_tensors:
+            raise ValueError(f"Duplicate resident tensor name after sanitizing: {safe_name}")
+        t = self.kn_graph.new_input(dims=dims, strides=strides, dtype=dtype)
+        # The resident initializer emits this name as both a C++ identifier
+        # and a model-pointer lookup key. Bind it once with matching spelling;
+        # attach_torch_tensor uses emplace, so a second attachment cannot rename it.
+        if self.task_graph_mode == "resident_data":
+            self.kn_graph.attach_torch_tensor(t, torch_tensor, safe_name)
+            self._model_tensors[safe_name] = torch_tensor
+        else:
+            # Keep the existing native binding behavior during this resident port.
+            self.kn_graph.attach_torch_tensor(t, torch_tensor, name)
+            self._model_tensors[name] = torch_tensor
+            self.kn_graph.attach_torch_tensor(t, torch_tensor, safe_name)
         # Keep a reference to the PyTorch tensor so it is not garbage-collected.
         # The generated persistent kernel code stores the raw GPU data pointer;
         # if the tensor is freed, the pointer becomes dangling.
@@ -930,7 +943,10 @@ class PersistentKernel:
         tb_graph.new_input(weight, (1, -1, -1), -1, True)
         tb_graph.new_input(output, (1, 0, -1), -1, True)
         self.kn_graph.customized([input, weight, output], tb_graph)
-        self.kn_graph.register_task(tb_graph, "embedding" if self.target_cc == 90 else "embedding", [input_source])
+        # Preserve native embedding identity; resident slot restart distinguishes
+        # tensor-backed IDs from the global token/step source.
+        name = "embedding_input" if self.task_graph_mode == "resident_data" and input_source == 1 else "embedding"
+        self.kn_graph.register_task(tb_graph, name, [input_source])
 
     def rmsnorm_layer(
         self,
@@ -949,6 +965,32 @@ class PersistentKernel:
         tb_graph.new_input(output, (0, -1, -1), 1, True)
         self.kn_graph.customized([input, weight, output], tb_graph)
         self.kn_graph.register_task(tb_graph, "rmsnorm_hopper" if self.target_cc >= 90 else "rmsnorm")
+
+    def checksum_layer(
+        self, input: DTensor, coefficient: DTensor, output: DTensor,
+        grid_dim: tuple, block_dim: tuple,
+    ):
+        """One weighted checksum per row: BF16(sum_fp32(input * coefficient)).
+
+        This is a diagnostic summary, not storage of the full output vector.
+        Each 256-thread block owns one row; coefficients are shared read-only.
+        """
+        if self.target_cc != 90 or self.task_graph_mode != "resident_data":
+            raise ValueError("Checksum requires Hopper resident_data")
+        if (input.num_dims != 2 or coefficient.num_dims != 1 or output.num_dims != 2
+                or input.dim(1) <= 0 or coefficient.dim(0) != input.dim(1)
+                or output.dim(0) != input.dim(0) or output.dim(1) != 1):
+            raise ValueError("Expected input[S,H], coefficient[H], output[S,1]")
+        if any(t.dtype != bfloat16 for t in (input, coefficient, output)):
+            raise ValueError("checksum_layer requires BF16 tensors")
+        if tuple(grid_dim) != (input.dim(0), 1, 1) or tuple(block_dim) != (256, 1, 1):
+            raise ValueError("Checksum requires grid=(S,1,1), block=(256,1,1)")
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input, (0, -1, -1), 1, True)
+        tb_graph.new_input(coefficient, (-1, -1, -1), 0, True)
+        tb_graph.new_input(output, (0, -1, -1), 1, True)
+        self.kn_graph.customized([input, coefficient, output], tb_graph)
+        self.kn_graph.register_task(tb_graph, "checksum_hopper")
 
     def rmsnorm_linear_layer(
         self,
@@ -1369,6 +1411,58 @@ class PersistentKernel:
             f"a layer with window_size {layer_window} reads KV group "
             f"{group_id}, which declares {group_window}")
         return block_size
+
+    def attention_slot_layer(
+        self, qkv: DTensor, k_cache: DTensor, v_cache: DTensor, output: DTensor,
+        grid_dim: Optional[tuple] = None, block_dim: tuple = (256, 1, 1),
+    ):
+        """Bounded attention with a private 64-token page per slot.
+
+        QKV is packed as [Q0,Q1,Q2,Q3,K,V] for each KV head, with head width
+        128. By default each pass attends to 63 fixed prefix entries plus its
+        current input and overwrites cache position 63 (V0). Compiling with
+        context_sequence=(steps, prefix_length) instead appends one token per
+        slot epoch and attends to prefix_length+epoch entries (V1, at most 64).
+        K/V appear as both inputs and outputs to expose the in-place writes.
+        """
+        if self.target_cc != 90 or self.task_graph_mode != "resident_data":
+            raise ValueError("Slot attention requires Hopper resident_data")
+        if (qkv.num_dims != 2 or output.num_dims != 2
+                or k_cache.num_dims != 4 or v_cache.num_dims != 4):
+            raise ValueError("Expected QKV[S,Hkv*768], output[S,Hkv*512], caches[S,64,Hkv,128]")
+        slots, kv_heads = qkv.dim(0), k_cache.dim(2)
+        cache_shape = (slots, 64, kv_heads, 128)
+        if (slots <= 0 or kv_heads <= 0 or qkv.dim(1) != kv_heads * 768
+                or output.dim(0) != slots or output.dim(1) != kv_heads * 512
+                or tuple(k_cache.dim(i) for i in range(4)) != cache_shape
+                or tuple(v_cache.dim(i) for i in range(4)) != cache_shape):
+            raise ValueError("Slot attention requires GQA ratio 4, head width 128, and one 64-token page")
+        tensors = (qkv, k_cache, v_cache, output)
+        if len({tensor.guid for tensor in tensors}) != len(tensors):
+            raise ValueError("QKV, output, K cache, and V cache must be distinct tensors")
+        for tensor in tensors:
+            _, strides = self.kn_graph.cygraph.get_input_dtensor_shape_and_stride(tensor)
+            expected, stride = [], 1
+            for axis in range(tensor.num_dims - 1, -1, -1):
+                expected.insert(0, stride)
+                stride *= tensor.dim(axis)
+            if tensor.dtype != bfloat16 or tuple(strides) != tuple(expected):
+                raise ValueError("Slot attention requires contiguous BF16 tensor storage")
+        expected_grid = (slots, kv_heads, 1)
+        if grid_dim is None:
+            grid_dim = expected_grid
+        if tuple(grid_dim) != expected_grid or tuple(block_dim) != (256, 1, 1):
+            raise ValueError("Slot attention requires grid=(S,Hkv,1), block=(256,1,1)")
+
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        # The three output views alias O/K/V storage directly. No allocation
+        # or cache copy is introduced by declaring these mutations.
+        views = [qkv, k_cache, v_cache, output, k_cache, v_cache]
+        for index, tensor in enumerate(views):
+            head_axis = 1 if index in (0, 3) else 2
+            tb_graph.new_input(tensor, (0, head_axis, -1), -1, True)
+        self.kn_graph.customized(views, tb_graph)
+        self.kn_graph.register_task(tb_graph, "attention_slot_hopper")
 
     def paged_attention_layer(
         self,
@@ -2039,6 +2133,81 @@ class PersistentKernel:
 
         self.kn_graph.register_task(tb_graph, "tensor_init")
     
+    def moe_top1_row_layer(
+        self, input: DTensor, top1_weight: DTensor, routing_indices: DTensor,
+        grid_dim: tuple, block_dim: tuple,
+    ):
+        """Experimental private top-1 routing: one Hopper task per slot.
+
+        logits[S,128] are writable BF16 scratch: the reused MPK kernel clears
+        them. It writes FP32 weights[S,1] and int32 ranks[S,128]. Each ranks row
+        contains one 1 and otherwise zeros. No shared active-expert list is
+        produced; the batch controller reads these private results instead.
+        """
+        if self.target_cc != 90 or self.task_graph_mode != "resident_data":
+            raise ValueError("Private top-1 requires Hopper resident_data")
+        if (input.num_dims != 2 or input.dim(0) <= 0 or input.dim(1) != 128
+                or top1_weight.num_dims != 2 or routing_indices.num_dims != 2
+                or top1_weight.dim(0) != input.dim(0) or top1_weight.dim(1) != 1
+                or routing_indices.dim(0) != input.dim(0) or routing_indices.dim(1) != 128):
+            raise ValueError("Expected logits[S,128], weights[S,1], ranks[S,128]")
+        if tuple(grid_dim) != (input.dim(0), 1, 1) or tuple(block_dim) != (256, 1, 1):
+            raise ValueError("Private top-1 requires grid=(S,1,1), block=(256,1,1)")
+        for tensor, dtype in ((input, bfloat16), (top1_weight, float32), (routing_indices, int32)):
+            _, strides = self.kn_graph.cygraph.get_input_dtensor_shape_and_stride(tensor)
+            if tensor.dtype != dtype or tuple(strides) != (tensor.dim(1), 1):
+                raise ValueError("Private top-1 requires contiguous BF16/FP32/int32 views")
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        for tensor in (input, top1_weight, routing_indices):
+            tb_graph.new_input(tensor, (0, -1, -1), -1, True)
+        self.kn_graph.customized([input, top1_weight, routing_indices], tb_graph)
+        self.kn_graph.register_task(tb_graph, "moe_top1_row")
+
+    def _moe_slot_linear_layer(
+        self, input: DTensor, weight: DTensor, routing_indices: DTensor,
+        output: DTensor, grid_dim: tuple, block_dim: tuple, *, w13: bool,
+    ):
+        # These are logical dependencies, not physical GEMM launches. A batch
+        # may complete several such private output rows at different epochs.
+        if self.target_cc != 90 or self.task_graph_mode != "resident_data":
+            raise ValueError("Logical slot MoE requires Hopper resident_data")
+        if (input.num_dims != 2 or weight.num_dims != 3 or output.num_dims != 2
+                or routing_indices.num_dims != 2 or input.dim(0) <= 0
+                or input.dim(1) <= 0 or weight.dim(0) != 128 or weight.dim(1) <= 0
+                or weight.dim(2) != input.dim(1) or output.dim(0) != input.dim(0)
+                or output.dim(1) != weight.dim(1)
+                or routing_indices.dim(0) != input.dim(0) or routing_indices.dim(1) != 128
+                or input.dim(1) % 128 or output.dim(1) % (256 if w13 else 64)):
+            raise ValueError("Expected x[S,K], W[128,N,K], ranks[S,128], y[S,N]; K%128=0 and N aligned")
+        if tuple(grid_dim) != (input.dim(0), 1, 1) or tuple(block_dim) != (256, 1, 1):
+            raise ValueError("Logical slot MoE requires grid=(S,1,1), block=(256,1,1)")
+        for tensor, dtype in ((input, bfloat16), (weight, bfloat16),
+                              (routing_indices, int32), (output, bfloat16)):
+            _, strides = self.kn_graph.cygraph.get_input_dtensor_shape_and_stride(tensor)
+            expected, stride = [], 1
+            for axis in range(tensor.num_dims - 1, -1, -1):
+                expected.insert(0, stride)
+                stride *= tensor.dim(axis)
+            if tensor.dtype != dtype or tuple(strides) != tuple(expected):
+                raise ValueError("Logical slot MoE requires contiguous BF16 activations/weights and int32 ranks")
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input, (0, -1, -1), -1, True)
+        tb_graph.new_input(weight, (-1, -1, -1), -1, True)
+        tb_graph.new_input(routing_indices, (0, -1, -1), -1, True)
+        tb_graph.new_input(output, (0, -1, -1), -1, True)
+        self.kn_graph.customized([input, weight, routing_indices, output], tb_graph)
+        self.kn_graph.register_task(tb_graph, "moe_slot_w13" if w13 else "moe_slot_w2")
+
+    def moe_slot_w13_layer(self, input, weight, routing_indices, output, grid_dim, block_dim):
+        """Logical row W13; requires the experimental MoE batching runtime."""
+        self._moe_slot_linear_layer(input, weight, routing_indices, output,
+                                   grid_dim, block_dim, w13=True)
+
+    def moe_slot_w2_layer(self, input, weight, routing_indices, output, grid_dim, block_dim):
+        """Logical row W2; requires the experimental MoE batching runtime."""
+        self._moe_slot_linear_layer(input, weight, routing_indices, output,
+                                   grid_dim, block_dim, w13=False)
+
     def moe_topk_softmax_routing_layer(
         self,
         input: DTensor,
@@ -2465,21 +2634,57 @@ class PersistentKernel:
         grid_dim: tuple,
         block_dim: tuple,
         bias: DTensor = None,
+        *,
+        one_row_per_task: bool = False,
+        batch_kind: str = None,
     ):
+        """Linear projection; optionally give each row its own Hopper task.
+
+        one_row_per_task uses grid=(rows,1,1), block=(256,1,1). Each task
+        computes a complete output row and reads the same shared weight matrix.
+        This first version accepts contiguous BF16 tensors, K divisible by 128,
+        and N divisible by 64. The default still shards output features.
+
+        batch_kind marks a row projection for optional runtime batching:
+        "qkv" or "attention_projection". Both markers retain the same real
+        row-linear kernel when batching is disabled. They do not alter edges.
+        """
+        if batch_kind not in (None, "qkv", "attention_projection"):
+            raise ValueError("batch_kind must be None, 'qkv', or 'attention_projection'")
+        if batch_kind is not None and self.task_graph_mode != "resident_data":
+            raise ValueError("Projection batching markers require resident_data")
+        if batch_kind is not None and not one_row_per_task:
+            raise ValueError("Projection batching markers require one_row_per_task=True")
+        if one_row_per_task and bias is not None:
+            raise ValueError("One-row Hopper linear does not support bias")
         # Currently assume that input/output
         assert input.num_dims == 2  # (batch_size, hidden_size / world_size)
         assert weight.num_dims == 2  # (hidden_size, hidden_size / world_size)
         assert output.num_dims == 2  # (batch_size, hidden_size)
+        if one_row_per_task:
+            if self.target_cc != 90:
+                raise ValueError("One-row linear currently supports Hopper")
+            if (input.dim(0) <= 0 or input.dim(1) <= 0 or weight.dim(0) <= 0
+                    or weight.dim(1) != input.dim(1) or output.dim(0) != input.dim(0)
+                    or output.dim(1) != weight.dim(0)
+                    or input.dim(1) % 128 or output.dim(1) % 64):
+                raise ValueError("Expected x[S,K], weight[N,K], y[S,N]; K multiple of 128, N multiple of 64")
+            if tuple(grid_dim) != (input.dim(0), 1, 1) or tuple(block_dim) != (256, 1, 1):
+                raise ValueError("One-row linear requires grid=(S,1,1), block=(256,1,1)")
+            for tensor in (input, weight, output):
+                _, strides = self.kn_graph.cygraph.get_input_dtensor_shape_and_stride(tensor)
+                if tensor.dtype != bfloat16 or tuple(strides) != (tensor.dim(1), 1):
+                    raise ValueError("One-row linear requires contiguous BF16 tensors")
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
-        tb_graph.new_input(input, (-1, -1, -1), 1, True)
-        tb_graph.new_input(weight, (0, -1, -1), 1, True)
+        tb_graph.new_input(input, (0, -1, -1) if one_row_per_task else (-1, -1, -1), 1, True)
+        tb_graph.new_input(weight, (-1, -1, -1) if one_row_per_task else (0, -1, -1), 1, True)
         if bias is not None:
             assert bias.num_dims == 2  # (1, hidden_size) -- one shared row
             assert bias.dim(0) == 1
             assert bias.dim(1) == output.dim(1)
             # Same partition as the output: each task takes its column slice.
             tb_graph.new_input(bias, (1, -1, -1), -1, True)
-        tb_graph.new_input(output, (1, -1, -1), -1, True)
+        tb_graph.new_input(output, (0, -1, -1) if one_row_per_task else (1, -1, -1), -1, True)
         graph_inputs = [input, weight] + ([bias] if bias is not None else [])
         self.kn_graph.customized(graph_inputs + [output], tb_graph)
 
@@ -2506,11 +2711,10 @@ class PersistentKernel:
         elif self.target_cc >= 100 and self.target_cc < 120:
             self.kn_graph.register_task(tb_graph, "linear_sm100")
         elif self.target_cc >= 90 and self.target_cc < 100:
-            if weight.dim(0) // grid_dim[0] <= 64:
-                self.kn_graph.register_task(tb_graph, "linear_swapAB_hopper")
-                # self.kn_graph.register_task(tb_graph, "linear_cutlass_hopper")
-            else:
-                self.kn_graph.register_task(tb_graph, "linear_swapAB_hopper")
+            name = {None: "linear_swapAB_hopper",
+                    "qkv": "linear_qkv_hopper",
+                    "attention_projection": "linear_wo_hopper"}[batch_kind]
+            self.kn_graph.register_task(tb_graph, name)
         elif self.target_cc >= 80 and self.target_cc < 90:
             self.kn_graph.register_task(tb_graph, "linear")
         else:
@@ -2586,15 +2790,36 @@ class PersistentKernel:
         output: DTensor,
         grid_dim: tuple,
         block_dim: tuple,
+        *,
+        one_row_per_task: bool = False,
     ):
+        """SiLU(gate) * up, with gate/up packed in the two input halves.
+
+        Row mode gives each slot one task over input[S,2I] -> output[S,I].
+        It uses a fixed one-row bound instead of the global token count.
+        Like the existing kernel, SiLU is rounded to BF16 before multiplication.
+        """
         # Currently assume that input/output
         assert input.num_dims == 2 # (batch_size, 2 * intermediate_size)
         assert output.num_dims == 2 # (batch_size, intermediate_size)
+        if one_row_per_task:
+            if self.target_cc != 90 or self.task_graph_mode != "resident_data":
+                raise ValueError("One-row SiLU/multiply requires Hopper resident_data")
+            if (input.dim(0) <= 0 or output.dim(1) <= 0
+                    or output.dim(0) != input.dim(0) or input.dim(1) != 2 * output.dim(1)):
+                raise ValueError("Expected input[S,2I], output[S,I]")
+            if tuple(grid_dim) != (input.dim(0), 1, 1) or tuple(block_dim) != (256, 1, 1):
+                raise ValueError("One-row SiLU/multiply requires grid=(S,1,1), block=(256,1,1)")
+            for tensor in (input, output):
+                _, strides = self.kn_graph.cygraph.get_input_dtensor_shape_and_stride(tensor)
+                if tensor.dtype != bfloat16 or tuple(strides) != (tensor.dim(1), 1):
+                    raise ValueError("One-row SiLU/multiply requires contiguous BF16 tensors")
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
-        tb_graph.new_input(input, (1, -1, -1), 1, True)
-        tb_graph.new_input(output, (1, -1, -1), 1, True)
+        # In row mode both halves stay together; grid.x selects only the row.
+        tb_graph.new_input(input, (0, -1, -1) if one_row_per_task else (1, -1, -1), 1, True)
+        tb_graph.new_input(output, (0, -1, -1) if one_row_per_task else (1, -1, -1), 1, True)
         self.kn_graph.customized([input, output], tb_graph)
-        self.kn_graph.register_task(tb_graph, "silu_mul" if self.target_cc == 90 else "silu_mul")
+        self.kn_graph.register_task(tb_graph, "silu_mul_row" if one_row_per_task else "silu_mul")
 
     def identity_layer(
         self,

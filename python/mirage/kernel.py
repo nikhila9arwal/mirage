@@ -804,3 +804,16 @@ class KNGraph:
 
     def generate_task_graph(self, num_gpus: int, my_gpu_id: int):
         return self.cygraph.generate_task_graph(num_gpus, my_gpu_id)
+
+    def generate_resident_task_graph(
+        self, num_gpus: int, my_gpu_id: int, data_slot_ids=None
+    ):
+        """Export native dataflow and optional DataId-indexed request slots.
+
+        Nonempty slot assignments must cover every DataId and use dense IDs
+        starting at zero. The native compiler validates independent ownership
+        and exports roots/terminals; it does not enable asynchronous iterations.
+        """
+        return self.cygraph.generate_resident_task_graph(
+            num_gpus, my_gpu_id, data_slot_ids
+        )

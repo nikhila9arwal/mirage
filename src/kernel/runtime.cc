@@ -19,6 +19,7 @@
 #include "mirage/transpiler/utils.h"
 #include "mirage/utils/json_utils.h"
 #include <queue>
+#include <set>
 
 namespace mirage {
 namespace kernel {
@@ -1886,9 +1887,18 @@ TaskGraphResult print_task_graph(
   code.e("void _execute_task(TaskDesc const* task_desc,");
   code.e("                   RuntimeConfig const &runtime_config) {");
   TaskRegister *task_register = TaskRegister::get_instance();
+  // Registrations are process-wide; another graph may have registered variants
+  // for a different runtime. Emit only the variants used by this native graph.
+  std::set<std::pair<TaskType, int>> used_variants;
+  for (auto const &task : all_tasks) {
+    used_variants.emplace(task.task_type, task.variant_id);
+  }
   bool first_task = true;
   for (auto const &task : task_register->all_task_variants) {
     for (size_t variant_id = 0; variant_id < task.second.size(); variant_id++) {
+      if (used_variants.count({task.first, static_cast<int>(variant_id)}) == 0) {
+        continue;
+      }
       std::string cond = first_task ? "if" : "else if";
       assert(task_type_to_name.find(task.first) != task_type_to_name.end());
       code.e("$ (task_desc->task_type == $ && task_desc->variant_id == $) {",

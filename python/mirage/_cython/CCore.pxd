@@ -231,7 +231,7 @@ cdef extern from "mirage/kernel/graph.h" namespace "mirage::kernel":
         int get_num_input_dtensors()
         int get_num_output_dtensors()
         int get_input_dtensors(CppDTensor** cinputs)
-        int get_input_dtensor_shape_and_stride(const CppDTensor *input, int *strides, int *dims)
+        int get_input_dtensor_shape_and_stride(const CppDTensor *input, int *strides, int *dims) except +
         void generate_triton_program(const char *filepath)
         void generate_cuda_program(const char *filepath)
         size_t get_owner_independent_hash() const
@@ -264,6 +264,8 @@ cdef extern from "mirage/kernel/graph.h" namespace "mirage::kernel":
         void register_task(const char *task_type,
                            vector[int] params)
         TaskGraphResult generate_task_graph(int num_gpus, int my_gpu_id)
+        TaskGraphResult generate_resident_task_graph(int num_gpus, int my_gpu_id,
+                                                     const vector[int]& data_slot_ids) except +
 
         vector[CppKNOperator*] operators
 

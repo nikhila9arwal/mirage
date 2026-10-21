@@ -184,6 +184,10 @@ public:
                            char const *name);
   void register_task(char const *task_type, std::vector<int> params);
   runtime::TaskGraphResult generate_task_graph(int num_gpus, int my_gpu_id);
+  // Resident data dependencies and optional per-DataId request-slot ownership.
+  runtime::TaskGraphResult generate_resident_task_graph(
+      int num_gpus, int my_gpu_id,
+      std::vector<int> const &data_slot_ids = {});
 
   // helper functions
   int get_num_input_dtensors() const;

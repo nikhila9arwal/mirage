@@ -15,6 +15,7 @@
 #include "mirage/kernel/task_register.h"
 #include "mirage/kernel/operator.h"
 #include "mirage/transpiler/utils.h"
+#include <stdexcept>
 
 namespace mirage {
 namespace runtime {
@@ -47,8 +48,13 @@ int TaskRegister::register_task_variant(runtime::TaskType type,
 }
 
 int TaskRegister::register_embedding_task(threadblock::Graph const &bgraph,
-                                          std::vector<int> const &params) {
-  assert(params.size() == 1);
+                                          std::vector<int> const &params,
+                                          TaskType task_type) {
+  if (params.size() != 1 || (params[0] != 0 && params[0] != 1) ||
+      (task_type != TASK_EMBEDDING && task_type != TASK_EMBEDDING_INPUT) ||
+      (task_type == TASK_EMBEDDING_INPUT && params[0] != 1)) {
+    throw std::runtime_error("Embedding source must be global tokens or explicit tensor IDs");
+  }
   // params[0]: input source (0: tokens, 1: input_token)
   int batch_size = 0, output_size = 0, output_stride = 0;
   std::vector<tb::TBInputOp *> input_ops;
@@ -68,9 +74,7 @@ int TaskRegister::register_embedding_task(threadblock::Graph const &bgraph,
   assert(output_ops[0]->output_tensors[0].num_dims == 2);
   batch_size = output_ops[0]->output_tensors[0].dim[0];
   output_size = output_ops[0]->output_tensors[0].dim[1];
-  kn::KNInputOp *kn_input_op =
-      static_cast<kn::KNInputOp *>(output_ops[0]->dtensor.owner_op);
-  output_stride = static_cast<int>(kn_input_op->input_strides[0]);
+  output_stride = static_cast<int>(output_ops[0]->dtensor.stride[0]);
 
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
@@ -85,7 +89,7 @@ int TaskRegister::register_embedding_task(threadblock::Graph const &bgraph,
   }
   code.e("    task_desc->input_ptrs[1],");
   code.e("    task_desc->output_ptrs[0]);");
-  return register_task_variant(TASK_EMBEDDING, code.to_string());
+  return register_task_variant(task_type, code.to_string());
 }
 
 int TaskRegister::register_rmsnorm_task(threadblock::Graph const &bgraph,
@@ -731,7 +735,8 @@ int TaskRegister::register_single_batch_extend_attention_task(
 }
 
 int TaskRegister::register_silu_mul_task(threadblock::Graph const &bgraph,
-                                         std::vector<int> const &params) {
+                                         std::vector<int> const &params,
+                                         bool one_row_per_task) {
   assert(params.size() == 0);
   int batch_size = 0, output_size = 0, input_stride, output_stride;
   std::vector<tb::TBInputOp *> input_ops;
@@ -750,18 +755,15 @@ int TaskRegister::register_silu_mul_task(threadblock::Graph const &bgraph,
   assert(output_ops[0]->output_tensors[0].num_dims == 2);
   batch_size = output_ops[0]->output_tensors[0].dim[0];
   output_size = output_ops[0]->output_tensors[0].dim[1];
+  if (one_row_per_task && batch_size != 1) {
+    throw std::runtime_error("Row SiLU/multiply requires one output row per task");
+  }
   assert(input_ops[0]->dtensor.num_dims == 2);
   assert(input_ops[0]->output_tensors[0].dim[1] == output_size * 2);
-  // get input stride
-  assert(input_ops[0]->dtensor.owner_op->op_type == type::KN_INPUT_OP);
-  kn::KNInputOp *kn_input_op =
-      static_cast<kn::KNInputOp *>(input_ops[0]->dtensor.owner_op);
-  input_stride = input_ops[0]->dtensor.dim[1];
-  assert(input_stride == static_cast<int>(kn_input_op->input_strides[0]));
-  // get output stride
-  assert(output_ops[0]->dtensor.owner_op->op_type == type::KN_INPUT_OP);
-  kn_input_op = static_cast<kn::KNInputOp *>(output_ops[0]->dtensor.owner_op);
-  output_stride = static_cast<int>(kn_input_op->input_strides[0]);
+  // Strides live on DTensor in the new compiler, including virtual views.
+  input_stride = static_cast<int>(input_ops[0]->dtensor.stride[0]);
+  output_stride = static_cast<int>(output_ops[0]->dtensor.stride[0]);
+  assert(input_stride == input_ops[0]->dtensor.dim[1]);
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
   code.e("kernel::silu_mul_task_impl<bfloat16, $, $, $, $>(",
@@ -771,8 +773,15 @@ int TaskRegister::register_silu_mul_task(threadblock::Graph const &bgraph,
          output_stride);
   code.e("    task_desc->input_ptrs[0],");
   code.e("    task_desc->output_ptrs[0],");
-  code.e("    runtime_config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS]);");
-  return register_task_variant(TASK_SILU_MUL, code.to_string());
+  // A row task's pointers already select its owning slot. Reading the global
+  // token count here would either skip that row or touch neighboring slots.
+  if (one_row_per_task) {
+    code.e("    1);");
+  } else {
+    code.e("    runtime_config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS]);");
+  }
+  return register_task_variant(
+      one_row_per_task ? TASK_SILU_MUL_ROW : TASK_SILU_MUL, code.to_string());
 }
 
 int TaskRegister::register_identity_task(threadblock::Graph const &bgraph,
@@ -1548,6 +1557,259 @@ int TaskRegister::register_paged_attention_hopper_task(
   return register_task_variant(TASK_PAGED_ATTENTION_HOPPER, code.to_string());
 }
 
+int TaskRegister::register_attention_slot_hopper_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  if (!params.empty() || bgraph.operators.size() != 6 ||
+      bgraph.block_dim.x != 256 || bgraph.block_dim.y != 1 ||
+      bgraph.block_dim.z != 1 || bgraph.grid_dim.x == 0 ||
+      bgraph.grid_dim.y == 0 || bgraph.grid_dim.z != 1 ||
+      bgraph.forloop_range != 1) {
+    throw std::runtime_error(
+        "Slot attention requires six views, grid=(slots,KV heads,1), and 256 threads");
+  }
+
+  // The first three views are QKV/K/V inputs; the last three are O/K/V
+  // outputs. Repeated cache views must identify exactly the same regions.
+  std::vector<tb::TBInputOp *> views;
+  for (size_t i = 0; i < bgraph.operators.size(); i++) {
+    auto *op = bgraph.operators[i];
+    if (op->op_type != type::TB_INPUT_OP) {
+      throw std::runtime_error("Slot attention requires tensor input/output views");
+    }
+    auto *view = static_cast<tb::TBInputOp *>(op);
+    auto const &tensor = view->dtensor;
+    bool const activation = i == 0 || i == 3;
+    int const rank = activation ? 2 : 4;
+    if (tensor.num_dims != rank || tensor.data_type != type::DT_BFLOAT16 ||
+        tensor.owner_op == nullptr || tensor.is_virtual() ||
+        tensor.owner_op->op_type != type::KN_INPUT_OP ||
+        view->output_tensors.size() != 1 ||
+        view->output_tensors[0].num_dims != rank ||
+        view->input_map.x != 0 ||
+        view->input_map.y != (activation ? 1 : 2) ||
+        view->input_map.z != -1 || view->forloop_dim != -1) {
+      throw std::runtime_error("Slot attention has an invalid BF16 slot/head view");
+    }
+    size_t stride = 1;
+    for (int axis = rank - 1; axis >= 0; axis--) {
+      if (tensor.dim[axis] <= 0 || tensor.stride[axis] != stride) {
+        throw std::runtime_error("Slot attention requires contiguous positive dimensions");
+      }
+      stride *= tensor.dim[axis];
+    }
+
+    auto const &local = view->output_tensors[0];
+    if (tensor.dim[0] != static_cast<int>(bgraph.grid_dim.x) || local.dim[0] != 1) {
+      throw std::runtime_error("Every attention task must own exactly one slot row");
+    }
+    if (activation) {
+      int const width = i == 0 ? 768 : 512;
+      if (tensor.dim[1] != static_cast<int64_t>(bgraph.grid_dim.y) * width ||
+          local.dim[1] != width) {
+        throw std::runtime_error("Slot attention requires four Q heads per KV head, D=128");
+      }
+    } else if (tensor.dim[1] != 64 ||
+               tensor.dim[2] != static_cast<int>(bgraph.grid_dim.y) ||
+               tensor.dim[3] != 128 || local.dim[1] != 64 ||
+               local.dim[2] != 1 || local.dim[3] != 128) {
+      throw std::runtime_error("Slot attention caches must have shape [slots,64,KV heads,128]");
+    }
+    views.push_back(view);
+  }
+  for (int i = 0; i < 4; i++) {
+    for (int j = i + 1; j < 4; j++) {
+      if (views[i]->dtensor.guid == views[j]->dtensor.guid) {
+        throw std::runtime_error("QKV, output, K cache, and V cache must be distinct tensors");
+      }
+    }
+  }
+  if (views[1]->dtensor.guid != views[4]->dtensor.guid ||
+      views[2]->dtensor.guid != views[5]->dtensor.guid) {
+    throw std::runtime_error("Slot attention cache outputs must alias their input views exactly");
+  }
+
+  int const kv_heads = bgraph.grid_dim.y;
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  // The descriptor already includes slot/head offsets. Local page 0 and query
+  // 0 therefore refer to that private slice, not a global request/page index.
+  code.e("int const attention_query_indptr[2] = {0, 1};");
+  code.e("int const attention_kv_indptr[2] = {0, 1};");
+  code.e("int const attention_page_indices[1] = {0};");
+  code.e("int attention_length = 64;");
+  code.e("if (runtime_config.context_sequence_length > 0) {");
+  code.inc_indent();
+  // This metadata is the immutable slot coordinate, not the ContextIO row.
+  // Validate before dereferencing the epoch; keep failures active with NDEBUG.
+  code.e("int const attention_slot = task_desc->task_metadata.request_id;");
+  code.e("require_request_slot_invariant(attention_slot >= 0 &&");
+  code.e("    attention_slot < runtime_config.num_request_slots &&");
+  code.e("    runtime_config.slot_iteration != nullptr);");
+  code.e("require_request_slot_invariant(");
+  code.e("    runtime_config.context_sequence_length <= 64 &&");
+  code.e("    runtime_config.context_prefix_length >= 0 &&");
+  code.e("    runtime_config.context_prefix_length <=");
+  code.e("        64 - runtime_config.context_sequence_length);");
+  code.e("uint32_t const attention_epoch =");
+  code.e("    runtime_config.slot_iteration[attention_slot];");
+  code.e("require_request_slot_invariant(attention_epoch > 0u &&");
+  code.e("    attention_epoch <=");
+  code.e("        static_cast<uint32_t>(runtime_config.context_sequence_length));");
+  code.e("attention_length = runtime_config.context_prefix_length +");
+  code.e("    static_cast<int>(attention_epoch);");
+  code.dec_indent();
+  code.e("}");
+  code.e("int const attention_last_page_len[1] = {attention_length};");
+  // MAX_TOKENS=16 pads four Q heads to the existing 64-row MMA tile. There is
+  // still only one real query. Full original row strides survive head slicing.
+  // Upstream owns KV tail initialization. Its final arguments are rotary
+  // dimension and page stride, not the old NAS ZERO_PAD_KV_TILES flag.
+  code.e("kernel::multitoken_paged_attention_hopper_impl<bfloat16, 4, 1, $, "
+         "$, $, $, 128, -1, 64, 64, 16, false, 1, 128, 64>(",
+         kv_heads, kv_heads * 128, kv_heads * 768, kv_heads * 512);
+  code.e("    task_desc->input_ptrs[1], task_desc->input_ptrs[2],");
+  code.e("    attention_query_indptr, attention_kv_indptr,");
+  code.e("    attention_page_indices, attention_last_page_len,");
+  code.e("    0, false, false, nullptr, nullptr, nullptr, nullptr,");
+  code.e("    1e-6f, 1e-6f, task_desc->input_ptrs[0],");
+  code.e("    task_desc->output_ptrs[0], nullptr, 0);");
+  return register_task_variant(TASK_ATTENTION_SLOT_HOPPER, code.to_string());
+}
+
+int TaskRegister::register_checksum_hopper_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  if (!params.empty() || bgraph.operators.size() != 3 ||
+      bgraph.block_dim.x != 256 || bgraph.block_dim.y != 1 || bgraph.block_dim.z != 1) {
+    throw std::runtime_error("Checksum requires two inputs, one output, and 256 threads");
+  }
+  std::vector<tb::TBInputOp *> views;
+  for (auto const &op : bgraph.operators) {
+    if (op->op_type != type::TB_INPUT_OP)
+      throw std::runtime_error("Checksum requires tensor input/output views");
+    views.push_back(static_cast<tb::TBInputOp *>(op));
+  }
+  auto const &x = views[0]->output_tensors[0];
+  auto const &w = views[1]->output_tensors[0];
+  auto const &y = views[2]->output_tensors[0];
+  if (x.num_dims != 2 || x.dim[0] != 1 || x.dim[1] <= 0 ||
+      w.num_dims != 1 || w.dim[0] != x.dim[1] ||
+      y.num_dims != 2 || y.dim[0] != 1 || y.dim[1] != 1) {
+    throw std::runtime_error("Checksum task expects x[1,H], coefficients[H], output[1,1]");
+  }
+  // The kernel uses contiguous indexing. Validate the underlying global views,
+  // including the row stride, instead of silently interpreting a strided view.
+  for (auto *view : views) {
+    auto const &tensor = view->dtensor;
+    if (tensor.data_type != type::DT_BFLOAT16 || tensor.owner_op == nullptr ||
+        tensor.is_virtual() || tensor.owner_op->op_type != type::KN_INPUT_OP)
+      throw std::runtime_error("Checksum requires contiguous BF16 tensors");
+    size_t stride = 1;
+    for (int axis = tensor.num_dims - 1; axis >= 0; axis--) {
+      if (tensor.stride[axis] != stride)
+        throw std::runtime_error("Checksum requires contiguous BF16 tensors");
+      stride *= tensor.dim[axis];
+    }
+  }
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::checksum_hopper_impl<bfloat16, $>(", x.dim[1]);
+  code.e("    task_desc->input_ptrs[0],");
+  code.e("    task_desc->input_ptrs[1],");
+  code.e("    task_desc->output_ptrs[0]);");
+  return register_task_variant(TASK_CHECKSUM_HOPPER, code.to_string());
+}
+
+// The experimental slot operators use full, contiguous private rows. Keep
+// native validation enabled in Release builds; Python is not the only caller.
+static std::vector<tb::TBInputOp *> validate_slot_moe_views(
+    threadblock::Graph const &bgraph, std::vector<int> const &params,
+    std::vector<type::DataType> const &dtypes) {
+  if (!params.empty() || bgraph.operators.size() != dtypes.size() ||
+      bgraph.block_dim.x != 256 || bgraph.block_dim.y != 1 || bgraph.block_dim.z != 1 ||
+      bgraph.grid_dim.x == 0 || bgraph.grid_dim.y != 1 || bgraph.grid_dim.z != 1) {
+    throw std::runtime_error("Slot MoE requires row grid, 256 threads, and fixed tensor views");
+  }
+  std::vector<tb::TBInputOp *> views;
+  for (size_t i = 0; i < bgraph.operators.size(); i++) {
+    auto *op = bgraph.operators[i];
+    if (op->op_type != type::TB_INPUT_OP)
+      throw std::runtime_error("Slot MoE requires tensor input/output views");
+    auto *view = static_cast<tb::TBInputOp *>(op);
+    auto const &tensor = view->dtensor;
+    if (tensor.data_type != dtypes[i] || tensor.owner_op == nullptr ||
+        tensor.is_virtual() || tensor.owner_op->op_type != type::KN_INPUT_OP)
+      throw std::runtime_error("Slot MoE tensor dtype or storage owner is invalid");
+    size_t stride = 1;
+    for (int axis = tensor.num_dims - 1; axis >= 0; axis--) {
+      if (tensor.dim[axis] <= 0 || tensor.stride[axis] != stride)
+        throw std::runtime_error("Slot MoE requires contiguous positive tensor dimensions");
+      stride *= tensor.dim[axis];
+    }
+    views.push_back(view);
+  }
+  return views;
+}
+
+int TaskRegister::register_moe_top1_row_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  auto views = validate_slot_moe_views(
+      bgraph, params, {type::DT_BFLOAT16, type::DT_FLOAT32, type::DT_INT32});
+  int const widths[] = {128, 1, 128};
+  for (int i = 0; i < 3; i++) {
+    auto const &local = views[i]->output_tensors[0];
+    auto const &global = views[i]->dtensor;
+    auto map = views[i]->input_map;
+    if (local.num_dims != 2 || local.dim[0] != 1 || local.dim[1] != widths[i] ||
+        global.num_dims != 2 || global.dim[0] != static_cast<int>(bgraph.grid_dim.x) ||
+        map.x != 0 || map.y != -1 || map.z != -1)
+      throw std::runtime_error("Private top-1 needs one logits/ranks row with 128 experts per slot");
+  }
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  // E=128 gives 16 threads per row; with num_rows=1 the existing half-warp
+  // mask is valid. A private [1,128] rank row has the same contiguous storage
+  // as the kernel's expert-major [128,1] view. Passing nullptr avoids its old
+  // in-place active-expert compaction; the controller extracts the sole rank 1.
+  code.e("kernel::topk_softmax_task_impl<cute::bfloat16_t, 8, 128, 8, 16>(");
+  code.e("    task_desc->input_ptrs[0], nullptr, task_desc->output_ptrs[0],");
+  code.e("    1, 1, task_desc->output_ptrs[1], nullptr, 0, 128, true);");
+  return register_task_variant(TASK_MOE_TOP1_ROW, code.to_string());
+}
+
+int TaskRegister::register_moe_slot_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params,
+    bool w13_linear) {
+  auto views = validate_slot_moe_views(
+      bgraph, params, {type::DT_BFLOAT16, type::DT_BFLOAT16,
+                      type::DT_INT32, type::DT_BFLOAT16});
+  auto const &x = views[0]->output_tensors[0];
+  auto const &w = views[1]->output_tensors[0];
+  auto const &r = views[2]->output_tensors[0];
+  auto const &y = views[3]->output_tensors[0];
+  if (x.num_dims != 2 || x.dim[0] != 1 || x.dim[1] % 128 ||
+      w.num_dims != 3 || w.dim[0] != 128 || w.dim[2] != x.dim[1] ||
+      y.num_dims != 2 || y.dim[0] != 1 || y.dim[1] != w.dim[1] ||
+      y.dim[1] % (w13_linear ? 256 : 64) ||
+      r.num_dims != 2 || r.dim[0] != 1 || r.dim[1] != 128) {
+    throw std::runtime_error("Logical MoE expects x[1,K], W[128,N,K], ranks[1,128], y[1,N]");
+  }
+  for (int i = 0; i < 4; i++) {
+    auto map = views[i]->input_map;
+    if (map.x != (i == 1 ? -1 : 0) || map.y != -1 || map.z != -1 ||
+        (i != 1 && views[i]->dtensor.dim[0] != static_cast<int>(bgraph.grid_dim.x)))
+      throw std::runtime_error("Logical MoE must keep activations private and weights shared");
+  }
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  // These tasks describe dependencies and outputs. Only the experimental
+  // controller may execute them through a physical batch. A trap makes an
+  // accidental ordinary launch fail loudly rather than silently skip work.
+  code.e("asm volatile(\"trap;\"); // Logical MoE reached ordinary task execution");
+  return register_task_variant(
+      w13_linear ? TASK_MOE_SLOT_W13 : TASK_MOE_SLOT_W2, code.to_string());
+}
+
+
 int TaskRegister::register_rmsnorm_hopper_task(threadblock::Graph const &bgraph,
                                                std::vector<int> const &params) {
   assert(params.size() == 0);
@@ -1588,7 +1850,13 @@ int TaskRegister::register_rmsnorm_hopper_task(threadblock::Graph const &bgraph,
 int TaskRegister::register_linear_swapAB_hopper_task(
     threadblock::Graph const &bgraph,
     std::vector<int> const &params,
-    bool with_residual) {
+    bool with_residual,
+    TaskType task_type) {
+  if ((task_type != TASK_LINEAR_SWAPAB_HOPPER &&
+       task_type != TASK_LINEAR_QKV_HOPPER && task_type != TASK_LINEAR_WO_HOPPER) ||
+      (with_residual && task_type != TASK_LINEAR_SWAPAB_HOPPER)) {
+    throw std::runtime_error("Invalid Hopper row projection marker");
+  }
   // assert(params.size() == 0);
   bool rank_with_residual = with_residual;
   if (with_residual) {
@@ -1617,10 +1885,7 @@ int TaskRegister::register_linear_swapAB_hopper_task(
   output_size = output_ops[0]->output_tensors[0].dim[1];
   assert(input_ops[0]->dtensor.num_dims == 2);
   reduction_size = input_ops[0]->dtensor.dim[1];
-  assert(output_ops[0]->dtensor.owner_op->op_type == type::KN_INPUT_OP);
-  kn::KNInputOp *kn_input_op =
-      static_cast<kn::KNInputOp *>(output_ops[0]->dtensor.owner_op);
-  output_stride = static_cast<int>(kn_input_op->input_strides[0]);
+  output_stride = static_cast<int>(output_ops[0]->dtensor.stride[0]);
 
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
@@ -1747,7 +2012,7 @@ int TaskRegister::register_linear_swapAB_hopper_task(
     return register_task_variant(TASK_LINEAR_SWAPAB_WITH_RESIDUAL_HOPPER,
                                  code.to_string());
   } else {
-    return register_task_variant(TASK_LINEAR_SWAPAB_HOPPER, code.to_string());
+    return register_task_variant(task_type, code.to_string());
   }
 }
 
