@@ -22,6 +22,7 @@ from .kv_planner import KVGroupSpec
 HARD_CODE = """
 #include <Python.h>
 #include <cstdint>
+#include <exception>
 #include <cuda_runtime.h>
 #include <string>
 #include <vector>
@@ -118,7 +119,14 @@ static PyObject *init_func(PyObject *self, PyObject *args) {
     }
   }
 
-  init_persistent_kernel(meta_tensors, profiler_buffer, my_mpi_rank, num_workers, num_local_schedulers, num_remote_schedulers, max_seq_length, total_num_requests, eos_token_id, allocate_nvshmem_teams, model_tensor_names, model_tensor_ptrs, kv_group_block_sizes, kv_group_window_sizes);
+  // Resident initialization validates its metadata before touching CUDA.
+  // Keep C++ validation errors inside the Python extension boundary.
+  try {
+    init_persistent_kernel(meta_tensors, profiler_buffer, my_mpi_rank, num_workers, num_local_schedulers, num_remote_schedulers, max_seq_length, total_num_requests, eos_token_id, allocate_nvshmem_teams, model_tensor_names, model_tensor_ptrs, kv_group_block_sizes, kv_group_window_sizes);
+  } catch (std::exception const &error) {
+    PyErr_SetString(PyExc_RuntimeError, error.what());
+    return NULL;
+  }
 
   Py_RETURN_NONE;
 }
@@ -440,6 +448,7 @@ class PersistentKernel:
         kv_groups: list = None,
         page_size: int = None,
         max_tokens_per_request: Optional[int] = None,
+        task_graph_mode: Optional[str] = None,
     ):
         self.__finalized__ = False
         self._is_compiled = False
@@ -462,6 +471,22 @@ class PersistentKernel:
 
         if mode not in valid_persistent_kernel_modes:
             raise ValueError(f"Invalid persistent kernel mode: {mode}")
+        if task_graph_mode is None:
+            task_graph_mode = os.environ.get("MIRAGE_TASK_GRAPH_MODE", "legacy_event")
+        if task_graph_mode not in {"legacy_event", "resident_data"}:
+            raise ValueError(f"Unsupported task graph mode: {task_graph_mode}")
+        self.task_graph_mode = task_graph_mode
+        self._data_slot_ids = None
+        if task_graph_mode == "resident_data":
+            if mode != "offline" or world_size != 1 or num_remote_schedulers != 0:
+                raise ValueError("The resident port supports single-GPU offline execution")
+            if not (1 <= num_local_schedulers <= num_workers <= 160):
+                raise ValueError("Invalid resident worker/scheduler counts")
+            if do_sample or (spec_decode_config is not None and
+                             spec_decode_config.method is not None):
+                raise ValueError("Resident execution does not support sampling or speculative decoding")
+            if "kv_event_log" in meta_tensors:
+                raise ValueError("Resident execution does not use the global KV event log")
         self.mode = mode
         self.pinned_ring_capacity = pinned_ring_capacity
         self.world_size = world_size
@@ -484,6 +509,9 @@ class PersistentKernel:
             assert page_size == kv_groups[0].block_size, (
                 f"page_size {page_size} disagrees with "
                 f"kv_groups[0].block_size {kv_groups[0].block_size}")
+        if self.task_graph_mode == "resident_data" and (
+                len(kv_groups) != 1 or kv_groups[0].window_size != 0):
+            raise ValueError("Resident execution requires one full-attention KV group")
         self.kv_groups = kv_groups
         self.page_size = kv_groups[0].block_size
         # Caps attention's per-CTA buffer sizing by one request instead of
@@ -691,6 +719,7 @@ class PersistentKernel:
         """Save kernel config for validation when loading."""
         metadata = {
             "mode": self.mode,
+            "task_graph_mode": self.task_graph_mode,
             "max_seq_length": self.max_seq_length,
             "max_num_batched_requests": self.max_num_batched_requests,
             "max_num_batched_tokens": self.max_num_batched_tokens,
@@ -711,6 +740,10 @@ class PersistentKernel:
             saved = json.load(f)
         
         errors = []
+        # Metadata predating the resident port describes a native event graph.
+        saved_graph_mode = saved.get("task_graph_mode", "legacy_event")
+        if saved_graph_mode != self.task_graph_mode:
+            errors.append(f"task_graph_mode: saved={saved_graph_mode}, current={self.task_graph_mode}")
         checks = [
             ("mode", self.mode),
             ("max_seq_length", self.max_seq_length),
@@ -742,6 +775,43 @@ class PersistentKernel:
             raise ValueError(
                 f"Kernel incompatible with current config:\n  " + "\n  ".join(errors)
             )
+
+    def set_request_slots(self, data_slot_ids):
+        """Assign reusable slots to the native graph's DataIds before compile.
+
+        First inspect generate_task_graph() to identify its actual DataIds.
+        Supply one nonnegative integer per DataId, using dense slot IDs from
+        zero. The native compiler validates dependencies and writable tensor
+        regions, then exports the assignment plus each slot's roots/terminals.
+        Pass None to clear the assignment. This is compiler metadata only;
+        independent runtime iteration control is a separate feature.
+        """
+        if self._is_compiled:
+            raise RuntimeError("Request slots must be assigned before compile()")
+        if self.task_graph_mode != "resident_data":
+            raise ValueError("Request slot metadata requires resident_data")
+        if data_slot_ids is None:
+            self._data_slot_ids = None
+            return
+        from operator import index
+        slots = list(data_slot_ids)
+        if not slots:
+            raise ValueError("data_slot_ids must be nonempty; use None to clear it")
+        if any(isinstance(slot, bool) for slot in slots):
+            raise TypeError("Request slot IDs must be integers, not bools")
+        self._data_slot_ids = tuple(index(slot) for slot in slots)
+
+    def generate_task_graph(self):
+        if self.task_graph_mode == "resident_data":
+            generator = getattr(self.kn_graph, "generate_resident_task_graph", None)
+            if generator is None:
+                # Patch B supplies this compiler binding. Never silently emit a
+                # native event graph when resident execution was requested.
+                raise NotImplementedError("Resident graph generation requires the Patch B compiler bindings")
+            return generator(num_gpus=self.world_size, my_gpu_id=self.mpi_rank,
+                             data_slot_ids=self._data_slot_ids)
+        return self.kn_graph.generate_task_graph(
+            num_gpus=self.world_size, my_gpu_id=self.mpi_rank)
 
     def attach_input(self, torch_tensor: torch.Tensor, name: str = None) -> DTensor:
         dims = tuple([d for d in torch_tensor.shape])
@@ -3220,7 +3290,7 @@ class PersistentKernel:
             tempdir_obj = tempfile.TemporaryDirectory()
             tempdir = tempdir_obj.name
         os.makedirs(tempdir, exist_ok=True)
-        results = self.kn_graph.generate_task_graph(num_gpus=self.world_size, my_gpu_id=self.mpi_rank)
+        results = self.generate_task_graph()
 
         cuda_code_path = os.path.join(tempdir, "test.cu")
         so_path = os.path.join(tempdir, "test" + sysconfig.get_config_var("EXT_SUFFIX"))

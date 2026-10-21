@@ -16,6 +16,7 @@
 #pragma once
 
 #include "mirage/config.h"
+#include <cstdint>
 #include <cuda_runtime.h>
 
 #ifdef USE_NVSHMEM
@@ -109,6 +110,12 @@ enum TaskType {
   TASK_RMS_NORM = 119,
   TASK_LINEAR = 120,
   TASK_IDENTITY = 121,
+  // Resident tasks use descriptor-owned input rows and private slot outputs.
+  TASK_EMBEDDING_INPUT = 122,
+  TASK_SILU_MUL_ROW = 123,
+  TASK_MOE_TOP1_ROW = 124,
+  TASK_MOE_SLOT_W13 = 125,
+  TASK_MOE_SLOT_W2 = 126,
   // Hopper Tasks
   TASK_HOPPER_TASK_BEGIN = 150, // Hopper start placeholder, not a real task
   TASK_LINEAR_WITH_RESIDUAL_HOPPER = 151,
@@ -125,6 +132,10 @@ enum TaskType {
   TASK_MOE_W2_LINEAR_SM90 = 162,
   TASK_SPLITK_LINEAR_SWAPAB_HOPPER = 163,
   TASK_PAGED_ATTENTION_SPLIT_KV_HOPPER = 164,
+  TASK_CHECKSUM_HOPPER = 165,
+  TASK_ATTENTION_SLOT_HOPPER = 166,
+  TASK_LINEAR_QKV_HOPPER = 167,
+  TASK_LINEAR_WO_HOPPER = 168,
   TASK_HOPPER_TASK_END = 198, // Hopper end placeholder, not a real task
   // SM100 Tasks
   TASK_SM100_TASK_BEGIN = 230, // SM100 start placeholder, not a real task
@@ -235,6 +246,18 @@ enum EventType {
   EVENT_INVALID = 999,
 };
 
+constexpr uint32_t INVALID_PROFILER_GROUP_ID = 0xFFFFFFFFu;
+
+constexpr bool is_scheduler_task_type(TaskType task_type) {
+  return task_type == TASK_SCHD_TASKS || task_type == TASK_SCHD_EVENTS ||
+         task_type == TASK_GET_EVENT || task_type == TASK_GET_NEXT_TASK ||
+         task_type == TASK_SCHD_PREPARE_BATCH;
+}
+
+constexpr bool uses_dag_profiler_group(TaskType task_type) {
+  return task_type != TASK_TERMINATE && !is_scheduler_task_type(task_type);
+}
+
 struct TensorDesc {
   int num_dims;
   void *base_ptr;
@@ -259,15 +282,19 @@ struct EventDesc {
 
 struct FullTaskDesc {
   FullTaskDesc(TaskType t, int _variant_id)
-      : task_type(t), variant_id(_variant_id), num_inputs(0), num_outputs(0),
+      : task_type(t), variant_id(_variant_id),
+        profiler_group_id(INVALID_PROFILER_GROUP_ID), num_inputs(0), num_outputs(0),
         trigger_event(EVENT_INVALID_ID), dependent_event(EVENT_INVALID_ID) {
     task_metadata.raw_payload = ~0ull;
   }
   FullTaskDesc() {
+    profiler_group_id = INVALID_PROFILER_GROUP_ID;
     task_metadata.raw_payload = ~0ull;
   }
   TaskType task_type;
   unsigned variant_id;
+  // Resident graphs identify the originating operator in optional traces.
+  uint32_t profiler_group_id;
   int num_inputs, num_outputs;
   EventId trigger_event;
   EventId dependent_event;
@@ -296,7 +323,7 @@ static_assert(
 struct alignas(16) TaskDesc {
   TaskDesc(FullTaskDesc t)
       : task_type(t.task_type), variant_id(t.variant_id),
-        trigger_event(t.trigger_event), dependent_event(t.dependent_event),
+        profiler_group_id(t.profiler_group_id), trigger_event(t.trigger_event), dependent_event(t.dependent_event),
         task_metadata(t.task_metadata) {
     for (int i = 0; i < t.num_inputs; i++) {
       input_ptrs[i] = t.inputs[i].base_ptr;
@@ -318,10 +345,13 @@ struct alignas(16) TaskDesc {
 #endif
   }
   TaskDesc() {
+    profiler_group_id = INVALID_PROFILER_GROUP_ID;
     task_metadata.raw_payload = ~0ull;
   }
   TaskType task_type;
   unsigned variant_id;
+  // Resident graphs identify the originating operator in optional traces.
+  uint32_t profiler_group_id;
   EventId trigger_event;
   EventId dependent_event;
   void *input_ptrs[MAX_INPUTS_PER_TASK];
