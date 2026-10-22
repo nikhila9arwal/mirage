@@ -274,10 +274,11 @@ __device__ __forceinline__ void linear_swapAB_kernel_hopper(
     for (int output_atom_idx = 0; output_atom_idx < NUM_ITER_N;
          output_atom_idx++) {
 
-      constexpr int CLEAR_ITERS = SMEM_M_SIZE / 16 <= 0 ? 1 : SMEM_M_SIZE / 16;
+      // Small row tasks have only four accumulator floats per thread.
+      // Clear exactly the fragment: an eight-float clear would overrun it.
 #pragma unroll
-      for (int i = 0; i < CLEAR_ITERS; i++) {
-        clear_8_floats(s_frag + (i << 3));
+      for (int i = 0; i < (SMEM_M_SIZE >> 1); i++) {
+        s_frag[i] = 0.0f;
       }
 
       wg_sync<THREADS_PER_WARPGROUP * CONSUMER_WARPGROUPS>(1);

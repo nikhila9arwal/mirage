@@ -15,6 +15,7 @@
  */
 
 #pragma once
+#include <cstdint>
 #include <cstdio>
 #include <iostream>
 
@@ -91,7 +92,8 @@ template <typename T_,
           int EXPERT_STRIDE,
           bool W13_LINEAR,
           bool NOBIAS,
-          int NUM_AB_STAGE = 8>
+          int NUM_AB_STAGE = 8,
+          bool INDEXED_ROWS = false>
 __device__ __forceinline__ void
     moe_linear_sm90_task_impl(const TMA_A &tma_a,
                               InputTensor mInput,
@@ -99,7 +101,15 @@ __device__ __forceinline__ void
                               IndicesTensor mRoutingIndices,
                               MaskTensor mMask,
                               OutputTensor mOutput,
-                              int const expert_offset) {
+                              int const expert_offset,
+                              uint32_t const *state_rows = nullptr,
+                              uint32_t row_count = BATCH_SIZE) {
+  // A selected-row batch uses a compact tile while activations stay in slots.
+  // Default arguments preserve the upstream native call and addressing path.
+  static_assert(!INDEXED_ROWS ||
+                    (BATCH_SIZE == 16 && MMA_N == 16 && NUM_TOPK == 1 &&
+                     NOBIAS && sizeof(T_) == 2 && OUTPUT_STRIDE == OUTPUT_SIZE),
+                "Indexed MoE rows require a 16-row BF16 top-1 tile");
   int warp_idx = cutlass::canonical_warp_idx_sync();
 
   // Construct the MMA grid coordinate from the CTA grid coordinate
@@ -416,24 +426,47 @@ __device__ __forceinline__ void
 
             int32_t token_idx =
                 n_tile * MMA_N + tid_in_wg / cp_async_group_size;
-            int32_t topk_idx =
-                (token_idx < BATCH_SIZE) ? tRoutingIndex(token_idx) : 0;
-            if (token_idx < BATCH_SIZE && topk_idx > 0) {
-              if constexpr (W13_LINEAR) {
-                cute::copy(
-                    copyB,
-                    tBgB(cute::_, cute::_, cute::_, cute::_, k_tile),
-                    tBsB(cute::_, cute::_, cute::_, cute::_, smem_wr_buffer));
-              } else {
-                cute::copy(
-                    copyB,
-                    tBgB(cute::_,
-                         cute::_,
-                         cute::_,
-                         cute::_,
-                         k_tile,
-                         topk_idx - 1),
-                    tBsB(cute::_, cute::_, cute::_, cute::_, smem_wr_buffer));
+            if constexpr (INDEXED_ROWS) {
+              // Eight producer lanes copy eight BF16 values each, together
+              // loading one row's 64-column K tile. Build the address directly:
+              // a compact GEMM row is not an offset into the state allocation.
+              bool active = token_idx < row_count &&
+                            tRoutingIndex(token_idx) > 0;
+              auto const *source = cute::raw_pointer_cast(mInput.data());
+              if (active) {
+                int64_t state_row = static_cast<int64_t>(state_rows[token_idx]);
+                source += state_row * REDUCTION_SIZE + k_tile * TILE_SIZE +
+                          (tid_in_wg % cp_async_group_size) * 8;
+              }
+              auto destination = cute::recast<cute::uint128_t>(
+                  tBsB(cute::_, cute::_, cute::_, cute::_, smem_wr_buffer));
+              CUTE_STATIC_ASSERT_V(cute::size(destination) == cute::Int<1>{});
+              // An inactive row never reads state_rows or activation memory.
+              // cp.async uses the valid base only as a dummy address with zero
+              // source bytes, filling its shared-memory fragment with zero.
+              cute::SM80_CP_ASYNC_CACHEALWAYS_ZFILL<cute::uint128_t>::copy(
+                  *reinterpret_cast<cute::uint128_t const *>(source),
+                  destination(0), active);
+            } else {
+              int32_t topk_idx =
+                  (token_idx < BATCH_SIZE) ? tRoutingIndex(token_idx) : 0;
+              if (token_idx < BATCH_SIZE && topk_idx > 0) {
+                if constexpr (W13_LINEAR) {
+                  cute::copy(
+                      copyB,
+                      tBgB(cute::_, cute::_, cute::_, cute::_, k_tile),
+                      tBsB(cute::_, cute::_, cute::_, cute::_, smem_wr_buffer));
+                } else {
+                  cute::copy(
+                      copyB,
+                      tBgB(cute::_,
+                           cute::_,
+                           cute::_,
+                           cute::_,
+                           k_tile,
+                           topk_idx - 1),
+                      tBsB(cute::_, cute::_, cute::_, cute::_, smem_wr_buffer));
+                }
               }
             }
 
@@ -558,17 +591,29 @@ __device__ __forceinline__ void
                         (((i & 3) >> 1) << 3) + m_base;
             int n_idx = ((i >> 2) << 3) + ((idx_in_warp & 3) << 1) + (i & 1);
 
-            int topk_idx = (n_idx < BATCH_SIZE) ? tRoutingIndex(n_idx) : 0;
+            if constexpr (INDEXED_ROWS) {
+              // Guard membership before reading its state ID. Unused local
+              // rows must neither alias state row zero nor overwrite sentinels.
+              if (n_idx < row_count && tRoutingIndex(n_idx) > 0 &&
+                  m_idx < OUTPUT_SIZE) {
+                int64_t state_row = static_cast<int64_t>(state_rows[n_idx]);
+                auto *output = cute::raw_pointer_cast(mOutput.data());
+                output[state_row * OUTPUT_SIZE + m_idx] =
+                    TypeAcc_to_TypeC(accum(i));
+              }
+            } else {
+              int topk_idx = (n_idx < BATCH_SIZE) ? tRoutingIndex(n_idx) : 0;
 
-            bool pred =
-                (n_idx < BATCH_SIZE && topk_idx > 0 && m_idx < OUTPUT_SIZE);
-            TypeC fragD = TypeAcc_to_TypeC(accum(i));
+              bool pred =
+                  (n_idx < BATCH_SIZE && topk_idx > 0 && m_idx < OUTPUT_SIZE);
+              TypeC fragD = TypeAcc_to_TypeC(accum(i));
 
-            if constexpr (!NOBIAS) {
-              fragD += mBias(n_idx, m_idx, expert_idx);
-            }
-            if (pred) {
-              mOutput(n_idx, m_idx, topk_idx - 1) = fragD;
+              if constexpr (!NOBIAS) {
+                fragD += mBias(n_idx, m_idx, expert_idx);
+              }
+              if (pred) {
+                mOutput(n_idx, m_idx, topk_idx - 1) = fragD;
+              }
             }
           }
         } // end for n_tile

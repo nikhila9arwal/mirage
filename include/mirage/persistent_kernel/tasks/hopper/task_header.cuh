@@ -10,6 +10,7 @@
 #endif // USE_NVSHMEM
 
 // Hopper task impls
+#include "tasks/hopper/checksum_hopper.cuh"
 #include "tasks/cute/hopper/gemm_ws.cuh"
 #include "tasks/cute/hopper/gemm_ws_cooperative.cuh"
 #include "tasks/cute/hopper/gemm_ws_mpk.cuh"
