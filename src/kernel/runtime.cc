@@ -15,6 +15,7 @@
 
 #include "mirage/kernel/annotated_graph.h"
 #include "mirage/kernel/graph.h"
+#include "mirage/kernel/task_graph_builder.h"
 #include "mirage/kernel/task_register.h"
 #include "mirage/transpiler/utils.h"
 #include "mirage/utils/json_utils.h"
@@ -39,18 +40,6 @@ size_t get_event_id(int my_gpu_id, size_t event_pos, bool nvshmem_event) {
 bool is_nvshmem_event(size_t event_id) {
   return (event_id & EVENT_NVSHMEM_TAG) > 0;
 }
-
-struct Dim3Comparator {
-  bool operator()(dim3 const &a, dim3 const &b) const {
-    if (a.x != b.x) {
-      return a.x < b.x;
-    }
-    if (a.y != b.y) {
-      return a.y < b.y;
-    }
-    return a.z < b.z;
-  }
-};
 
 /**
  * Get number of subtasks for a task type.
@@ -90,8 +79,8 @@ void dfs_create_events_add_tasks(
     std::vector<EventDesc> &all_events,
     std::vector<FullTaskDesc> &all_tasks,
     std::vector<FullTaskDesc> const &cur_op_tasks,
-    std::map<dim3, std::vector<TaskId>, Dim3Comparator> const &pre_task_map,
-    std::map<dim3, std::vector<TaskId>, Dim3Comparator> &cur_task_map,
+    TaskMap const &pre_task_map,
+    TaskMap &cur_task_map,
     std::unordered_set<size_t> &nvshmem_events_idx,
     bool nvshmem_event,
     bool multigpu_task) {
@@ -228,9 +217,7 @@ void register_mugraph(
     std::vector<FullTaskDesc> &all_tasks,
     std::vector<EventDesc> &all_events,
     std::vector<TaskId> &first_tasks,
-    std::map<kernel::KNOperator *,
-             std::map<dim3, std::vector<TaskId>, Dim3Comparator>>
-        &all_task_maps,
+    OperatorTaskMaps &all_task_maps,
     std::unordered_map<kn::KNOperator const *,
                        std::tuple<int, int, TaskType, int>> const
         &task_configs) {
@@ -264,8 +251,7 @@ void register_mugraph(
   // layer index (the AnnotatedGraph's natural key). We still populate
   // `all_task_maps` at the end for the legacy KNOperator*-keyed consumers
   // (print_task_graph).
-  std::vector<std::map<dim3, std::vector<TaskId>, Dim3Comparator>>
-      layer_task_maps(V);
+  std::vector<TaskMap> layer_task_maps(V);
   std::vector<bool> layer_is_multigpu(V, false);
   // Each fork group's consumer-bundle is emitted exactly once — when we
   // encounter branch 0 (the head) in the topo walk. Other branches of the
@@ -277,7 +263,9 @@ void register_mugraph(
   // tile shape; strides come straight off the DTensor (set at new_input or
   // view-construction time). Views thus need no parent lookup here.
   auto get_tensor_desc = [](tb::TBInputOp *const &tb_op) -> TensorDesc {
-    TensorDesc desc;
+    // Addresses are bound when the generated graph is loaded. Resident
+    // dependency conversion treats a null address as unresolved.
+    TensorDesc desc{};
     assert(tb_op->output_tensors.size() == 1);
     tb::STensor stensor = tb_op->output_tensors[0];
     DTensor const &dt = tb_op->dtensor;
@@ -328,17 +316,22 @@ void register_mugraph(
         for (bid.z = 0; bid.z < bgraph.grid_dim.z; bid.z++) {
           for (int subtask_id = 0; subtask_id < num_subtasks; subtask_id++) {
             FullTaskDesc task(task_type, variant_id);
-            // Set request_id for attention and paged_attention
+            // Set request_id when grid_dim.x selects a request or slot. The
+            // MTP/EAGLE cases also need this index despite replicated tensors.
             if ((task_type == TASK_ATTENTION_1) ||
                 (task_type == TASK_ATTENTION_2) ||
                 (task_type == TASK_SINGLE_BATCH_EXTEND_ATTENTION) ||
                 (task_type == TASK_PAGED_ATTENTION_1) ||
                 (task_type == TASK_PAGED_ATTENTION_2) ||
                 (task_type == TASK_PAGED_ATTENTION_HOPPER) ||
+                (task_type == TASK_ATTENTION_SLOT_HOPPER) ||
                 (task_type == TASK_PAGED_ATTENTION_SPLIT_KV_SM100) ||
-                (TASK_PAGED_ATTENTION_SPLIT_KV_MERGE_SM100) ||
+                (task_type == TASK_PAGED_ATTENTION_SPLIT_KV_MERGE_SM100) ||
                 (task_type == TASK_PAGED_ATTENTION_SPLIT_KV_HOPPER) ||
-                (task_type == TASK_ATTN_SM100)) {
+                (task_type == TASK_ATTN_SM100) ||
+                (task_type == TASK_MTP_PREPARE_VERIFY) ||
+                (task_type == TASK_MTP_BUILD_EMBED_INPUT) ||
+                (task_type == TASK_EAGLE3_COMMIT)) {
               // Note that we assume grid_dim.x corresponds to
               // the request dimension
               task.task_metadata.request_id = bid.x;
@@ -488,7 +481,7 @@ void register_mugraph(
           int num_subtasks,
           bool is_multigpu,
           std::vector<FullTaskDesc> const &bid_lex_tasks,
-          std::map<dim3, std::vector<TaskId>, Dim3Comparator> &task_map) {
+          TaskMap &task_map) {
         dim3 b;
         for (b.x = lo.x; b.x < hi.x; b.x++) {
           for (b.y = lo.y; b.y < hi.y; b.y++) {
@@ -605,7 +598,7 @@ void register_mugraph(
   auto set_producer_triggers =
       [&](dim3 lo,
           dim3 hi,
-          std::map<dim3, std::vector<TaskId>, Dim3Comparator> const &prod_map,
+          TaskMap const &prod_map,
           size_t event_pos,
           bool nvshmem_event,
           EventDesc &event_desc) {
@@ -1032,9 +1025,7 @@ TaskGraphResult print_task_graph(
     std::vector<FullTaskDesc> const &all_tasks,
     std::vector<EventDesc> const &all_events,
     std::vector<TaskId> const &first_tasks,
-    std::map<kernel::KNOperator *,
-             std::map<dim3, std::vector<TaskId>, Dim3Comparator>> const
-        &all_task_maps,
+    OperatorTaskMaps const &all_task_maps,
     std::unordered_map<kn::KNOperator const *,
                        std::tuple<int, int, TaskType, int>> const &task_configs,
     std::map<mirage::type::GuidType, IODesc> const &io_configs,
@@ -1388,8 +1379,7 @@ TaskGraphResult print_task_graph(
         task_configs.find(op)->second;
 
     assert(all_task_maps.find(op) != all_task_maps.end());
-    std::map<dim3, std::vector<TaskId>, Dim3Comparator> const &task_map =
-        all_task_maps.find(op)->second;
+    TaskMap const &task_map = all_task_maps.find(op)->second;
     // Customized op
     kn::KNCustomizedOp const *cur_op =
         dynamic_cast<kn::KNCustomizedOp const *>(op);
@@ -1927,9 +1917,7 @@ TaskGraphResult Graph::generate_task_graph(int _num_gpus, int _my_gpu_id) {
   std::vector<EventDesc> all_events;
   std::vector<TaskId> first_tasks;
   int num_gpus, my_gpu_id;
-  std::map<kernel::KNOperator *,
-           std::map<dim3, std::vector<TaskId>, Dim3Comparator>>
-      all_task_maps;
+  OperatorTaskMaps all_task_maps;
   num_gpus = _num_gpus;
   my_gpu_id = _my_gpu_id;
   // add the termination event to the event lists

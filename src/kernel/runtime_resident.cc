@@ -14,6 +14,7 @@
  */
 
 #include "mirage/kernel/graph.h"
+#include "mirage/kernel/task_graph_builder.h"
 #include "mirage/persistent_kernel/resident_runtime_header.h"
 #include "mirage/kernel/task_register.h"
 #include "mirage/transpiler/utils.h"
@@ -52,18 +53,6 @@ size_t get_event_id(int my_gpu_id, size_t event_pos, bool nvshmem_event) {
 bool is_nvshmem_event(size_t event_id) {
   return (event_id & EVENT_NVSHMEM_TAG) > 0;
 }
-
-struct Dim3Comparator {
-  bool operator()(dim3 const &a, dim3 const &b) const {
-    if (a.x != b.x) {
-      return a.x < b.x;
-    }
-    if (a.y != b.y) {
-      return a.y < b.y;
-    }
-    return a.z < b.z;
-  }
-};
 
 /**
  * Get number of subtasks for a task type.
@@ -281,9 +270,7 @@ ResidentTaskGraph build_data_aware_task_graph(
     mirage::kernel::Graph const &graph,
     std::vector<FullTaskDesc> const &all_tasks,
     std::vector<EventDesc> const &all_events,
-    std::map<kernel::KNOperator *,
-             std::map<dim3, std::vector<TaskId>, Dim3Comparator>> const
-        &all_task_maps,
+    OperatorTaskMaps const &all_task_maps,
     DataAwareTaskGraphFlavor flavor,
     ResidentExecutionMode execution_mode,
     StreamingBaseExecutionMode streaming_base_mode) {
@@ -291,6 +278,9 @@ ResidentTaskGraph build_data_aware_task_graph(
   result.task_to_data_id.assign(all_tasks.size(), DATA_INVALID_ID);
   std::unordered_map<std::string, ResidentTaskId> streaming_resident_ids;
 
+  // Keep families and DataIds in registration/grid order. Slot annotations
+  // and projection-layer numbering use this order; regular TaskIds may be
+  // interleaved by the shared DAG generator and are looked up explicitly.
   for (auto const &op : graph.operators) {
     if (op->op_type == type::KNOperatorType::KN_INPUT_OP) {
       continue;
@@ -592,153 +582,6 @@ void validate_resident_task_graph(ResidentTaskGraph const &graph) {
 
 } // namespace
 
-void dfs_create_events_add_tasks(
-    int depth,
-    int const my_gpu_id,
-    int const num_gpus,
-    std::vector<int> const &event_dims,
-    int3 const input_map,
-    int3 const output_map,
-    dim3 const consumer_grid_dim,
-    dim3 const producer_grid_dim,
-    dim3 consumer_lo_bid,
-    dim3 consumer_hi_bid,
-    dim3 producer_lo_bid,
-    dim3 producer_hi_bid,
-    std::vector<EventDesc> &all_events,
-    std::vector<FullTaskDesc> &all_tasks,
-    std::vector<FullTaskDesc> const &cur_op_tasks,
-    std::map<dim3, std::vector<TaskId>, Dim3Comparator> const &pre_task_map,
-    std::map<dim3, std::vector<TaskId>, Dim3Comparator> &cur_task_map,
-    std::unordered_set<size_t> &nvshmem_events_idx,
-    bool nvshmem_event,
-    bool multigpu_task) {
-  if (depth >= mirage::config::MAX_TENSOR_DIMS) {
-    EventDesc event_desc;
-    event_desc.num_triggers = 0;
-    event_desc.first_task_id = all_tasks.size();
-    // Add consumer tasks
-    dim3 bid;
-    for (bid.x = consumer_lo_bid.x; bid.x < consumer_hi_bid.x; bid.x++) {
-      for (bid.y = consumer_lo_bid.y; bid.y < consumer_hi_bid.y; bid.y++) {
-        for (bid.z = consumer_lo_bid.z; bid.z < consumer_hi_bid.z; bid.z++) {
-          int block_offset = bid.x * consumer_grid_dim.y * consumer_grid_dim.z +
-                             bid.y * consumer_grid_dim.z + bid.z;
-          if (multigpu_task) {
-            cur_task_map[bid] = std::vector<TaskId>();
-            for (int i = 0; i < num_gpus - 1; i++) {
-              cur_task_map[bid].push_back(all_tasks.size());
-              all_tasks.push_back(
-                  cur_op_tasks[block_offset * (num_gpus - 1) + i]);
-            }
-          } else {
-            cur_task_map[bid] = std::vector<TaskId>{all_tasks.size()};
-            all_tasks.push_back(cur_op_tasks[block_offset]);
-          }
-        }
-      }
-    }
-    event_desc.last_task_id = all_tasks.size();
-    // Set producer tasks
-    for (bid.x = producer_lo_bid.x; bid.x < producer_hi_bid.x; bid.x++) {
-      for (bid.y = producer_lo_bid.y; bid.y < producer_hi_bid.y; bid.y++) {
-        for (bid.z = producer_lo_bid.z; bid.z < producer_hi_bid.z; bid.z++) {
-          assert(pre_task_map.find(bid) != pre_task_map.end());
-          std::vector<TaskId> const &task_ids = pre_task_map.find(bid)->second;
-          if (all_tasks[task_ids[0]].task_type ==
-              TASK_NVSHMEM_ALLGATHER_STRIDED_PUT) {
-            assert(task_ids.size() == (size_t)num_gpus - 1);
-            for (int tgt_gpu_id = 0; tgt_gpu_id < num_gpus; tgt_gpu_id++) {
-              if (tgt_gpu_id == my_gpu_id) {
-                continue;
-              }
-              size_t idx = tgt_gpu_id < my_gpu_id ? tgt_gpu_id : tgt_gpu_id - 1;
-              assert(all_tasks[task_ids[idx]].task_type ==
-                     TASK_NVSHMEM_ALLGATHER_STRIDED_PUT);
-              all_tasks[task_ids[idx]].trigger_event =
-                  get_event_id(tgt_gpu_id,
-                               all_events.size(),
-                               nvshmem_event /*nvshmem_event*/);
-              event_desc.num_triggers++;
-            }
-          } else {
-            assert(task_ids.size() == 1);
-            all_tasks[task_ids[0]].trigger_event = get_event_id(
-                my_gpu_id, all_events.size(), nvshmem_event /*nvshmem_event*/);
-            event_desc.num_triggers++;
-          }
-        }
-      }
-    }
-    if (nvshmem_event) {
-      // NVSHMEM events need to be triggered by all other GPUs
-      nvshmem_events_idx.insert(all_events.size());
-    }
-    event_desc.event_type =
-        event_desc.last_task_id >= event_desc.first_task_id + 8
-            ? EVENT_LAUNCH_MASSIVE_TASKS
-            : EVENT_LAUNCH_TASKS;
-    all_events.push_back(event_desc);
-  } else {
-    for (int i = 0; i < event_dims[depth]; i++) {
-      dim3 new_consumer_lo_bid = consumer_lo_bid;
-      dim3 new_consumer_hi_bid = consumer_hi_bid;
-      dim3 new_producer_lo_bid = producer_lo_bid;
-      dim3 new_producer_hi_bid = producer_hi_bid;
-      if (depth == input_map.x) {
-        int factor = consumer_grid_dim.x / event_dims[depth];
-        new_consumer_lo_bid.x = i * factor;
-        new_consumer_hi_bid.x = (i + 1) * factor;
-      }
-      if (depth == input_map.y) {
-        int factor = consumer_grid_dim.y / event_dims[depth];
-        new_consumer_lo_bid.y = i * factor;
-        new_consumer_hi_bid.y = (i + 1) * factor;
-      }
-      if (depth == input_map.z) {
-        int factor = consumer_grid_dim.z / event_dims[depth];
-        new_consumer_lo_bid.z = i * factor;
-        new_consumer_hi_bid.z = (i + 1) * factor;
-      }
-      if (depth == output_map.x) {
-        int factor = producer_grid_dim.x / event_dims[depth];
-        new_producer_lo_bid.x = i * factor;
-        new_producer_hi_bid.x = (i + 1) * factor;
-      }
-      if (depth == output_map.y) {
-        int factor = producer_grid_dim.y / event_dims[depth];
-        new_producer_lo_bid.y = i * factor;
-        new_producer_hi_bid.y = (i + 1) * factor;
-      }
-      if (depth == output_map.z) {
-        int factor = producer_grid_dim.z / event_dims[depth];
-        new_producer_lo_bid.z = i * factor;
-        new_producer_hi_bid.z = (i + 1) * factor;
-      }
-      dfs_create_events_add_tasks(depth + 1,
-                                  my_gpu_id,
-                                  num_gpus,
-                                  event_dims,
-                                  input_map,
-                                  output_map,
-                                  consumer_grid_dim,
-                                  producer_grid_dim,
-                                  new_consumer_lo_bid,
-                                  new_consumer_hi_bid,
-                                  new_producer_lo_bid,
-                                  new_producer_hi_bid,
-                                  all_events,
-                                  all_tasks,
-                                  cur_op_tasks,
-                                  pre_task_map,
-                                  cur_task_map,
-                                  nvshmem_events_idx,
-                                  nvshmem_event,
-                                  multigpu_task);
-    }
-  }
-}
-
 // The resident compiler currently supports attached storage tensors. The new
 // native compiler's virtual view/alias analysis is deliberately not duplicated
 // here: reject such graphs before any owner-op cast or pointer arithmetic.
@@ -798,273 +641,6 @@ void validate_resident_bindings(mirage::kernel::Graph const &graph) {
           throw std::runtime_error("Resident tensor size overflows int64");
         }
         contiguous_stride *= tensor.dim[d];
-      }
-    }
-  }
-}
-
-void register_mugraph(
-    mirage::kernel::Graph const &graph,
-    int num_gpus,
-    int my_gpu_id,
-    std::vector<FullTaskDesc> &all_tasks,
-    std::vector<EventDesc> &all_events,
-    std::vector<TaskId> &first_tasks,
-    std::map<kernel::KNOperator *,
-             std::map<dim3, std::vector<TaskId>, Dim3Comparator>>
-        &all_task_maps,
-    std::unordered_map<kn::KNOperator const *,
-                       std::tuple<int, int, TaskType, int>> const
-        &task_configs) {
-  // push a begin-graph task and a event to launch dependent asks
-  {
-    EventDesc e(EVENT_LAUNCH_DEPENDENT_TASKS, 1, 0, 0);
-    FullTaskDesc t(TASK_BEGIN_TASK_GRAPH, 0 /*variant_id*/);
-    t.trigger_event = get_event_id(my_gpu_id, all_events.size(), false);
-    all_tasks.push_back(t);
-    all_events.push_back(e);
-  }
-  std::vector<tb::TBInputOp *> pre_output_ops;
-  kn::KNCustomizedOp const *pre_op = nullptr;
-  std::map<dim3, std::vector<TaskId>, Dim3Comparator> pre_task_map;
-  std::unordered_set<size_t> nvshmem_events_idx;
-  bool prev_op_is_multigpu = false;
-  for (auto const &op : graph.operators) {
-    if (op->op_type == type::KNOperatorType::KN_INPUT_OP) {
-      continue;
-    }
-    std::tuple<int, int, TaskType, int> task_config =
-        task_configs.find(op)->second;
-    assert(op->op_type == type::KNOperatorType::KN_CUSTOMIZED_OP);
-    // Customized op
-    kn::KNCustomizedOp const *cur_op =
-        dynamic_cast<kn::KNCustomizedOp const *>(op);
-    tb::Graph const &bgraph = cur_op->bgraph;
-    dim3 bid;
-    std::vector<tb::TBInputOp *> input_ops;
-    std::vector<tb::TBInputOp *> output_ops;
-    int num_inputs = std::get<0>(task_config);
-    int num_outputs = std::get<1>(task_config);
-    TaskType task_type = std::get<2>(task_config);
-    int variant_id = std::get<3>(task_config);
-    assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
-    for (auto const &op : bgraph.operators) {
-      assert(op->op_type == mirage::type::TB_INPUT_OP);
-      if (input_ops.size() < (size_t)num_inputs) {
-        input_ops.push_back(static_cast<tb::TBInputOp *>(op));
-      } else {
-        output_ops.push_back(static_cast<tb::TBInputOp *>(op));
-      }
-    }
-
-    auto add_events_for_denpendency =
-        [&](std::vector<FullTaskDesc> const &cur_op_tasks,
-            bool nvshmem_event,
-            bool multigpu_task)
-        -> std::map<dim3, std::vector<TaskId>, Dim3Comparator> {
-      std::map<dim3, std::vector<TaskId>, Dim3Comparator> cur_task_map;
-      std::vector<int> producer_partition(mirage::config::MAX_TENSOR_DIMS, 1);
-      std::vector<int> consumer_partition(mirage::config::MAX_TENSOR_DIMS, 1);
-      int num_shared_tensors = 0;
-      int3 input_map, output_map;
-      for (auto const &input : input_ops) {
-        for (auto const &output : pre_output_ops) {
-          if (input->dtensor.guid == output->dtensor.guid) {
-            input_map = input->input_map;
-            output_map = output->input_map;
-            num_shared_tensors++;
-          }
-        }
-      }
-      // This backend retains the NAS ordered-operator registration contract.
-      // An unrelated fork needs a DAG compiler extension, not a guessed edge.
-      if (num_shared_tensors == 0) {
-        throw std::runtime_error(
-            "Resident ordered registration requires adjacent operators to share "
-            "a producer/consumer tensor; independent operator forks are not supported");
-      }
-      for (int d = 0; d < mirage::config::MAX_TENSOR_DIMS; d++) {
-        // ! Note: If two block dimensions are mapped to the same tensor dim,
-        // ! then the partitioning will be incorrect.
-        if (d == input_map.x) {
-          consumer_partition[d] = bgraph.grid_dim.x;
-        }
-        if (d == input_map.y) {
-          consumer_partition[d] = bgraph.grid_dim.y;
-        }
-        if (d == input_map.z) {
-          consumer_partition[d] = bgraph.grid_dim.z;
-        }
-        if (d == output_map.x) {
-          producer_partition[d] = pre_op->bgraph.grid_dim.x;
-        }
-        if (d == output_map.y) {
-          producer_partition[d] = pre_op->bgraph.grid_dim.y;
-        }
-        if (d == output_map.z) {
-          producer_partition[d] = pre_op->bgraph.grid_dim.z;
-        }
-      }
-      // Step 2.2: create events and add tasks
-      // number of events is the product of gcd of producer/consumer
-      std::vector<int> event_dims(mirage::config::MAX_TENSOR_DIMS, 1);
-      for (int d = 0; d < mirage::config::MAX_TENSOR_DIMS; d++) {
-        event_dims[d] = std::gcd(producer_partition[d], consumer_partition[d]);
-      }
-      dfs_create_events_add_tasks(0,         /*depth*/
-                                  my_gpu_id, /*my_gpu_id*/
-                                  num_gpus,
-                                  event_dims,              /*event_dims*/
-                                  input_map,               /*input_map*/
-                                  output_map,              /*output_map*/
-                                  bgraph.grid_dim,         /*consumer_grid_dim*/
-                                  pre_op->bgraph.grid_dim, /*producer_grid_dim*/
-                                  dim3(0, 0, 0),           /*consumer_lo_bid*/
-                                  bgraph.grid_dim,         /*consumer_hi_bid*/
-                                  dim3(0, 0, 0),           /*producer_lo_bid*/
-                                  pre_op->bgraph.grid_dim, /*producer_hi_bid*/
-                                  all_events,
-                                  all_tasks,
-                                  cur_op_tasks,
-                                  pre_task_map, /*pre_task_map*/
-                                  cur_task_map /*cur_task_map)*/,
-                                  nvshmem_events_idx,
-                                  nvshmem_event,
-                                  multigpu_task);
-      return cur_task_map;
-    };
-
-    auto get_tensor_desc =
-        [](threadblock::TBInputOp *const &tb_op) -> TensorDesc {
-      TensorDesc desc{};
-      assert(tb_op->output_tensors.size() == 1);
-      tb::STensor stensor = tb_op->output_tensors[0];
-      // DTensor now owns its strides. Do not cast owner_op: virtual views do
-      // not have a KNInputOp owner and are explicitly rejected at entry.
-      desc.num_dims = stensor.num_dims;
-      desc.data_type = stensor.data_type;
-      for (int d = stensor.num_dims - 1; d >= 0; d--) {
-        desc.dim[d] = stensor.dim[d];
-        desc.stride[d] = static_cast<int>(tb_op->dtensor.stride[d]);
-      }
-      return desc;
-    };
-
-    int cur_op_num_subtasks = get_num_subtasks(num_gpus, task_type);
-    bool cur_op_is_multigpu = (task_type == TASK_NVSHMEM_ALLGATHER_STRIDED_PUT);
-
-    std::vector<FullTaskDesc> tasks;
-    // Step 1: add all tasks based on their blockIdx
-    // (bid.x, bid.y, bid.z) ordering
-    for (bid.x = 0; bid.x < bgraph.grid_dim.x; bid.x++) {
-      for (bid.y = 0; bid.y < bgraph.grid_dim.y; bid.y++) {
-        for (bid.z = 0; bid.z < bgraph.grid_dim.z; bid.z++) {
-          for (int subtask_id = 0; subtask_id < cur_op_num_subtasks;
-               subtask_id++) {
-            FullTaskDesc task(task_type, variant_id);
-            // Set request_id for attention and paged_attention
-            if ((task_type == TASK_ATTENTION_1) ||
-                (task_type == TASK_ATTENTION_2) ||
-                (task_type == TASK_SINGLE_BATCH_EXTEND_ATTENTION) ||
-                (task_type == TASK_PAGED_ATTENTION_1) ||
-                (task_type == TASK_PAGED_ATTENTION_2) ||
-                (task_type == TASK_PAGED_ATTENTION_HOPPER) ||
-                (task_type == TASK_ATTENTION_SLOT_HOPPER) ||
-                (task_type == TASK_PAGED_ATTENTION_SPLIT_KV_SM100) ||
-                (task_type == TASK_PAGED_ATTENTION_SPLIT_KV_MERGE_SM100) ||
-                (task_type == TASK_PAGED_ATTENTION_SPLIT_KV_HOPPER) ||
-                (task_type == TASK_ATTN_SM100)) {
-              // Note that we assume grid_dim.x corresponds to
-              // the request dimension
-              task.task_metadata.request_id = bid.x;
-            }
-            // Set expert_offset for MoE tasks
-            if (task_type == TASK_MOE_W13_LINEAR_SM100 ||
-                task_type == TASK_MOE_W2_LINEAR_SM100 ||
-                task_type == TASK_MOE_W13_LINEAR_SM90 ||
-                task_type == TASK_MOE_W2_LINEAR_SM90) {
-              task.task_metadata.expert_offset = bid.x;
-            }
-            // Set paged attention split kv task kv_idx
-            if (task_type == TASK_PAGED_ATTENTION_SPLIT_KV_SM100 ||
-                task_type == TASK_PAGED_ATTENTION_SPLIT_KV_MERGE_SM100 ||
-                task_type == TASK_PAGED_ATTENTION_SPLIT_KV_HOPPER) {
-              task.task_metadata.kv_idx = bid.z;
-              task.task_metadata.merge_task_offset = bid.y;
-            }
-            if (task_type == TASK_NVSHMEM_TILE_ALLREDUCE) {
-              task.task_metadata.task_offset =
-                  bid.x + bid.y * bgraph.grid_dim.x +
-                  bid.z * bgraph.grid_dim.x * bgraph.grid_dim.y;
-            }
-            // Initialize input tensors to the task
-            for (auto const &input : input_ops) {
-              task.inputs[task.num_inputs++] = get_tensor_desc(input);
-            }
-            // Initialize output tensors to the task
-            for (auto const &output : output_ops) {
-              task.outputs[task.num_outputs++] = get_tensor_desc(output);
-            }
-            tasks.push_back(task);
-          }
-        }
-      }
-    }
-    // Step 2: create events between operators
-    std::map<dim3, std::vector<TaskId>, Dim3Comparator> cur_task_map;
-    std::map<dim3, TaskId, Dim3Comparator> cur_task_map_single;
-    if (pre_op == nullptr) {
-      dim3 bid;
-      for (bid.x = 0; bid.x < bgraph.grid_dim.x; bid.x++) {
-        for (bid.y = 0; bid.y < bgraph.grid_dim.y; bid.y++) {
-          for (bid.z = 0; bid.z < bgraph.grid_dim.z; bid.z++) {
-            cur_task_map[bid] = {all_tasks.size()};
-
-            int offset = bid.x * bgraph.grid_dim.y * bgraph.grid_dim.z +
-                         bid.y * bgraph.grid_dim.z + bid.z;
-
-            first_tasks.push_back(all_tasks.size());
-            all_tasks.push_back(tasks[offset]);
-          }
-        }
-      }
-    } else {
-      bool cur_task_trigger_nvshmem_event = prev_op_is_multigpu;
-      cur_task_map = add_events_for_denpendency(
-          tasks, cur_task_trigger_nvshmem_event, cur_op_is_multigpu);
-    }
-    pre_output_ops = output_ops;
-    pre_op = cur_op;
-    pre_task_map = cur_task_map;
-    all_task_maps.emplace(op, cur_task_map);
-    prev_op_is_multigpu = cur_op_is_multigpu;
-  }
-
-  // Update the trigger event for all tasks in pre_task_map
-  for (auto const &it : pre_task_map) {
-    assert(it.second.size() == 1);
-    all_tasks[it.second[0]].trigger_event =
-        get_event_id(my_gpu_id, all_events.size(), false /*nvshmem_event*/);
-  }
-  all_events.push_back(
-      EventDesc(EVENT_END_OF_TASK_GRAPH, pre_task_map.size(), 0, 0));
-
-  // Prelaunch all tasks at the begining of an iteration
-  all_events[1].first_task_id = 2;
-  all_events[1].last_task_id = all_tasks.size();
-  for (size_t e = 2; e < all_events.size(); e++) {
-    if (all_events[e].event_type == EVENT_LAUNCH_TASKS ||
-        all_events[e].event_type == EVENT_LAUNCH_MASSIVE_TASKS) {
-      all_events[e].event_type = EVENT_EMPTY;
-      bool is_nvshmem_event = false;
-      if (nvshmem_events_idx.count(e) > 0) {
-        is_nvshmem_event = true;
-      }
-      for (size_t t = all_events[e].first_task_id;
-           t < all_events[e].last_task_id;
-           t++) {
-        all_tasks[t].dependent_event =
-            get_event_id(my_gpu_id, e, is_nvshmem_event /*nvshmem_event*/);
       }
     }
   }
@@ -1379,9 +955,7 @@ TaskGraphResult print_task_graph(
     std::vector<FullTaskDesc> const &all_tasks,
     std::vector<EventDesc> const &all_events,
     std::vector<TaskId> const &first_tasks,
-    std::map<kernel::KNOperator *,
-             std::map<dim3, std::vector<TaskId>, Dim3Comparator>> const
-        &all_task_maps,
+    OperatorTaskMaps const &all_task_maps,
     std::unordered_map<kn::KNOperator const *,
                        std::tuple<int, int, TaskType, int>> const &task_configs,
     std::map<mirage::type::GuidType, IODesc> const &io_configs,
@@ -1389,6 +963,11 @@ TaskGraphResult print_task_graph(
     bool use_json_format,
     std::vector<int> const &data_slot_ids = {}) {
   using mirage::runtime::IODesc;
+  if (!use_json_format) {
+    throw std::runtime_error(
+        "Resident task graph generation requires JSON output to preserve "
+        "TaskIds.");
+  }
   ResidentExecutionMode resident_execution_mode =
       flavor == DataAwareTaskGraphFlavor::STREAMING
           ? RESIDENT_EXECUTION_STREAMING
@@ -1880,8 +1459,9 @@ TaskGraphResult print_task_graph(
              {"merge_task_offset", -1},
              {"task_offset", -1}});
   }
-  // generate all other tasks
-  size_t task_pos = 2;
+  // Branch tasks can interleave across operators, so buffer by global TaskId.
+  std::vector<json> json_tasks(all_tasks.size());
+  std::vector<bool> task_filled(all_tasks.size(), false);
   std::vector<json> json_data(resident_graph.all_data.size());
   for (auto const &op : graph.operators) {
     if (op->op_type == type::KNOperatorType::KN_INPUT_OP) {
@@ -1892,8 +1472,7 @@ TaskGraphResult print_task_graph(
         task_configs.find(op)->second;
 
     assert(all_task_maps.find(op) != all_task_maps.end());
-    std::map<dim3, std::vector<TaskId>, Dim3Comparator> const &task_map =
-        all_task_maps.find(op)->second;
+    TaskMap const &task_map = all_task_maps.find(op)->second;
     // Customized op
     kn::KNCustomizedOp const *cur_op =
         dynamic_cast<kn::KNCustomizedOp const *>(op);
@@ -1915,18 +1494,20 @@ TaskGraphResult print_task_graph(
 
     unsigned cur_op_num_subtasks = get_num_subtasks(num_gpus, task_type);
 
-    // There is no guarantee that the tasks are added in (x,y,z) order,
-    // so, to keep the final tasks array in order, we need to re-order them
-    // here. ! tgbody-based gen is still prone to ordering issue.
-    std::vector<json> json_tasks(bgraph.grid_dim.x * bgraph.grid_dim.y *
-                                 bgraph.grid_dim.z * cur_op_num_subtasks);
-    TaskId starting_task_id = task_pos;
     for (bid.x = 0; bid.x < bgraph.grid_dim.x; bid.x++) {
       for (bid.y = 0; bid.y < bgraph.grid_dim.y; bid.y++) {
         for (bid.z = 0; bid.z < bgraph.grid_dim.z; bid.z++) {
           for (int subtask_id = 0; subtask_id < cur_op_num_subtasks;
                subtask_id++) {
-            TaskId task_id = task_map.at(bid)[subtask_id];
+            TaskId task_id = task_map.at(bid).at(subtask_id);
+            if (task_id < 2 || task_id >= all_tasks.size()) {
+              throw std::runtime_error(
+                  "Resident serialization has an invalid compute TaskId.");
+            }
+            if (task_filled[task_id]) {
+              throw std::runtime_error(
+                  "Resident serialization has a duplicate TaskId.");
+            }
             FullTaskDesc task_desc = all_tasks[task_id];
             tgbody.e("// task[$]", task_id);
             tgbody.e("{");
@@ -2272,8 +1853,8 @@ TaskGraphResult print_task_graph(
             tgbody.e("all_tasks.push_back(task_desc);");
             tgbody.e("task_to_data_id.push_back($);", data_id);
             tgbody.e("}");
-            // json_task_graph["all_tasks"].push_back(json_task);
-            json_tasks[task_id - starting_task_id] = json_task;
+            json_tasks[task_id] = json_task;
+            task_filled[task_id] = true;
             if (has_data_desc) {
               json_data[data_id] = json_data_desc;
             }
@@ -2281,13 +1862,14 @@ TaskGraphResult print_task_graph(
         }   // bid.z
       }     // bid.y
     }       // bid.x
-
-    for (int i = 0; i < json_tasks.size(); i++) {
-      json_task_graph["all_tasks"].push_back(json_tasks[i]);
-    }
-    task_pos += json_tasks.size();
   }
-  assert(task_pos == all_tasks.size());
+  for (TaskId task_id = 2; task_id < all_tasks.size(); task_id++) {
+    if (!task_filled[task_id]) {
+      throw std::runtime_error(
+          "Resident serialization is missing a compute TaskId.");
+    }
+    json_task_graph["all_tasks"].push_back(json_tasks[task_id]);
+  }
   // Add all events
   for (auto const &event : all_events) {
     tgbody.e(
@@ -2505,9 +2087,7 @@ TaskGraphResult Graph::generate_resident_task_graph(
   std::vector<EventDesc> all_events;
   std::vector<TaskId> first_tasks;
   int num_gpus, my_gpu_id;
-  std::map<kernel::KNOperator *,
-           std::map<dim3, std::vector<TaskId>, Dim3Comparator>>
-      all_task_maps;
+  OperatorTaskMaps all_task_maps;
   num_gpus = _num_gpus;
   my_gpu_id = _my_gpu_id;
   // add the termination event to the event lists
@@ -2515,14 +2095,14 @@ TaskGraphResult Graph::generate_resident_task_graph(
   all_events.push_back(e);
   FullTaskDesc t(TASK_TERMINATE, 0 /*variant_id*/);
   all_tasks.push_back(t);
-  register_mugraph(*this,
-                   num_gpus,
-                   my_gpu_id,
-                   all_tasks,
-                   all_events,
-                   first_tasks,
-                   all_task_maps,
-                   task_config);
+  kn::register_mugraph(*this,
+                      num_gpus,
+                      my_gpu_id,
+                      all_tasks,
+                      all_events,
+                      first_tasks,
+                      all_task_maps,
+                      task_config);
   assign_profiler_group_ids(all_tasks);
   assert(sanity_check(*this, all_tasks, all_events, first_tasks));
   return print_task_graph(*this,
