@@ -31,6 +31,7 @@ extern std::string g_task_graph_json_path;
 
 static PyObject *init_func(PyObject *self, PyObject *args) {
   PyObject *meta_list, *py_profiler_buffer, *tensor_names_list, *tensor_ptrs_list, *py_json_path, *kv_block_sizes_list, *kv_window_sizes_list;
+  PyObject *context_io = Py_None;
   std::vector<void*> meta_tensors;
   std::vector<std::string> model_tensor_names;
   std::vector<void*> model_tensor_ptrs;
@@ -41,7 +42,7 @@ static PyObject *init_func(PyObject *self, PyObject *args) {
   int allocate_nvshmem_teams;
   void *profiler_buffer;
 
-  if (!PyArg_ParseTuple(args, "OOiiiiiiLiOOOOO", &meta_list, &py_profiler_buffer, &my_mpi_rank, &num_workers, &num_local_schedulers, &num_remote_schedulers, &max_seq_length, &total_num_requests, &eos_token_id, &allocate_nvshmem_teams, &tensor_names_list, &tensor_ptrs_list, &py_json_path, &kv_block_sizes_list, &kv_window_sizes_list)) {
+  if (!PyArg_ParseTuple(args, "OOiiiiiiLiOOOOO|O", &meta_list, &py_profiler_buffer, &my_mpi_rank, &num_workers, &num_local_schedulers, &num_remote_schedulers, &max_seq_length, &total_num_requests, &eos_token_id, &allocate_nvshmem_teams, &tensor_names_list, &tensor_ptrs_list, &py_json_path, &kv_block_sizes_list, &kv_window_sizes_list, &context_io)) {
     PyErr_SetString(PyExc_TypeError, "Invalid parameters");
     return NULL;
   }
@@ -118,6 +119,39 @@ static PyObject *init_func(PyObject *self, PyObject *args) {
       g_task_graph_json_path = std::string(json_path);
     }
   }
+
+  // The resident generator defines this macro before including its runtime.
+  // Configure ContextIO before native validation/allocation. The ordinary
+  // upstream initializer keeps its existing arguments and default behavior.
+#ifdef MIRAGE_RESIDENT_EXECUTION_MODE_VALUE
+  auto &config = global_runtime_config;
+  config.num_contexts = -1;
+  config.context_input_is_int64 = 0;
+  config.context_sequence_length = 0;
+  config.context_prefix_length = 0;
+  config.context_input_width = config.context_output_width = 0;
+  config.context_inputs = config.context_slot_inputs = nullptr;
+  config.context_saved_outputs = nullptr;
+  config.context_slot_outputs = nullptr;
+  if (context_io != Py_None) {
+    unsigned long long inputs, saved, slot_inputs, slot_outputs;
+    if (!PyArg_ParseTuple(context_io, "KKKKiiii|ii", &inputs, &saved, &slot_inputs,
+                          &slot_outputs, &config.num_contexts,
+                          &config.context_input_width, &config.context_output_width,
+                          &config.context_input_is_int64,
+                          &config.context_sequence_length, &config.context_prefix_length))
+      return NULL;
+    config.context_inputs = reinterpret_cast<void const *>(inputs);
+    config.context_saved_outputs = reinterpret_cast<__nv_bfloat16 *>(saved);
+    config.context_slot_inputs = reinterpret_cast<void *>(slot_inputs);
+    config.context_slot_outputs = reinterpret_cast<__nv_bfloat16 const *>(slot_outputs);
+  }
+#else
+  if (context_io != Py_None) {
+    PyErr_SetString(PyExc_ValueError, "Context IO requires resident_data");
+    return NULL;
+  }
+#endif
 
   // Resident initialization validates its metadata before touching CUDA.
   // Keep C++ validation errors inside the Python extension boundary.
@@ -482,6 +516,7 @@ class PersistentKernel:
             raise ValueError(f"Unsupported task graph mode: {task_graph_mode}")
         self.task_graph_mode = task_graph_mode
         self._data_slot_ids = None
+        self._context_io = None  # Keep caller-owned CUDA buffers alive through finalize().
         if task_graph_mode == "resident_data":
             if mode != "offline" or world_size != 1 or num_remote_schedulers != 0:
                 raise ValueError("The resident port supports single-GPU offline execution")
@@ -3499,11 +3534,86 @@ class PersistentKernel:
         self.kn_graph.customized([hot_token, d2t_table, target_token], tb_graph)
         self.kn_graph.register_task(tb_graph, "eagle3_d2t_remap", params)
 
+    def _bind_context_io(self, buffers):
+        """Bind (queued inputs, saved outputs, slot inputs, slot outputs).
+
+        Outputs are contiguous CUDA BF16 matrices. Inputs can be BF16 vectors
+        or int64 matrices with one embedding ID per row. Queue/result rows use
+        context IDs; working rows use reusable slot IDs. One pass consumes one
+        row. Native initialization also checks these addresses against the graph.
+        """
+        if buffers is None:
+            return None
+        if (self.task_graph_mode != "resident_data" or self.mode != "offline"
+                or self.world_size != 1 or self.num_remote_schedulers != 0
+                or self.spec_decode_config is not None or self._data_slot_ids is None):
+            raise ValueError("Context IO requires annotated, single-GPU offline resident_data")
+        if "MIRAGE_RESIDENT_SLOT_ITERATIONS" in os.environ:
+            raise ValueError("Choose context_io or MIRAGE_RESIDENT_SLOT_ITERATIONS, not both")
+        if not isinstance(buffers, (tuple, list)) or len(buffers) != 4:
+            raise ValueError("context_io must contain inputs, saved_outputs, slot_inputs, slot_outputs")
+        for tensor in buffers:
+            if (not isinstance(tensor, torch.Tensor) or not tensor.is_cuda
+                    or tensor.device.index != self.mpi_rank
+                    or tensor.ndim != 2 or not tensor.is_contiguous()):
+                raise ValueError("Context IO needs contiguous 2D tensors on this rank's CUDA device")
+        inputs, saved, slot_inputs, slot_outputs = buffers
+        if (inputs.dtype not in (torch.bfloat16, torch.int64) or slot_inputs.dtype != inputs.dtype
+                or saved.dtype != torch.bfloat16 or slot_outputs.dtype != torch.bfloat16):
+            raise ValueError("Context IO needs matching BF16/int64 inputs and BF16 outputs")
+        if inputs.dtype == torch.int64 and inputs.shape[1] != 1:
+            raise ValueError("Integer ContextIO input must be one int64 ID per slot")
+        count, input_width = inputs.shape
+        output_width = saved.shape[1]
+        slots = max(self._data_slot_ids) + 1
+        if (saved.shape[0] != count or slot_inputs.shape != (slots, input_width)
+                or slot_outputs.shape != (slots, output_width)
+                or not 0 <= count <= 0x7fffffff
+                or not 0 < input_width <= 0x7fffffff or not 0 < output_width <= 0x7fffffff
+                or slots > self.max_num_batched_requests):
+            raise ValueError("Expected inputs[N,Hin], outputs[N,Hout], slot_inputs[S,Hin], slot_outputs[S,Hout]")
+        ranges = [(t.data_ptr(), t.data_ptr() + t.numel() * t.element_size()) for t in buffers]
+        for i, (begin, end) in enumerate(ranges):
+            if any(begin < other_end and other_begin < end
+                   for other_begin, other_end in ranges[:i] if other_begin != other_end) and begin != end:
+                raise ValueError("Context IO buffers must not overlap")
+        self._context_io = tuple(buffers)
+        return (*[tensor.data_ptr() for tensor in buffers], count, input_width, output_width,
+                int(inputs.dtype == torch.int64))
+
+    def _bind_context_sequence(self, context_io, sequence):
+        """Select fixed sequences with context_sequence=(steps, prefix_length).
+
+        By default each slot keeps one sequence for the whole invocation.
+        Preloaded rows are [slot, step], flattened to [S*T, ...]. The existing
+        comparison-only repeat macro extends this to [round, slot, step].
+        Omission retains ordinary ContextIO queue admission and V0 attention.
+        """
+        if sequence is None:
+            return context_io
+        if context_io is None:
+            raise ValueError("context_sequence requires context_io")
+        if (not isinstance(sequence, (tuple, list)) or len(sequence) != 2
+                or any(type(value) is not int for value in sequence)):
+            raise ValueError("context_sequence must be (integer steps, integer prefix_length)")
+        steps, prefix = sequence
+        if not 1 <= steps <= 64 or not 0 <= prefix <= 64 - steps:
+            raise ValueError("Fixed sequences require steps >= 1 and 0 <= prefix <= 64 - steps")
+        slots = max(self._data_slot_ids) + 1
+        # Isolated comparison policy; the matching JIT macro is checked by
+        # native initialization. Default binding retains one sequence per slot.
+        repeats = int(os.environ.get("MIRAGE_COMPARE_SEQUENCE_REPEATS", "1"))
+        if repeats < 1 or context_io[4] != slots * steps * repeats:
+            raise ValueError("Fixed sequences require num_slots * steps * repeats rows")
+        return (*context_io, steps, prefix)
+
     def compile(
         self,
         **kwargs,
     ):
         assert not self._is_compiled
+        context_io = self._bind_context_io(kwargs.get("context_io"))
+        context_io = self._bind_context_sequence(context_io, kwargs.get("context_sequence"))
         
         output_dir = kwargs.get("output_dir", None)
 
@@ -3742,6 +3852,7 @@ class PersistentKernel:
             "",  # Empty JSON path = use __FILE__ based path during initial compile
             [g.block_size for g in self.kv_groups],
             [g.window_size for g in self.kv_groups],
+            *([context_io] if context_io is not None else []),
         )
 
         self._is_compiled = True
@@ -3762,6 +3873,8 @@ class PersistentKernel:
                        - task_graph_rank{N}.json
         """
         assert not self._is_compiled, "Kernel is already compiled"
+        context_io = self._bind_context_io(kwargs.get("context_io"))
+        context_io = self._bind_context_sequence(context_io, kwargs.get("context_sequence"))
         
         # Find the compiled .so file
         so_pattern = f"mpk_launcher_rank{self.mpi_rank}.cpython-{sys.version_info.major}{sys.version_info.minor}-x86_64-linux-gnu.so"
@@ -3862,6 +3975,7 @@ class PersistentKernel:
             json_path,  # Pass the JSON path for kernel reuse
             [g.block_size for g in self.kv_groups],
             [g.window_size for g in self.kv_groups],
+            *([context_io] if context_io is not None else []),
         )
 
         self._is_compiled = True
@@ -3910,4 +4024,5 @@ class PersistentKernel:
         assert not self.__finalized__
         if self._is_compiled:
             self.finalize_func()
+        self._context_io = None
         self.__finalized__ = True

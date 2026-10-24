@@ -490,7 +490,11 @@ __host__ inline void fill_tma_desc_by_task(CUtensorMap *tma_desc,
 
       break;
     }
+    // NAS marks these dense rows for optional batching. When batching is off,
+    // they execute the same row-linear kernel and need the same tensor maps.
     case TASK_LINEAR_SWAPAB_HOPPER:
+    case TASK_LINEAR_QKV_HOPPER:
+    case TASK_LINEAR_WO_HOPPER:
     case TASK_LINEAR_SWAPAB_WITH_RESIDUAL_HOPPER: {
       int const cp_async_size = 64;
       size_t const smem_repeat_row = 1;
@@ -559,10 +563,12 @@ __host__ inline void fill_tma_desc_by_task(CUtensorMap *tma_desc,
                                             smem_shape,
                                             smem_repeat_row,
                                             smem_repeat_col);
-      } else if (param_id == 3 && task_desc.task_type ==
-                                      TASK_LINEAR_SWAPAB_WITH_RESIDUAL_HOPPER ||
-                 param_id == 2 &&
-                     task_desc.task_type == TASK_LINEAR_SWAPAB_HOPPER) {
+      } else if ((param_id == 3 && task_desc.task_type ==
+                                      TASK_LINEAR_SWAPAB_WITH_RESIDUAL_HOPPER) ||
+                 (param_id == 2 &&
+                     (task_desc.task_type == TASK_LINEAR_SWAPAB_HOPPER ||
+                      task_desc.task_type == TASK_LINEAR_QKV_HOPPER ||
+                      task_desc.task_type == TASK_LINEAR_WO_HOPPER))) {
         // TMA_OUT
         int const batch_size = tensor_desc.dim[0];
         int const output_size = tensor_desc.dim[1];
@@ -1467,6 +1473,8 @@ __host__ inline void create_tma_desc_by_task(FullTaskDesc &task_desc) {
     case TASK_LINEAR_HOPPER:
     case TASK_LINEAR_WITH_RESIDUAL_HOPPER:
     case TASK_LINEAR_SWAPAB_HOPPER:
+    case TASK_LINEAR_QKV_HOPPER:
+    case TASK_LINEAR_WO_HOPPER:
     case TASK_LINEAR_SWAPAB_WITH_RESIDUAL_HOPPER:
     case TASK_SPLITK_LINEAR_SWAPAB_HOPPER:
     case TASK_LINEAR_SM100:
