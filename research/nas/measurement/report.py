@@ -5,23 +5,23 @@ from pathlib import Path
 
 def write_report(output):
     reports = [json.loads(p.read_text()) for p in sorted(output.glob('*/report.json'))]
-    text = ['# Incremental counts and FIFO membership', '',
+    text = ['# FIFO winner-loop comparison', '',
         'Real 48-layer Qwen3-30B-A3B, identical 64 offline prompts; 16 slots, 16 worker CTAs, '
         'one controller; P=4, top-k=8, H=2048, I=768, 128 experts. MoE threshold 8, timeout '
         '100 microseconds, batch capacity 16, descriptor pool 16. Dense batching and both '
         'companion policies are off. ContextIO hidden-output saving remains on.', '',
-        'FIFO bins maintain uint16 counts in ready()/dispatch(), one link per pending '
-        '(slot, token, branch), and a list of nonempty bins. The head supplies the oldest '
-        'timestamp. Selection scans only active bins and follows up to 16 links. '
-        'Threshold/timeout rules stay the same. Equal ages now use (op_id, expert), '
-        'and members leave in arrival order rather than flat slot order. Both can change batching.', '',
+        'All FIFO variants use the same counts, member queues, oldest-eligible rule, '
+        'and (op_id, expert) equal-age tie rule. fifo is the preserved baseline. '
+        'fifo_cached stores the head timestamp per bin. fifo_cached_unchecked also '
+        'omits duplicate per-bin present/enabled checks, reusing the validation in ready(). '
+        'No heap, extra scheduler, kernel, or compiler change is included.', '',
         'Each variant is one full invocation. GPU timing excludes checkpoint loading, compilation, '
         'and host analysis. Compare within the same instrumentation and completion budget. '
         'Diagnostics can alter batch formation; uninstrumented controls are reported separately.', '',
-        '| Variant | Completion budget | Invocation s | Generated tokens | Tokens/s | Speedup vs matching histogram | Checks |',
+        '| Variant | Completion budget | Invocation s | Generated tokens | Tokens/s | Speedup vs matching FIFO baseline | Checks |',
         '|---|---:|---:|---:|---:|---:|---|']
     for r in reports:
-        old = next((x for x in reports if x['selector']=='histogram' and
+        old = next((x for x in reports if x['selector']=='fifo' and
             x['instrumentation']==r['instrumentation'] and x['completion_budget']==r['completion_budget']),None)
         speed = f"{old['invocation_seconds']/r['invocation_seconds']:.3f}x" if old else 'not run'
         text.append(f"| {r['variant']} | {r['completion_budget']} | {r['invocation_seconds']:.6f} | "
@@ -46,10 +46,14 @@ def write_report(output):
             f"Selector phases total **{selector['measured_seconds']:.6f} s**; enclosing selection "
             f"**{selector['outer_seconds']:.6f} s**; outer dispatch **{split['outer_seconds']:.6f} s**. "
             'These are nested scopes, not times to add together. FIFO reset is unused/zero.', '',
-            '| Outcome | Mean distinct bins inspected | Maximum |', '|---|---:|---:|']
+            '| Outcome | Mean distinct bins inspected | Maximum | Winner ns/inspected bin |', '|---|---:|---:|---:|']
         for outcome in selector['outcomes']:
             if outcome['calls']:
-                text.append(f"| {outcome['outcome']} | {outcome['mean_groups']:.3f} | {outcome['max_groups']} |")
+                winner = next((phase for phase in selector['rows']
+                    if phase['outcome']==outcome['outcome'] and phase['phase']=='choose_winner'), None)
+                normalized = (f"{winner['seconds']*1e9/outcome['groups_inspected']:.3f}"
+                    if winner and outcome['groups_inspected'] else 'n/a')
+                text.append(f"| {outcome['outcome']} | {outcome['mean_groups']:.3f} | {outcome['max_groups']} | {normalized} |")
         if d.get('membership'):
             text += ['', '| Membership maintenance | Calls | Members | Summed s | Mean us |',
                      '|---|---:|---:|---:|---:|']
@@ -85,7 +89,10 @@ def write_report(output):
     text += ['', 'Only completed variants appear above. See status.json, failure.json (if present), '
         'and the Slurm log for incomplete runs. Faster selection can itself change arrival timing '
         'and batching. One run does not measure variance or establish each optimization’s isolated '
-        'contribution. The measured change combines incremental counts and FIFO member selection.']
+        'contribution. Compare diagnostic_fifo to diagnostic_fifo_cached for age caching, '
+        'then diagnostic_fifo_cached to diagnostic_fifo_cached_unchecked for the additional '
+        'effect of removing duplicate validity checks. Their changed execution timing can '
+        'alter bin populations; use both per-call and per-inspected-bin costs.']
     (output/'REPORT.md').write_text('\n'.join(text)+'\n')
 
 

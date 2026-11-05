@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare rebuilt histograms with incremental FIFO bins on the same workload."""
+"""Compare FIFO winner-loop variants without changing selection policy."""
 import argparse
 from contextlib import contextmanager
 import importlib
@@ -31,9 +31,12 @@ def compile_options(args, out, pointers, variant):
     original = module.get_compile_command
     def command(*positional, **keywords):
         cmd = [x for x in original(*positional, **keywords) if x != '-arch=sm_90a']
+        policy = variant.split('_', 1)[1]
         flags = [f'-DNAS_INVESTIGATE_COMPLETION_BUDGET={args.completion_budget}',
-            f'-DNAS_SELECTOR_HISTOGRAM={int(variant.endswith("histogram"))}',
-            f'-DNAS_SELECTOR_FIFO={int(variant.endswith("fifo"))}',
+            f'-DNAS_SELECTOR_HISTOGRAM={int(policy == "histogram")}',
+            f'-DNAS_SELECTOR_FIFO={int(policy.startswith("fifo"))}',
+            f'-DNAS_FIFO_CACHE_OLDEST={int(policy in ("fifo_cached", "fifo_cached_unchecked"))}',
+            f'-DNAS_FIFO_SKIP_STATIC_CHECKS={int(policy == "fifo_cached_unchecked")}',
             '-DMIRAGE_EXPERIMENTAL_MOE_BATCHING=1',
             '-DNAS_MOE_TOP_K=8', '-DNAS_MOE_STATE_SLOTS=16', '-DNAS_MOE_LAYERS=48',
             '-DNAS_MOE_H=2048', '-DNAS_MOE_I=768',
@@ -145,10 +148,10 @@ def run(args):
             policy = variant.split('_', 1)[1]
             # Estimate each policy separately: a slow legacy invocation must not
             # force the same duration estimate for the optimized selector later.
-            # The measured histogram invocation took about 112 seconds. Use
-            # 180 until this job supplies a sample, rather than reserving the
-            # old selector's 1353 seconds. This only guards starting a trial.
-            initial_estimate = 180 if policy in ('histogram', 'fifo') else 1353
+            # FIFO diagnostics last took 77 seconds. Budget 120 until a new
+            # sample exists, plus the compile/setup margin below. This never
+            # truncates an invocation; the external job timeout remains final.
+            initial_estimate = 120 if policy.startswith('fifo') else (180 if policy == 'histogram' else 1353)
             estimate = max([x['invocation_seconds'] for x in summary if x['selector']==policy] or [initial_estimate])
             if remaining < estimate * 1.15 + 180:
                 progress('insufficient_time_for_next_variant', skipped=variant, remaining=remaining)
@@ -234,6 +237,8 @@ def run(args):
                     bool(torch.isfinite(saved_cpu[request,:length]).all()) and
                     bool(torch.isnan(saved_cpu[request,length:]).all()))
             report = dict(variant=variant, selector=policy, completion_budget=args.completion_budget,
+                fifo_cache_oldest=policy in ('fifo_cached', 'fifo_cached_unchecked'),
+                fifo_skip_static_checks=policy == 'fifo_cached_unchecked',
                 instrumentation="diagnostic" if variant.startswith("diagnostic") else "off",
                 invocation_seconds=elapsed, host_launch_to_sync_seconds=host_elapsed,
                 same_tokens_as_preserved_control=bool(torch.equal(tokens,baseline["tokens"]) and
@@ -281,8 +286,11 @@ if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--workload', type=Path, required=True)
     parser.add_argument('--hf-reference', type=Path, required=True)
-    parser.add_argument('--variants', nargs='+', choices=('diagnostic_legacy','diagnostic_histogram','control_legacy','control_histogram','diagnostic_fifo','control_fifo'),
-                        default=['control_histogram','control_fifo','diagnostic_fifo'])
+    parser.add_argument('--variants', nargs='+', choices=('diagnostic_legacy','diagnostic_histogram','control_legacy','control_histogram',
+                        'diagnostic_fifo','control_fifo','diagnostic_fifo_cached','control_fifo_cached',
+                        'diagnostic_fifo_cached_unchecked','control_fifo_cached_unchecked'),
+                        default=['control_fifo','control_fifo_cached_unchecked',
+                                 'diagnostic_fifo','diagnostic_fifo_cached','diagnostic_fifo_cached_unchecked'])
     parser.add_argument('--completion-budget',type=int,choices=(1,16),default=1)
     parser.add_argument('--baseline-outputs',type=Path,required=True)
     parser.add_argument('--task-capacity',type=int,default=250000)

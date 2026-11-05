@@ -6,8 +6,8 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=96G
 #SBATCH --time=00:35:00
-#SBATCH --job-name=nas-fifo
-#SBATCH --output=nas-fifo-%j.log
+#SBATCH --job-name=nas-fifo-winner
+#SBATCH --output=nas-fifo-winner-%j.log
 set -euo pipefail
 # Submit from the repository root. sbatch copies this file to a spool directory,
 # so BASH_SOURCE would not locate the source tree while the job is running.
@@ -23,10 +23,17 @@ ulimit -c 0
 TASK_OUTPUT="$TASK_SESSION/results/job_${SLURM_JOB_ID}"
 mkdir -p "$TASK_SESSION/results"
 mkdir "$TASK_OUTPUT"
-TASK_VARIANTS=(control_histogram control_fifo diagnostic_fifo)
+case "${1:-compare}" in
+  compare) TASK_VARIANTS=(control_fifo control_fifo_cached_unchecked
+                         diagnostic_fifo diagnostic_fifo_cached diagnostic_fifo_cached_unchecked) ;;
+  baseline) TASK_VARIANTS=(control_fifo diagnostic_fifo) ;;
+  *) echo 'Expected compare or baseline' >&2; exit 2 ;;
+esac
 # Compile the small replay beforehand with tests/run_checks.py --compile-gpu.
-srun --ntasks=1 timeout --signal=TERM --kill-after=10s 60 \
-  "$TASK_SESSION/.build/fifo_gpu_baseline" > "$TASK_OUTPUT/fifo_gpu_baseline.log" 2>&1
+for TASK_REPLAY in baseline cached fast; do
+  srun --ntasks=1 timeout --signal=TERM --kill-after=10s 60 \
+    "$TASK_SESSION/.build/fifo_gpu_${TASK_REPLAY}" > "$TASK_OUTPUT/fifo_gpu_${TASK_REPLAY}.log" 2>&1
+done
 srun --ntasks=1 timeout --signal=TERM --kill-after=30s 2040 \
   "$TASK_PYTHON" -B -u "$TASK_SESSION/measurement/measure.py" \
   --workload "$NAS_WORKLOAD" --hf-reference "$NAS_HF_REFERENCE" \

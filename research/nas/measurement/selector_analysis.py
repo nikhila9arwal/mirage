@@ -6,6 +6,8 @@ PHASES = {
     'histogram': ('accumulate_bins', 'choose_winner', 'collect_members', 'reset_counts'),
     'fifo': ('prepare_selection', 'choose_winner', 'collect_fifo_prefix', 'reset_unused'),
 }
+PHASES['fifo_cached'] = PHASES['fifo']
+PHASES['fifo_cached_unchecked'] = PHASES['fifo']
 
 
 def analyze_membership(raw, selected_rows, published):

@@ -53,6 +53,14 @@ class SelectorAccounting(unittest.TestCase):
         raw[0,3]+=1; raw[1,0]+=1
         self.assertFalse(analyze_membership(raw,20,2)['passed'])
 
+    def test_fifo_winner_variants_use_the_same_phase_boundaries(self):
+        p,s,d=self.fixture()
+        baseline=analyze_selector(p,s,d,'fifo')
+        for name in ('fifo_cached','fifo_cached_unchecked'):
+            result=analyze_selector(p,s,d,name)
+            self.assertTrue(result['passed'])
+            self.assertEqual(result['rows'],baseline['rows'])
+
     def test_report_uses_existing_latency_field_names(self):
         p,s,d=self.fixture();selector=analyze_selector(p,s,d,'histogram')
         report=dict(variant='diagnostic_histogram',selector='histogram',instrumentation='diagnostic',

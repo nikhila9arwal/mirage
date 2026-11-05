@@ -12,7 +12,11 @@ namespace mirage { namespace runtime {
 // The caller establishes pending metadata before append and reserves a physical
 // descriptor before selection. Selection itself never removes any work.
 NAS_MOE_FIFO_INLINE bool experimental_moe_fifo_append(
-    ExperimentalMoeFifo &fifo, uint32_t key, uint32_t member) {
+    ExperimentalMoeFifo &fifo, uint32_t key, uint32_t member,
+    unsigned long long ready_ns) {
+#if !NAS_FIFO_CACHE_OLDEST
+  (void)ready_ns;
+#endif
   if (key >= EXPERIMENTAL_MOE_SELECTION_BINS ||
       member >= EXPERIMENTAL_MOE_PENDING_ROWS ||
       fifo.count[key] == UINT16_MAX) return false;
@@ -20,7 +24,11 @@ NAS_MOE_FIFO_INLINE bool experimental_moe_fifo_append(
     if (fifo.active_count >= EXPERIMENTAL_MOE_PENDING_ROWS) return false;
     fifo.active[fifo.active_count++] = key;
     fifo.head[key] = member;
+#if NAS_FIFO_CACHE_OLDEST
+    fifo.oldest[key] = ready_ns;
+#endif
   } else {
+    // Appends arrive in timestamp order. An existing head keeps its age.
     fifo.next[fifo.tail[key]] = member;
   }
   fifo.next[member] = UINT32_MAX;
@@ -40,6 +48,9 @@ NAS_MOE_FIFO_INLINE ExperimentalMoeSelection experimental_moe_select_fifo(
 #ifndef NAS_INVESTIGATE_ALL_ROWS
   (void)eligible_ops;
 #endif
+#if NAS_FIFO_CACHE_OLDEST
+  (void)pending;
+#endif
   experimental_moe_selection_stamp(timing, 0);
   ExperimentalMoeSelection selected;
   uint64_t best_time = UINT64_MAX;
@@ -50,14 +61,24 @@ NAS_MOE_FIFO_INLINE ExperimentalMoeSelection experimental_moe_select_fifo(
     uint32_t key = fifo.active[i];
     uint32_t op_id = key / EXPERIMENTAL_MOE_EXPERTS;
     auto const &op = operators[op_id];
+#if !NAS_FIFO_SKIP_STATIC_CHECKS
     if (!op.present || !op.enabled) continue;
+#endif
+    // With the opt-in above, reuse ready()'s validation: disabled operations
+    // take its ordinary-worker path and present is checked before FIFO append.
+    // These operator fields are immutable during a run. Dynamic cohort gating
+    // below still applies; it is not a static validity check.
 #ifdef NAS_INVESTIGATE_ALL_ROWS
     if ((eligible_ops & (1u << op_id)) == 0u) continue;
 #endif
     uint32_t count = fifo.count[key];
+#if NAS_FIFO_CACHE_OLDEST
+    uint64_t oldest = fifo.oldest[key];
+#else
     constexpr uint32_t members_per_slot =
         EXPERIMENTAL_MOE_CHUNK_ROWS * EXPERIMENTAL_MOE_TOP_K;
     uint64_t oldest = pending[fifo.head[key] / members_per_slot].ready_ns;
+#endif
     bool threshold = count >= op.threshold;
     bool timeout = now - oldest >= op.timeout_ns;
     // Equal ages use (op_id, expert), independent of active-list swaps. This
@@ -102,7 +123,12 @@ NAS_MOE_FIFO_INLINE ExperimentalMoeSelection experimental_moe_select_fifo(
 // does NOT complete its logical DataId: the existing branch join still waits
 // for GPU completion. Pending bits are cleared by the existing dispatch loop.
 NAS_MOE_FIFO_INLINE bool experimental_moe_fifo_commit(
-    ExperimentalMoeFifo &fifo, ExperimentalMoeSelection const &selected) {
+    ExperimentalMoeFifo &fifo,
+    ExperimentalMoePendingSlot const (&pending)[EXPERIMENTAL_MOE_STATE_SLOTS],
+    ExperimentalMoeSelection const &selected) {
+#if !NAS_FIFO_CACHE_OLDEST
+  (void)pending;
+#endif
   uint32_t i = selected.active_bin_index;
   if (selected.op_id < 0 || i >= fifo.active_count || selected.count == 0u ||
       selected.count > EXPERIMENTAL_MOE_BATCH_CAPACITY) return false;
@@ -119,6 +145,14 @@ NAS_MOE_FIFO_INLINE bool experimental_moe_fifo_commit(
   if (fifo.count[key] == 0u) {
     fifo.tail[key] = UINT32_MAX;
     fifo.active[i] = fifo.active[--fifo.active_count];
+#if NAS_FIFO_CACHE_OLDEST
+  } else {
+    // Only an oversized bin leaves a new head. Read its timestamp ONCE here,
+    // rather than chasing the head on every subsequent selection attempt.
+    constexpr uint32_t members_per_slot =
+        EXPERIMENTAL_MOE_CHUNK_ROWS * EXPERIMENTAL_MOE_TOP_K;
+    fifo.oldest[key] = pending[fifo.head[key] / members_per_slot].ready_ns;
+#endif
   }
   return true;
 }

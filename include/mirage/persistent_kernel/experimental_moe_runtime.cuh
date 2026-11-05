@@ -251,7 +251,8 @@ __device__ __forceinline__ void experimental_moe_ready(
       uint32_t key = uint32_t(op_id) * EXPERIMENTAL_MOE_EXPERTS + expert;
       uint32_t member = (slot * EXPERIMENTAL_MOE_CHUNK_ROWS + token) *
                             EXPERIMENTAL_MOE_TOP_K + branch;
-      require_request_slot_invariant(experimental_moe_fifo_append(state.fifo, key, member));
+      require_request_slot_invariant(
+          experimental_moe_fifo_append(state.fifo, key, member, ready_ns));
 #endif
       occupancy.ready(op.kind, ready_ns);
       // All members share logical readiness. Physical completion order is free.
@@ -464,7 +465,8 @@ __device__ __forceinline__ bool experimental_moe_dispatch(
 #if NAS_SELECTOR_FIFO
   // The reserved descriptor now owns this FIFO prefix. Keep queue publication
   // after both count/link updates and the pending-bit clears below.
-  require_request_slot_invariant(experimental_moe_fifo_commit(state.fifo, selected));
+  require_request_slot_invariant(
+      experimental_moe_fifo_commit(state.fifo, state.pending, selected));
 #endif
   for (uint32_t m = 0; m < batch.count; m++) {
     auto const &member = batch.members[m];

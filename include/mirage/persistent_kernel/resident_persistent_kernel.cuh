@@ -452,7 +452,8 @@ __global__ void prepare_kernel(ResidentRuntimeConfig config,
     }
 #if NAS_SELECTOR_FIFO
     // One reset per invocation. An empty bin's first append initializes its
-    // head/tail, and every append initializes its member link before use.
+    // head/tail (and optional cached age), and every append initializes its
+    // member link before use. Empty bins never read stale cached ages.
     for (unsigned int key = blockIdx.x * blockDim.x + threadIdx.x;
          key < EXPERIMENTAL_MOE_SELECTION_BINS; key += blockDim.x * gridDim.x)
       config.experimental_moe->fifo.count[key] = 0u;

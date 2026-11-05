@@ -32,3 +32,15 @@ git worktree add --detach ../Async-NAS-F1-fifo-baseline nas-fifo-baseline
 
 All original experiment directories remain unchanged. The Git publishing copy
 does not replace the source used by any queued or running Slurm job.
+
+The following commit imports only the winner-loop optimization and its tests
+and measurement changes from:
+
+```text
+/u/elu1/mpk_fifo_winner_20261105T004506Z/checkout
+```
+
+`source_latest.json` records all imported core hashes. They match that source
+exactly; no runtime/compiler refactoring was done while preparing this repo.
+Both new switches default to zero, so an existing build does not silently opt
+in. The new measurement launcher explicitly selects them for comparisons.

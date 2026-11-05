@@ -15,6 +15,17 @@
 #if NAS_SELECTOR_FIFO && NAS_SELECTOR_HISTOGRAM
 #error "Select either persistent FIFO bins or rebuilt histograms, not both"
 #endif
+// Independent opt-ins for the winner-loop experiment. Both zero reproduces
+// the previous FIFO path, including its storage layout and per-bin checks.
+#ifndef NAS_FIFO_CACHE_OLDEST
+#define NAS_FIFO_CACHE_OLDEST 0
+#endif
+#ifndef NAS_FIFO_SKIP_STATIC_CHECKS
+#define NAS_FIFO_SKIP_STATIC_CHECKS 0
+#endif
+#if (NAS_FIFO_CACHE_OLDEST || NAS_FIFO_SKIP_STATIC_CHECKS) && !NAS_SELECTOR_FIFO
+#error "FIFO winner optimizations require NAS_SELECTOR_FIFO=1"
+#endif
 
 namespace mirage { namespace runtime {
 #ifndef NAS_MOE_STATE_SLOTS
@@ -169,8 +180,12 @@ struct ExperimentalMoeFifo {
   uint32_t next[EXPERIMENTAL_MOE_PENDING_ROWS];
   uint32_t active[EXPERIMENTAL_MOE_PENDING_ROWS];
   uint32_t active_count;
-  // The head member's slot already stores ready_ns. Its logical operation
-  // cannot finish/reuse that slot while any of its members remain pending.
+  // The head member's slot retains ready_ns until all its members complete.
+  // Optional duplication saves the dependent head -> slot lookup on every
+  // winner scan. Only first append and a partial dispatch change a bin's age.
+#if NAS_FIFO_CACHE_OLDEST
+  uint64_t oldest[EXPERIMENTAL_MOE_SELECTION_BINS];
+#endif
 };
 
 struct ExperimentalMoeState {

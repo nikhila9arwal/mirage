@@ -33,6 +33,9 @@ __host__ __device__
 #endif
 void act(Fixture &f, Action a) {
   if (a.kind == APPEND) {
+    // Match the production ready() precondition. Operator fields never change
+    // during replay, so skipping the duplicate winner-loop check is valid.
+    assert(f.operators[a.key/128].present && f.operators[a.key/128].enabled);
     auto &slot = f.pending[a.member / (P*R)];
     uint32_t offset = a.member % (P*R);
     assert(!(slot.pending_mask & (1u << offset)));
@@ -42,11 +45,11 @@ void act(Fixture &f, Action a) {
     assert(slot.op_id == a.key / 128 && slot.ready_ns == a.time);
     slot.experts[offset/R][offset%R] = a.key % 128;
     slot.pending_mask |= 1u << offset;
-    assert(experimental_moe_fifo_append(f.fifo,a.key,a.member));
+    assert(experimental_moe_fifo_append(f.fifo,a.key,a.member,a.time));
   } else if (a.kind == SELECT) {
     f.selected = experimental_moe_select_fifo(f.pending,f.operators,f.fifo,a.time);
   } else if (a.kind == COMMIT) {
-    assert(experimental_moe_fifo_commit(f.fifo,f.selected));
+    assert(experimental_moe_fifo_commit(f.fifo,f.pending,f.selected));
     for (uint32_t j=0; j<f.selected.count; ++j) {
       auto &row = f.pending[f.selected.slots[j]];
       uint32_t bit = 1u << (f.selected.tokens[j]*R+f.selected.branches[j]);
@@ -119,6 +122,12 @@ int main() {
         index=f.fifo.next[index];
       }
       assert(index==UINT32_MAX && f.fifo.tail[key]==q.back());
+#if NAS_FIFO_CACHE_OLDEST
+      // The oracle follows the head even when the selector uses cached age.
+      // This catches a stale age after partial dispatch, empty-bin reuse, or
+      // prepare_kernel-style reset (which deliberately leaves age bytes alone).
+      assert(f.fifo.oldest[key]==f.pending[q.front()/(P*R)].ready_ns);
+#endif
     }
     for (uint32_t key=0; key<EXPERIMENTAL_MOE_SELECTION_BINS; ++key)
       if (!queues.count(key)) assert(f.fifo.count[key]==0);
@@ -202,9 +211,9 @@ int main() {
     step({SELECT,0,0,now}); step({COMMIT,0,0,0}); check();
   }
   assert(empty && selected_rows && (P==1 || oversized));
-  assert(!experimental_moe_fifo_append(f.fifo,EXPERIMENTAL_MOE_SELECTION_BINS,0));
-  assert(!experimental_moe_fifo_append(f.fifo,0,N));
-  assert(!experimental_moe_fifo_commit(f.fifo,ExperimentalMoeSelection{}));
+  assert(!experimental_moe_fifo_append(f.fifo,EXPERIMENTAL_MOE_SELECTION_BINS,0,now));
+  assert(!experimental_moe_fifo_append(f.fifo,0,N,now));
+  assert(!experimental_moe_fifo_commit(f.fifo,f.pending,ExperimentalMoeSelection{}));
 #ifdef __CUDACC__
   Fixture *device; Action *device_actions; ExperimentalMoeSelection *device_results;
   cuda_check(cudaMalloc(&device,sizeof(Fixture)));
@@ -224,7 +233,16 @@ int main() {
   cuda_check(cudaFree(device)); cuda_check(cudaFree(device_actions)); cuda_check(cudaFree(device_results));
   std::cout<<"GPU replay passed; ";
 #endif
-  std::cout<<"CPU passed: "<<actions.size()<<" actions, "<<selections.size()
+  // Compare this digest across build switches: timing-free selection and FIFO
+  // membership must remain identical, including the equal-age tie breaker.
+  uint64_t digest=14695981039346656037ull;
+  auto mix=[&](uint32_t value) { digest=(digest^value)*1099511628211ull; };
+  for (auto const &selected : selections) {
+    mix(uint32_t(selected.op_id)); mix(selected.expert); mix(selected.reason);
+    mix(selected.group_count); mix(selected.count); mix(selected.active_bin_index);
+    for (uint32_t member : members(selected)) mix(member);
+  }
+  std::cout<<"selection_digest="<<digest<<"; CPU passed: "<<actions.size()<<" actions, "<<selections.size()
            <<" selections, "<<oversized<<" oversized winners, FIFO bytes="
            <<sizeof(ExperimentalMoeFifo)<<"\n";
 }

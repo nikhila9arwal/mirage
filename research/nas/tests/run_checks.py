@@ -7,12 +7,14 @@ Generated binaries stay outside Git in research/nas/.build.
 import argparse
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 
 SESSION = Path(__file__).resolve().parents[1]
 ROOT = SESSION.parents[1]
-OPTIONS = {'baseline': (0, 0)}
+OPTIONS = {'baseline': (0, 0), 'cached': (1, 0),
+           'checks_only': (0, 1), 'fast': (1, 1)}
 
 
 def main():
@@ -26,6 +28,7 @@ def main():
               '-DNAS_MOE_LAYERS=48', '-DNAS_MOE_STATE_SLOTS=16']
     source = str(SESSION / 'tests/test_fifo.cc')
     for p, r in ((1, 1), (4, 8)):
+        expected_digest = None
         for name, (cache, skip) in OPTIONS.items():
             flags = [f'-DNAS_PREFILL_CHUNK_ROWS={p}', f'-DNAS_MOE_TOP_K={r}',
                      f'-DNAS_FIFO_CACHE_OLDEST={cache}',
@@ -34,8 +37,14 @@ def main():
             subprocess.run([os.environ.get('CXX', 'g++'), '-std=c++17', '-O2',
                             '-Wall', '-Wextra', '-pedantic', *common, *flags,
                             source, '-o', str(binary)], check=True)
-            subprocess.run([str(binary)], check=True)
-            if args.compile_gpu and (p, r) == (4, 8):
+            replay = subprocess.run([str(binary)], check=True, text=True,
+                                    capture_output=True)
+            print(name, replay.stdout.strip(), flush=True)
+            digest = re.search(r'selection_digest=(\d+)', replay.stdout).group(1)
+            if expected_digest is not None:
+                assert digest == expected_digest, 'Optimization changed selection'
+            expected_digest = digest
+            if args.compile_gpu and (p, r) == (4, 8) and name != 'checks_only':
                 subprocess.run([os.environ.get('NVCC', 'nvcc'), '-std=c++17',
                                 '-O2', '-arch=sm_90a', '-x', 'cu', *common,
                                 *flags, source, '-o',

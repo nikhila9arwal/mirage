@@ -24,6 +24,8 @@ python3 research/nas/tests/run_checks.py
 ```
 
 `CXX` selects the compiler. Binaries go to ignored `research/nas/.build/`.
+All four cache/check combinations run at P=1/R=1 and P=4/R=8, and their
+selection digests must match. The tests include partial drains, reuse, and reset.
 The runner also executes the measurement accounting unit tests. To compile the
 small GPU replay with NVCC, without launching a GPU workload:
 
@@ -96,3 +98,36 @@ for FIFO on the same GH200, with identical 663-token NAS output. These are
 single invocations, not variance estimates. The FIFO diagnostic took 77.331 s;
 choosing the winning bin remained the largest selection cost. Original raw
 results remain on the source machine, outside Git.
+
+## Optional winner-loop optimization
+
+The latest commit adds two independent, compile-time opt-ins, both default off:
+
+- `NAS_FIFO_CACHE_OLDEST=1`: keep each bin's head timestamp in `oldest[key]`.
+  First append initializes it; partial dispatch updates it from the new head.
+  The winner loop avoids repeatedly chasing head -> slot -> timestamp.
+- `NAS_FIFO_SKIP_STATIC_CHECKS=1`: omit duplicate present/enabled checks in the
+  winner loop. The existing readiness and host validation remain enabled.
+
+No threshold, timeout, tie-breaking, publication, completion, or iteration
+semantics change. The cache adds 192 KiB plus four alignment bytes for the
+48-layer configuration. These switches require `NAS_SELECTOR_FIFO=1`.
+
+| Selector name | Cache oldest | Skip duplicate checks |
+|---|---:|---:|
+| `fifo` | 0 | 0 |
+| `fifo_cached` | 1 | 0 |
+| `fifo_cached_unchecked` | 1 | 1 |
+
+The launcher defaults to two uninstrumented controls (baseline and both
+changes), followed by baseline/cached/both diagnostic invocations. To run
+the baseline implementation only:
+
+```bash
+sbatch research/nas/measurement/run.sbatch baseline
+```
+
+The original comparison was submitted as job 3530459 from the isolated source
+copy. Its GPU results are not claimed by this publishing snapshot. CPU replay
+and CUDA compilation passed there. The preserved `nas-fifo-baseline` Git tag
+and both switches set to zero provide independent rollback paths.
