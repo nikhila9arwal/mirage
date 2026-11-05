@@ -526,6 +526,10 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     bool const row = name == "silu_mul_row";
     int variant_id = task_register->register_silu_mul_task(customized->bgraph, params, row);
     task_config[op] = std::make_tuple(1, 1, row ? TASK_SILU_MUL_ROW : TASK_SILU_MUL, variant_id);
+  } else if (name == "gather_last_slot_row") {
+    int variant_id = task_register->register_gather_last_slot_row_task(
+        customized->bgraph, params);
+    task_config[op] = std::make_tuple(1, 1, TASK_IDENTITY, variant_id);
   } else if (name == "identity") {
     int variant_id =
         task_register->register_identity_task(customized->bgraph, params);
@@ -535,6 +539,10 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         customized->bgraph, params);
     task_config[op] =
         std::make_tuple(3, 1, TASK_SILU_MUL_LINEAR_WITH_RESIDUAL, variant_id);
+  } else if (name == "argmax_row") {
+    int variant_id =
+        task_register->register_argmax_row_task(customized->bgraph, params);
+    task_config[op] = std::make_tuple(1, 1, TASK_ARGMAX_ROW, variant_id);
   } else if (name == "argmax") {
     task_config[op] = std::make_tuple(1, 1, TASK_ARGMAX, 0);
   } else if (name == "argmax_partial") {
@@ -586,17 +594,26 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
   } else if (name == "attention_slot_hopper") {
     int variant_id = task_register->register_attention_slot_hopper_task(customized->bgraph, params);
     // K/V cache writes are outputs as well as inputs for ownership/dependencies.
-    task_config[op] = std::make_tuple(3, 3, TASK_ATTENTION_SLOT_HOPPER, variant_id);
+    // Registration validates optional Q/K norm and RoPE input pairs. The
+    // final three views always describe the same O/K/V outputs.
+    int num_inputs = static_cast<int>(customized->bgraph.operators.size()) - 3;
+    task_config[op] = std::make_tuple(num_inputs, 3, TASK_ATTENTION_SLOT_HOPPER, variant_id);
   } else if (name == "checksum_hopper") {
     int variant_id = task_register->register_checksum_hopper_task(customized->bgraph, params);
     task_config[op] = std::make_tuple(2, 1, TASK_CHECKSUM_HOPPER, variant_id);
   } else if (name == "moe_top1_row") {
     int variant_id = task_register->register_moe_top1_row_task(customized->bgraph, params);
     task_config[op] = std::make_tuple(1, 2, TASK_MOE_TOP1_ROW, variant_id);
+  } else if (name == "moe_topk_row") {
+    int variant_id = task_register->register_moe_topk_row_task(customized->bgraph, params);
+    task_config[op] = std::make_tuple(1, 2, TASK_MOE_TOPK_ROW, variant_id);
   } else if (name == "moe_slot_w13" || name == "moe_slot_w2") {
     bool const w13 = name == "moe_slot_w13";
     int variant_id = task_register->register_moe_slot_task(customized->bgraph, params, w13);
     task_config[op] = std::make_tuple(3, 1, w13 ? TASK_MOE_SLOT_W13 : TASK_MOE_SLOT_W2, variant_id);
+  } else if (name == "moe_weighted_sum") {
+    int variant_id = task_register->register_moe_weighted_sum_task(customized->bgraph, params);
+    task_config[op] = std::make_tuple(2, 1, TASK_MOE_WEIGHTED_SUM, variant_id);
   } else if (name == "linear_qkv_hopper" || name == "linear_wo_hopper") {
     TaskType type = name == "linear_qkv_hopper" ? TASK_LINEAR_QKV_HOPPER : TASK_LINEAR_WO_HOPPER;
     int variant_id = task_register->register_linear_swapAB_hopper_task(customized->bgraph, params, false, type);

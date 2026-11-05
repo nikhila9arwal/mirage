@@ -133,18 +133,59 @@ static PyObject *init_func(PyObject *self, PyObject *args) {
   config.context_inputs = config.context_slot_inputs = nullptr;
   config.context_saved_outputs = nullptr;
   config.context_slot_outputs = nullptr;
+  config.context_predicted_tokens = nullptr;
+  config.context_generated_tokens = nullptr;
+  config.num_decode_requests = -1;
+  config.decode_prefix_lengths = nullptr;
+  config.decode_generated_lengths = nullptr;
+  config.prefill_chunk_capacity = 0;
+  config.decode_prompt_lengths = nullptr;
+  g_request_kv_bindings.clear();
   if (context_io != Py_None) {
     unsigned long long inputs, saved, slot_inputs, slot_outputs;
-    if (!PyArg_ParseTuple(context_io, "KKKKiiii|ii", &inputs, &saved, &slot_inputs,
+    unsigned long long predicted_tokens = 0, generated_tokens = 0;
+    unsigned long long prefix_lengths = 0, generated_lengths = 0;
+    unsigned long long prompt_lengths = 0;
+    PyObject *cache_bindings = Py_None;
+    if (!PyArg_ParseTuple(context_io, "KKKKiiii|iiKKiKKOiK", &inputs, &saved, &slot_inputs,
                           &slot_outputs, &config.num_contexts,
                           &config.context_input_width, &config.context_output_width,
                           &config.context_input_is_int64,
-                          &config.context_sequence_length, &config.context_prefix_length))
+                          &config.context_sequence_length, &config.context_prefix_length,
+                          &predicted_tokens, &generated_tokens,
+                          &config.num_decode_requests, &prefix_lengths,
+                          &generated_lengths, &cache_bindings,
+                          &config.prefill_chunk_capacity, &prompt_lengths))
       return NULL;
     config.context_inputs = reinterpret_cast<void const *>(inputs);
     config.context_saved_outputs = reinterpret_cast<__nv_bfloat16 *>(saved);
     config.context_slot_inputs = reinterpret_cast<void *>(slot_inputs);
     config.context_slot_outputs = reinterpret_cast<__nv_bfloat16 const *>(slot_outputs);
+    config.context_predicted_tokens = reinterpret_cast<int64_t const *>(predicted_tokens);
+    config.context_generated_tokens = reinterpret_cast<int64_t *>(generated_tokens);
+    config.decode_prefix_lengths = reinterpret_cast<int32_t const *>(prefix_lengths);
+    config.decode_generated_lengths = reinterpret_cast<int32_t *>(generated_lengths);
+    config.decode_prompt_lengths = reinterpret_cast<int32_t const *>(prompt_lengths);
+    if (config.num_decode_requests >= 0) {
+      if (!PyList_Check(cache_bindings)) {
+        PyErr_SetString(PyExc_TypeError, "Request KV bindings must be a list");
+        return NULL;
+      }
+      // Runtime initialization validates graph ownership before uploading these
+      // immutable bindings. This launcher only unpacks the Python arguments.
+      for (Py_ssize_t i = 0; i < PyList_Size(cache_bindings); i++) {
+        unsigned long long slot_k, slot_v, prefix_k, prefix_v;
+        int heads;
+        if (!PyArg_ParseTuple(PyList_GetItem(cache_bindings, i), "KKKKi",
+                              &slot_k, &slot_v, &prefix_k, &prefix_v, &heads))
+          return NULL;
+        g_request_kv_bindings.push_back({
+            reinterpret_cast<__nv_bfloat16 *>(slot_k),
+            reinterpret_cast<__nv_bfloat16 *>(slot_v),
+            reinterpret_cast<__nv_bfloat16 const *>(prefix_k),
+            reinterpret_cast<__nv_bfloat16 const *>(prefix_v), heads});
+      }
+    }
   }
 #else
   if (context_io != Py_None) {
@@ -517,6 +558,9 @@ class PersistentKernel:
         self.task_graph_mode = task_graph_mode
         self._data_slot_ids = None
         self._context_io = None  # Keep caller-owned CUDA buffers alive through finalize().
+        self._context_autoregressive = None
+        self._context_requests = None
+        self._context_prefill = None
         if task_graph_mode == "resident_data":
             if mode != "offline" or world_size != 1 or num_remote_schedulers != 0:
                 raise ValueError("The resident port supports single-GPU offline execution")
@@ -760,6 +804,8 @@ class PersistentKernel:
         metadata = {
             "mode": self.mode,
             "task_graph_mode": self.task_graph_mode,
+            "context_chunk_size": getattr(self, "_context_chunk_size", 1),
+            "context_prefill": getattr(self, "_context_prefill_enabled", False),
             "max_seq_length": self.max_seq_length,
             "max_num_batched_requests": self.max_num_batched_requests,
             "max_num_batched_tokens": self.max_num_batched_tokens,
@@ -784,6 +830,14 @@ class PersistentKernel:
         saved_graph_mode = saved.get("task_graph_mode", "legacy_event")
         if saved_graph_mode != self.task_graph_mode:
             errors.append(f"task_graph_mode: saved={saved_graph_mode}, current={self.task_graph_mode}")
+        saved_chunk = saved.get("context_chunk_size", 1)
+        current_chunk = getattr(self, "_context_chunk_size", 1)
+        if saved_chunk != current_chunk:
+            errors.append(f"context_chunk_size: saved={saved_chunk}, current={current_chunk}")
+        saved_prefill = saved.get("context_prefill", False)
+        current_prefill = getattr(self, "_context_prefill_enabled", False)
+        if saved_prefill != current_prefill:
+            errors.append(f"context_prefill: saved={saved_prefill}, current={current_prefill}")
         checks = [
             ("mode", self.mode),
             ("max_seq_length", self.max_seq_length),
@@ -1447,35 +1501,83 @@ class PersistentKernel:
             f"{group_id}, which declares {group_window}")
         return block_size
 
+    @staticmethod
+    def _chunk_slot_count(rows, chunk_rows_per_task):
+        """A slot owns P adjacent token rows; a physical task owns that chunk."""
+        if (type(chunk_rows_per_task) is not int or not 1 <= chunk_rows_per_task <= 4
+                or rows <= 0 or rows % chunk_rows_per_task):
+            raise ValueError("Chunk rows per task must be 1..4 and divide the token-row count")
+        return rows // chunk_rows_per_task
+
     def attention_slot_layer(
         self, qkv: DTensor, k_cache: DTensor, v_cache: DTensor, output: DTensor,
         grid_dim: Optional[tuple] = None, block_dim: tuple = (256, 1, 1),
+        *, q_norm: Optional[DTensor] = None, k_norm: Optional[DTensor] = None,
+        cos_pos_embed: Optional[DTensor] = None,
+        sin_pos_embed: Optional[DTensor] = None, qk_norm_eps: float = 1e-6,
+        chunk_rows_per_task: int = 1,
     ):
-        """Bounded attention with a private 64-token page per slot.
+        """Bounded GQA with a private 64-token page per slot, D=128.
 
-        QKV is packed as [Q0,Q1,Q2,Q3,K,V] for each KV head, with head width
-        128. By default each pass attends to 63 fixed prefix entries plus its
-        current input and overwrites cache position 63 (V0). Compiling with
-        context_sequence=(steps, prefix_length) instead appends one token per
-        slot epoch and attends to prefix_length+epoch entries (V1, at most 64).
+        Each KV-head group is packed [Q0,...,Q(R-1),K,V]; R is derived from
+        the output/cache shapes (currently validated for 4 or 8). Optional
+        Q/K RMSNorm and full-head RoPE reuse the ordinary paged-attention kernel.
+        Supply each pair together; omitting both preserves the original API.
+        Read-only weights/tables are shared across slots and head tasks.
+
+        V0 overwrites position 63. context_sequence=(steps, prefix_length)
+        instead appends at prefix_length+epoch-1 (V1, at most 64 tokens).
         K/V appear as both inputs and outputs to expose the in-place writes.
+        chunk_rows_per_task=P uses activations[S*P,F] and caches[S,64,Hkv,D].
+        context_prefill appends successive full chunks, then uses one active
+        row per decode pass while retaining these capacity-P tensor views.
         """
+        import math
+        import struct
         if self.target_cc != 90 or self.task_graph_mode != "resident_data":
             raise ValueError("Slot attention requires Hopper resident_data")
         if (qkv.num_dims != 2 or output.num_dims != 2
                 or k_cache.num_dims != 4 or v_cache.num_dims != 4):
-            raise ValueError("Expected QKV[S,Hkv*768], output[S,Hkv*512], caches[S,64,Hkv,128]")
-        slots, kv_heads = qkv.dim(0), k_cache.dim(2)
-        cache_shape = (slots, 64, kv_heads, 128)
-        if (slots <= 0 or kv_heads <= 0 or qkv.dim(1) != kv_heads * 768
-                or output.dim(0) != slots or output.dim(1) != kv_heads * 512
+            raise ValueError("Expected QKV/output rows and caches[S,P,Hkv,D]")
+        slots = self._chunk_slot_count(qkv.dim(0), chunk_rows_per_task)
+        page_size, kv_heads, head_dim = (k_cache.dim(i) for i in (1, 2, 3))
+        if (slots <= 0 or kv_heads <= 0 or head_dim != 128 or page_size != 64
+                or output.dim(0) != qkv.dim(0) or output.dim(1) % head_dim != 0):
+            raise ValueError("Slot attention requires D=128 and one 64-token page per slot")
+        # Same shape-derived head counts as paged_attention_layer(). The
+        # fixed page/head limits are explicit; group widths are not constants.
+        q_heads = output.dim(1) // head_dim
+        if q_heads % kv_heads != 0 or q_heads // kv_heads not in (4, 8):
+            raise ValueError("Slot attention currently supports GQA ratios 4 and 8")
+        ratio = q_heads // kv_heads
+        cache_shape = (slots, page_size, kv_heads, head_dim)
+        if (qkv.dim(1) != kv_heads * (ratio + 2) * head_dim
                 or tuple(k_cache.dim(i) for i in range(4)) != cache_shape
                 or tuple(v_cache.dim(i) for i in range(4)) != cache_shape):
-            raise ValueError("Slot attention requires GQA ratio 4, head width 128, and one 64-token page")
+            raise ValueError("Slot attention QKV/cache dimensions disagree with the head layout")
+        if (q_norm is None) != (k_norm is None):
+            raise ValueError("Supply both q_norm and k_norm, or neither")
+        if (cos_pos_embed is None) != (sin_pos_embed is None):
+            raise ValueError("Supply both cosine and sine tables, or neither")
+        qk_norm, rope = q_norm is not None, cos_pos_embed is not None
+        if not math.isfinite(qk_norm_eps) or qk_norm_eps <= 0:
+            raise ValueError("qk_norm_eps must be finite and positive")
+        eps_bits = struct.unpack("i", struct.pack("f", qk_norm_eps))[0]
+        readonly = []
+        if qk_norm:
+            for tensor in (q_norm, k_norm):
+                if tensor.num_dims != 1 or tensor.dim(0) != head_dim:
+                    raise ValueError("Q/K normalization weights must have shape [D]")
+            readonly += [q_norm, k_norm]
+        if rope:
+            for tensor in (cos_pos_embed, sin_pos_embed):
+                if tensor.num_dims != 2 or tensor.dim(0) < page_size or tensor.dim(1) != head_dim:
+                    raise ValueError("Full-head RoPE tables must have shape [at least 64,D]")
+            readonly += [cos_pos_embed, sin_pos_embed]
         tensors = (qkv, k_cache, v_cache, output)
         if len({tensor.guid for tensor in tensors}) != len(tensors):
             raise ValueError("QKV, output, K cache, and V cache must be distinct tensors")
-        for tensor in tensors:
+        for tensor in (*tensors, *readonly):
             _, strides = self.kn_graph.cygraph.get_input_dtensor_shape_and_stride(tensor)
             expected, stride = [], 1
             for axis in range(tensor.num_dims - 1, -1, -1):
@@ -1490,14 +1592,19 @@ class PersistentKernel:
             raise ValueError("Slot attention requires grid=(S,Hkv,1), block=(256,1,1)")
 
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
-        # The three output views alias O/K/V storage directly. No allocation
-        # or cache copy is introduced by declaring these mutations.
-        views = [qkv, k_cache, v_cache, output, k_cache, v_cache]
-        for index, tensor in enumerate(views):
-            head_axis = 1 if index in (0, 3) else 2
+        # Inputs precede outputs. Only activations/caches are partitioned;
+        # every head task reads the same immutable normalization/RoPE tables.
+        inputs = [qkv, k_cache, v_cache] + readonly
+        outputs = [output, k_cache, v_cache]
+        for tensor, head_axis in ((qkv, 1), (k_cache, 2), (v_cache, 2)):
             tb_graph.new_input(tensor, (0, head_axis, -1), -1, True)
-        self.kn_graph.customized(views, tb_graph)
-        self.kn_graph.register_task(tb_graph, "attention_slot_hopper")
+        for tensor in readonly:
+            tb_graph.new_input(tensor, (-1, -1, -1), -1, True)
+        for tensor, head_axis in ((output, 1), (k_cache, 2), (v_cache, 2)):
+            tb_graph.new_input(tensor, (0, head_axis, -1), -1, True)
+        self.kn_graph.customized(inputs + outputs, tb_graph)
+        self.kn_graph.register_task(tb_graph, "attention_slot_hopper",
+                                    [int(qk_norm), int(rope), eps_bits])
 
     def paged_attention_layer(
         self,
@@ -2168,53 +2275,76 @@ class PersistentKernel:
 
         self.kn_graph.register_task(tb_graph, "tensor_init")
     
-    def moe_top1_row_layer(
-        self, input: DTensor, top1_weight: DTensor, routing_indices: DTensor,
-        grid_dim: tuple, block_dim: tuple,
+    def moe_topk_row_layer(
+        self, input: DTensor, topk_weight: DTensor, routing_indices: DTensor,
+        grid_dim: tuple, block_dim: tuple, *, chunk_rows_per_task: int = 1,
     ):
-        """Experimental private top-1 routing: one Hopper task per slot.
+        """Experimental private top-k routing: one Hopper task per slot.
 
         logits[S,128] are writable BF16 scratch: the reused MPK kernel clears
-        them. It writes FP32 weights[S,1] and int32 ranks[S,128]. Each ranks row
-        contains one 1 and otherwise zeros. No shared active-expert list is
-        produced; the batch controller reads these private results instead.
+        them. It writes renormalized FP32 weights[S,R] and int32 ranks[S,128],
+        with ranks 1..R for selected experts and zero otherwise. R is 1..8 and
+        must match NAS_MOE_TOP_K in the batching runtime. No shared active
+        expert list is produced. With chunk_rows_per_task=P, shapes use S*P
+        token rows and grid.x=S; one logical task routes the complete chunk.
         """
         if self.target_cc != 90 or self.task_graph_mode != "resident_data":
-            raise ValueError("Private top-1 requires Hopper resident_data")
+            raise ValueError("Private top-k requires Hopper resident_data")
         if (input.num_dims != 2 or input.dim(0) <= 0 or input.dim(1) != 128
-                or top1_weight.num_dims != 2 or routing_indices.num_dims != 2
-                or top1_weight.dim(0) != input.dim(0) or top1_weight.dim(1) != 1
+                or topk_weight.num_dims != 2 or routing_indices.num_dims != 2
+                or topk_weight.dim(0) != input.dim(0) or not 1 <= topk_weight.dim(1) <= 8
                 or routing_indices.dim(0) != input.dim(0) or routing_indices.dim(1) != 128):
-            raise ValueError("Expected logits[S,128], weights[S,1], ranks[S,128]")
-        if tuple(grid_dim) != (input.dim(0), 1, 1) or tuple(block_dim) != (256, 1, 1):
-            raise ValueError("Private top-1 requires grid=(S,1,1), block=(256,1,1)")
-        for tensor, dtype in ((input, bfloat16), (top1_weight, float32), (routing_indices, int32)):
+            raise ValueError("Expected logits[S,128], weights[S,R], ranks[S,128], with R in 1..8")
+        slots = self._chunk_slot_count(input.dim(0), chunk_rows_per_task)
+        if tuple(grid_dim) != (slots, 1, 1) or tuple(block_dim) != (256, 1, 1):
+            raise ValueError("Private top-k requires grid=(S,1,1), block=(256,1,1)")
+        for tensor, dtype in ((input, bfloat16), (topk_weight, float32), (routing_indices, int32)):
             _, strides = self.kn_graph.cygraph.get_input_dtensor_shape_and_stride(tensor)
             if tensor.dtype != dtype or tuple(strides) != (tensor.dim(1), 1):
-                raise ValueError("Private top-1 requires contiguous BF16/FP32/int32 views")
+                raise ValueError("Private top-k requires contiguous BF16/FP32/int32 views")
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
-        for tensor in (input, top1_weight, routing_indices):
+        for tensor in (input, topk_weight, routing_indices):
             tb_graph.new_input(tensor, (0, -1, -1), -1, True)
-        self.kn_graph.customized([input, top1_weight, routing_indices], tb_graph)
-        self.kn_graph.register_task(tb_graph, "moe_top1_row")
+        self.kn_graph.customized([input, topk_weight, routing_indices], tb_graph)
+        self.kn_graph.register_task(tb_graph, "moe_topk_row")
+
+    def moe_top1_row_layer(
+        self, input: DTensor, top1_weight: DTensor, routing_indices: DTensor,
+        grid_dim: tuple, block_dim: tuple, *, chunk_rows_per_task: int = 1,
+    ):
+        """Compatibility wrapper for private routing with R=1."""
+        if top1_weight.num_dims != 2 or top1_weight.dim(1) != 1:
+            raise ValueError("Private top-1 requires weights[S,1]")
+        self.moe_topk_row_layer(input, top1_weight, routing_indices, grid_dim, block_dim,
+                                 chunk_rows_per_task=chunk_rows_per_task)
 
     def _moe_slot_linear_layer(
         self, input: DTensor, weight: DTensor, routing_indices: DTensor,
         output: DTensor, grid_dim: tuple, block_dim: tuple, *, w13: bool,
+        chunk_rows_per_task: int = 1,
     ):
-        # These are logical dependencies, not physical GEMM launches. A batch
-        # may complete several such private output rows at different epochs.
+        # One logical output per slot joins all P*R token/branch members.
+        # Activations flatten [S,P,...] to [S*P,...]; weights stay shared.
+        # The batching controller performs the physical GEMM launches.
         if self.target_cc != 90 or self.task_graph_mode != "resident_data":
             raise ValueError("Logical slot MoE requires Hopper resident_data")
-        if (input.num_dims != 2 or weight.num_dims != 3 or output.num_dims != 2
-                or routing_indices.num_dims != 2 or input.dim(0) <= 0
-                or input.dim(1) <= 0 or weight.dim(0) != 128 or weight.dim(1) <= 0
-                or weight.dim(2) != input.dim(1) or output.dim(0) != input.dim(0)
-                or output.dim(1) != weight.dim(1)
+        legacy = input.num_dims == 2 and output.num_dims == 2
+        joined = output.num_dims == 3 and input.num_dims == (2 if w13 else 3)
+        if not (legacy or joined) or weight.num_dims != 3 or routing_indices.num_dims != 2:
+            raise ValueError("Expected W13 x[S,K], y[S,R,N] or W2 x[S,R,K], y[S,R,N]; 2D views support R=1")
+        top_k = 1 if legacy else output.dim(1)
+        reduction_size = input.dim(input.num_dims - 1)
+        output_size = output.dim(output.num_dims - 1)
+        if (input.dim(0) <= 0 or not 1 <= top_k <= 8
+                or reduction_size <= 0 or weight.dim(0) != 128 or weight.dim(1) <= 0
+                or weight.dim(2) != reduction_size or output.dim(0) != input.dim(0)
+                or output_size != weight.dim(1)
+                or (not w13 and joined and input.dim(1) != top_k)
                 or routing_indices.dim(0) != input.dim(0) or routing_indices.dim(1) != 128
-                or input.dim(1) % 128 or output.dim(1) % (256 if w13 else 64)):
-            raise ValueError("Expected x[S,K], W[128,N,K], ranks[S,128], y[S,N]; K%128=0 and N aligned")
-        if tuple(grid_dim) != (input.dim(0), 1, 1) or tuple(block_dim) != (256, 1, 1):
+                or reduction_size % 128 or output_size % (256 if w13 else 64)):
+            raise ValueError("Expected matching slot/top-k views, W[128,N,K], ranks[S,128]; R in 1..8, K%128=0 and N aligned")
+        slots = self._chunk_slot_count(input.dim(0), chunk_rows_per_task)
+        if tuple(grid_dim) != (slots, 1, 1) or tuple(block_dim) != (256, 1, 1):
             raise ValueError("Logical slot MoE requires grid=(S,1,1), block=(256,1,1)")
         for tensor, dtype in ((input, bfloat16), (weight, bfloat16),
                               (routing_indices, int32), (output, bfloat16)):
@@ -2233,15 +2363,52 @@ class PersistentKernel:
         self.kn_graph.customized([input, weight, routing_indices, output], tb_graph)
         self.kn_graph.register_task(tb_graph, "moe_slot_w13" if w13 else "moe_slot_w2")
 
-    def moe_slot_w13_layer(self, input, weight, routing_indices, output, grid_dim, block_dim):
-        """Logical row W13; requires the experimental MoE batching runtime."""
+    def moe_slot_w13_layer(self, input, weight, routing_indices, output, grid_dim, block_dim,
+                           *, chunk_rows_per_task: int = 1):
+        """Joined W13: x[S,H] to y[S,R,2I]; 2D output is supported for R=1."""
         self._moe_slot_linear_layer(input, weight, routing_indices, output,
-                                   grid_dim, block_dim, w13=True)
+                                   grid_dim, block_dim, w13=True,
+                                   chunk_rows_per_task=chunk_rows_per_task)
 
-    def moe_slot_w2_layer(self, input, weight, routing_indices, output, grid_dim, block_dim):
-        """Logical row W2; requires the experimental MoE batching runtime."""
+    def moe_slot_w2_layer(self, input, weight, routing_indices, output, grid_dim, block_dim,
+                           *, chunk_rows_per_task: int = 1):
+        """Joined W2: x[S,R,I] to y[S,R,H]; 2D views are supported for R=1."""
         self._moe_slot_linear_layer(input, weight, routing_indices, output,
-                                   grid_dim, block_dim, w13=False)
+                                   grid_dim, block_dim, w13=False,
+                                   chunk_rows_per_task=chunk_rows_per_task)
+
+    def moe_weighted_sum_layer(
+        self, input: DTensor, weight: DTensor, output: DTensor,
+        grid_dim: tuple, block_dim: tuple, *, chunk_rows_per_task: int = 1,
+    ):
+        """Reduce BF16 branches[S,R,H] with FP32 weights[S,R] to BF16 y[S,H].
+
+        One task per slot sums in FP32 and adds no residual. With P token
+        rows per task, each token independently reduces its own R branches.
+        """
+        if self.target_cc != 90 or self.task_graph_mode != "resident_data":
+            raise ValueError("Slot MoE weighted sum requires Hopper resident_data")
+        if (input.num_dims != 3 or weight.num_dims != 2 or output.num_dims != 2
+                or input.dim(0) <= 0 or not 1 <= input.dim(1) <= 8 or input.dim(2) <= 0
+                or weight.dim(0) != input.dim(0) or weight.dim(1) != input.dim(1)
+                or output.dim(0) != input.dim(0) or output.dim(1) != input.dim(2)):
+            raise ValueError("Expected branches[S,R,H], weights[S,R], output[S,H], with R in 1..8")
+        slots = self._chunk_slot_count(input.dim(0), chunk_rows_per_task)
+        if tuple(grid_dim) != (slots, 1, 1) or tuple(block_dim) != (256, 1, 1):
+            raise ValueError("Slot MoE weighted sum requires grid=(S,1,1), block=(256,1,1)")
+        for tensor, dtype in ((input, bfloat16), (weight, float32), (output, bfloat16)):
+            _, strides = self.kn_graph.cygraph.get_input_dtensor_shape_and_stride(tensor)
+            expected, stride = [], 1
+            for axis in range(tensor.num_dims - 1, -1, -1):
+                expected.insert(0, stride)
+                stride *= tensor.dim(axis)
+            if tensor.dtype != dtype or tuple(strides) != tuple(expected):
+                raise ValueError("Slot MoE weighted sum requires contiguous BF16 branches/output and FP32 weights")
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        for tensor in (input, weight, output):
+            tb_graph.new_input(tensor, (0, -1, -1), -1, True)
+        self.kn_graph.customized([input, weight, output], tb_graph)
+        self.kn_graph.register_task(tb_graph, "moe_weighted_sum")
 
     def moe_topk_softmax_routing_layer(
         self,
@@ -2514,13 +2681,35 @@ class PersistentKernel:
         output: DTensor,
         grid_dim: tuple,
         block_dim: tuple,
+        *, chunk_rows_per_task: int = 1,
     ):
         # Currently assume that input/output
         assert input.num_dims == 3 # (batch_size, num_expert_per_tok, 2 * intermediate_size)
         assert output.num_dims == 3 # (batch_size, num_expert_per_tok, intermediate_size)
+        slots = self._chunk_slot_count(input.dim(0), chunk_rows_per_task)
+        if chunk_rows_per_task > 1 and (self.target_cc != 90 or self.task_graph_mode != "resident_data"):
+            raise ValueError("Chunk SiLU requires Hopper resident_data")
+        joined_slot = (self.target_cc == 90 and self.task_graph_mode == "resident_data"
+                       and tuple(grid_dim) == (slots, 1, 1))
+        if chunk_rows_per_task > 1 and not joined_slot:
+            raise ValueError("Chunk SiLU requires grid=(slots,1,1)")
+        if joined_slot:
+            if (input.dim(0) <= 0 or not 1 <= input.dim(1) <= 8
+                    or output.dim(0) != input.dim(0) or output.dim(1) != input.dim(1)
+                    or output.dim(2) <= 0 or input.dim(2) != 2 * output.dim(2)):
+                raise ValueError("Joined slot SiLU requires x[S,R,2I], y[S,R,I], with R in 1..8")
+            if tuple(block_dim) != (256, 1, 1):
+                raise ValueError("Joined slot SiLU requires block=(256,1,1)")
+            for tensor in (input, output):
+                _, strides = self.kn_graph.cygraph.get_input_dtensor_shape_and_stride(tensor)
+                if tensor.dtype != bfloat16 or tuple(strides) != (tensor.dim(1) * tensor.dim(2), tensor.dim(2), 1):
+                    raise ValueError("Joined slot SiLU requires contiguous BF16 views")
+        # A joined slot task processes all P*R vectors. Other grids retain their
+        # existing partition across the expert dimension.
+        input_map = (0, -1, -1) if joined_slot else (0, 1, -1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
-        tb_graph.new_input(input, (0, 1, -1), -1, True)
-        tb_graph.new_input(output, (0, 1, -1), -1, True)
+        tb_graph.new_input(input, input_map, -1, True)
+        tb_graph.new_input(output, input_map, -1, True)
         self.kn_graph.customized([input, output], tb_graph)
         self.kn_graph.register_task(tb_graph, "moe_silu_mul")
 
@@ -2672,6 +2861,7 @@ class PersistentKernel:
         *,
         one_row_per_task: bool = False,
         batch_kind: str = None,
+        chunk_rows_per_task: Optional[int] = None,
     ):
         """Linear projection; optionally give each row its own Hopper task.
 
@@ -2683,20 +2873,33 @@ class PersistentKernel:
         batch_kind marks a row projection for optional runtime batching:
         "qkv" or "attention_projection". Both markers retain the same real
         row-linear kernel when batching is disabled. They do not alter edges.
+
+        chunk_rows_per_task=P instead gives each task P contiguous rows with
+        grid=(rows/P,1,1). It compiles the real P-row TMA view, not shifted
+        pointers to a one-row kernel. Experimental dense bins remain one-row.
         """
+        row_partitioned = one_row_per_task or chunk_rows_per_task is not None
+        rows_per_task = 1 if chunk_rows_per_task is None else chunk_rows_per_task
+        if chunk_rows_per_task is not None:
+            if one_row_per_task:
+                raise ValueError("Choose one_row_per_task or chunk_rows_per_task, not both")
+            if self.task_graph_mode != "resident_data":
+                raise ValueError("Chunk linear requires resident_data")
+            if batch_kind is not None:
+                raise ValueError("Experimental dense bins are not enabled for chunk linear")
         if batch_kind not in (None, "qkv", "attention_projection"):
             raise ValueError("batch_kind must be None, 'qkv', or 'attention_projection'")
         if batch_kind is not None and self.task_graph_mode != "resident_data":
             raise ValueError("Projection batching markers require resident_data")
         if batch_kind is not None and not one_row_per_task:
             raise ValueError("Projection batching markers require one_row_per_task=True")
-        if one_row_per_task and bias is not None:
+        if row_partitioned and bias is not None:
             raise ValueError("One-row Hopper linear does not support bias")
         # Currently assume that input/output
         assert input.num_dims == 2  # (batch_size, hidden_size / world_size)
         assert weight.num_dims == 2  # (hidden_size, hidden_size / world_size)
         assert output.num_dims == 2  # (batch_size, hidden_size)
-        if one_row_per_task:
+        if row_partitioned:
             if self.target_cc != 90:
                 raise ValueError("One-row linear currently supports Hopper")
             if (input.dim(0) <= 0 or input.dim(1) <= 0 or weight.dim(0) <= 0
@@ -2704,22 +2907,23 @@ class PersistentKernel:
                     or output.dim(1) != weight.dim(0)
                     or input.dim(1) % 128 or output.dim(1) % 64):
                 raise ValueError("Expected x[S,K], weight[N,K], y[S,N]; K multiple of 128, N multiple of 64")
-            if tuple(grid_dim) != (input.dim(0), 1, 1) or tuple(block_dim) != (256, 1, 1):
+            slots = self._chunk_slot_count(input.dim(0), rows_per_task)
+            if tuple(grid_dim) != (slots, 1, 1) or tuple(block_dim) != (256, 1, 1):
                 raise ValueError("One-row linear requires grid=(S,1,1), block=(256,1,1)")
             for tensor in (input, weight, output):
                 _, strides = self.kn_graph.cygraph.get_input_dtensor_shape_and_stride(tensor)
                 if tensor.dtype != bfloat16 or tuple(strides) != (tensor.dim(1), 1):
                     raise ValueError("One-row linear requires contiguous BF16 tensors")
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
-        tb_graph.new_input(input, (0, -1, -1) if one_row_per_task else (-1, -1, -1), 1, True)
-        tb_graph.new_input(weight, (-1, -1, -1) if one_row_per_task else (0, -1, -1), 1, True)
+        tb_graph.new_input(input, (0, -1, -1) if row_partitioned else (-1, -1, -1), 1, True)
+        tb_graph.new_input(weight, (-1, -1, -1) if row_partitioned else (0, -1, -1), 1, True)
         if bias is not None:
             assert bias.num_dims == 2  # (1, hidden_size) -- one shared row
             assert bias.dim(0) == 1
             assert bias.dim(1) == output.dim(1)
             # Same partition as the output: each task takes its column slice.
             tb_graph.new_input(bias, (1, -1, -1), -1, True)
-        tb_graph.new_input(output, (0, -1, -1) if one_row_per_task else (1, -1, -1), -1, True)
+        tb_graph.new_input(output, (0, -1, -1) if row_partitioned else (1, -1, -1), -1, True)
         graph_inputs = [input, weight] + ([bias] if bias is not None else [])
         self.kn_graph.customized(graph_inputs + [output], tb_graph)
 
@@ -2856,6 +3060,36 @@ class PersistentKernel:
         self.kn_graph.customized([input, output], tb_graph)
         self.kn_graph.register_task(tb_graph, "silu_mul_row" if one_row_per_task else "silu_mul")
 
+    def gather_last_slot_row_layer(
+        self, input: DTensor, output: DTensor,
+        grid_dim: tuple, block_dim: tuple = (256, 1, 1),
+        *, chunk_rows_per_task: int = 1,
+    ):
+        """Copy the last active hidden row from each slot's capacity-P chunk.
+
+        Input is BF16 [S*P,H]; output is BF16 [S,H]. Prefill selects row P-1,
+        decode selects row 0. A one-row final norm and LM head can then reuse
+        the existing readout layers without computing logits for padded rows.
+        """
+        if self.target_cc != 90 or self.task_graph_mode != "resident_data":
+            raise ValueError("Last-row gather requires Hopper resident_data")
+        if input.num_dims != 2 or output.num_dims != 2 or input.dim(1) <= 0:
+            raise ValueError("Last-row gather expects input[S*P,H] and output[S,H]")
+        slots = self._chunk_slot_count(input.dim(0), chunk_rows_per_task)
+        if output.dim(0) != slots or output.dim(1) != input.dim(1):
+            raise ValueError("Last-row gather output must have one matching hidden row per slot")
+        if tuple(grid_dim) != (slots, 1, 1) or tuple(block_dim) != (256, 1, 1):
+            raise ValueError("Last-row gather requires grid=(S,1,1), block=(256,1,1)")
+        for tensor in (input, output):
+            _, strides = self.kn_graph.cygraph.get_input_dtensor_shape_and_stride(tensor)
+            if tensor.dtype != bfloat16 or tuple(strides) != (tensor.dim(1), 1):
+                raise ValueError("Last-row gather requires contiguous BF16 tensors")
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input, (0, -1, -1), -1, True)
+        tb_graph.new_input(output, (0, -1, -1), -1, True)
+        self.kn_graph.customized([input, output], tb_graph)
+        self.kn_graph.register_task(tb_graph, "gather_last_slot_row")
+
     def identity_layer(
         self,
         input: DTensor,
@@ -2917,6 +3151,34 @@ class PersistentKernel:
         tb_graph.new_input(output, (1, -1, -1), 1, True)
         self.kn_graph.customized([input, weight, residual, output], tb_graph)
         self.kn_graph.register_task(tb_graph, "silu_mul_linear_with_residual")
+
+    def argmax_row_layer(
+        self, input: DTensor, output: DTensor,
+        grid_dim: tuple, block_dim: tuple = (256, 1, 1),
+    ):
+        """One greedy token per private row, with the lowest index winning ties.
+
+        BF16 logits[S,V] remain read-only; output[S,1] contains int64 token IDs.
+        Each task consumes exactly one descriptor-owned row, without reading
+        the global batch's active-token count or modifying token/KV metadata.
+        """
+        if self.target_cc != 90 or self.task_graph_mode != "resident_data":
+            raise ValueError("Row argmax currently requires Hopper resident_data")
+        if (input.num_dims != 2 or output.num_dims != 2
+                or input.dim(0) <= 0 or input.dim(1) <= 0
+                or output.dim(0) != input.dim(0) or output.dim(1) != 1):
+            raise ValueError("Row argmax expects logits[S,V] and token_ids[S,1]")
+        if tuple(grid_dim) != (input.dim(0), 1, 1) or tuple(block_dim) != (256, 1, 1):
+            raise ValueError("Row argmax requires grid=(S,1,1), block=(256,1,1)")
+        for tensor, dtype in ((input, bfloat16), (output, int64)):
+            _, strides = self.kn_graph.cygraph.get_input_dtensor_shape_and_stride(tensor)
+            if tensor.dtype != dtype or tuple(strides) != (tensor.dim(1), 1):
+                raise ValueError("Row argmax requires contiguous BF16 logits and int64 token IDs")
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input, (0, -1, -1), -1, True)
+        tb_graph.new_input(output, (0, -1, -1), -1, True)
+        self.kn_graph.customized([input, output], tb_graph)
+        self.kn_graph.register_task(tb_graph, "argmax_row")
 
     def argmax_layer(
         self, input: DTensor, output: DTensor, grid_dim: tuple, block_dim: tuple
@@ -3534,13 +3796,41 @@ class PersistentKernel:
         self.kn_graph.customized([hot_token, d2t_table, target_token], tb_graph)
         self.kn_graph.register_task(tb_graph, "eagle3_d2t_remap", params)
 
+    def _bind_context_chunk(self, kwargs):
+        """Select the slot capacity and optional full-chunk prefill policy."""
+        rows = kwargs.get("context_chunk_size", 1)
+        if type(rows) is not int or not 1 <= rows <= 4:
+            raise ValueError("context_chunk_size must be an integer in 1..4")
+        prefill = kwargs.get("context_prefill") is not None
+        if prefill:
+            if (self.target_cc != 90 or self.task_graph_mode != "resident_data"
+                    or self.mode != "offline" or kwargs.get("context_io") is None
+                    or kwargs.get("context_sequence") is not None
+                    or kwargs.get("context_requests") is not None
+                    or kwargs.get("context_autoregressive") is None
+                    or int(os.environ.get("MIRAGE_COMPARE_SEQUENCE_REPEATS", "1")) != 1):
+                raise ValueError("context_prefill requires Hopper offline resident_data, ContextIO "
+                                 "and autoregressive feedback, without context_sequence or context_requests")
+        elif rows > 1:
+            if (self.target_cc != 90 or self.task_graph_mode != "resident_data"
+                    or self.mode != "offline" or kwargs.get("context_io") is None
+                    or kwargs.get("context_sequence") != (1, 0)
+                    or kwargs.get("context_requests") is not None
+                    or kwargs.get("context_autoregressive") is not None
+                    or int(os.environ.get("MIRAGE_COMPARE_SEQUENCE_REPEATS", "1")) != 1):
+                raise ValueError("Fixed chunks require Hopper offline resident_data, ContextIO, "
+                                 "context_sequence=(1,0), and no request queue or feedback")
+        self._context_chunk_size = rows
+        self._context_prefill_enabled = prefill
+
     def _bind_context_io(self, buffers):
         """Bind (queued inputs, saved outputs, slot inputs, slot outputs).
 
         Outputs are contiguous CUDA BF16 matrices. Inputs can be BF16 vectors
-        or int64 matrices with one embedding ID per row. Queue/result rows use
-        context IDs; working rows use reusable slot IDs. One pass consumes one
-        row. Native initialization also checks these addresses against the graph.
+        or int64 token IDs. Native prefill uses inputs[N*64,1] and slot_inputs[S,P];
+        each request's prompt occupies the start of its 64-row reservation.
+        Other modes use the same input width in queued and working tensors.
+        Native initialization also checks these addresses against the graph.
         """
         if buffers is None:
             return None
@@ -3561,17 +3851,23 @@ class PersistentKernel:
         if (inputs.dtype not in (torch.bfloat16, torch.int64) or slot_inputs.dtype != inputs.dtype
                 or saved.dtype != torch.bfloat16 or slot_outputs.dtype != torch.bfloat16):
             raise ValueError("Context IO needs matching BF16/int64 inputs and BF16 outputs")
-        if inputs.dtype == torch.int64 and inputs.shape[1] != 1:
-            raise ValueError("Integer ContextIO input must be one int64 ID per slot")
+        chunk_size = getattr(self, "_context_chunk_size", 1)
+        prefill = getattr(self, "_context_prefill_enabled", False)
+        queued_width = 1 if prefill else chunk_size
+        if inputs.dtype == torch.int64 and inputs.shape[1] != queued_width:
+            raise ValueError("Integer ContextIO width must be 1 for native prefill, otherwise context_chunk_size")
+        if (prefill or chunk_size > 1) and inputs.dtype != torch.int64:
+            raise ValueError("Chunk prefill requires int64 token IDs")
         count, input_width = inputs.shape
+        slot_input_width = chunk_size if prefill else input_width
         output_width = saved.shape[1]
         slots = max(self._data_slot_ids) + 1
-        if (saved.shape[0] != count or slot_inputs.shape != (slots, input_width)
+        if (saved.shape[0] != count or slot_inputs.shape != (slots, slot_input_width)
                 or slot_outputs.shape != (slots, output_width)
                 or not 0 <= count <= 0x7fffffff
                 or not 0 < input_width <= 0x7fffffff or not 0 < output_width <= 0x7fffffff
                 or slots > self.max_num_batched_requests):
-            raise ValueError("Expected inputs[N,Hin], outputs[N,Hout], slot_inputs[S,Hin], slot_outputs[S,Hout]")
+            raise ValueError("Expected matching ContextIO rows/widths and slot tensors; native prefill uses slot_inputs[S,P]")
         ranges = [(t.data_ptr(), t.data_ptr() + t.numel() * t.element_size()) for t in buffers]
         for i, (begin, end) in enumerate(ranges):
             if any(begin < other_end and other_begin < end
@@ -3607,13 +3903,168 @@ class PersistentKernel:
             raise ValueError("Fixed sequences require num_slots * steps * repeats rows")
         return (*context_io, steps, prefix)
 
+    def _bind_context_requests(self, context_io, requests):
+        """Bind a finite offline queue with EOS stopping and private slot caches.
+
+        requests = (prefix_lengths, generated_lengths, cache_bindings).
+        Each binding is (slot_k, slot_v, prefix_k, prefix_v), with BF16 shapes
+        [S,64,heads,128] and [N,64,heads,128]. Only the seed at inputs[r*64]
+        is consumed. History/output row r*64+t belongs to request r, token t.
+        The uniform cache capacity supplies the limit: prefix[r]+length[r]<=64.
+        """
+        self._context_requests = None
+        self._context_prefill = None
+        self._context_request_arguments = None
+        if requests is None:
+            return context_io
+        if (context_io is None or len(context_io) != 8 or context_io[7] != 1):
+            raise ValueError("context_requests needs int64 ContextIO without context_sequence")
+        if int(os.environ.get("MIRAGE_COMPARE_SEQUENCE_REPEATS", "1")) != 1:
+            raise ValueError("context_requests owns replacement; comparison repeats are unsupported")
+        if not isinstance(requests, (tuple, list)) or len(requests) != 3:
+            raise ValueError("context_requests must contain prefix_lengths, generated_lengths, cache_bindings")
+        prefixes, lengths, bindings = requests
+        for tensor in (prefixes, lengths):
+            if (not isinstance(tensor, torch.Tensor) or tensor.dtype != torch.int32
+                    or not tensor.is_cuda or tensor.device.index != self.mpi_rank
+                    or tensor.ndim != 1 or not tensor.is_contiguous()):
+                raise ValueError("Request lengths must be contiguous CUDA int32 vectors")
+        count = prefixes.numel()
+        if lengths.shape != prefixes.shape or context_io[4] != count * 64:
+            raise ValueError("Request IO needs N prefix/length entries and N*64 input/output rows")
+        if bool(((prefixes < 0) | (prefixes >= 64)).any().item()):
+            raise ValueError("Each cached prefix must contain 0..63 tokens, excluding its seed")
+        if not isinstance(bindings, (tuple, list)):
+            raise ValueError("Request cache_bindings must be a list of four-tensor bindings")
+        slots = max(self._data_slot_ids) + 1
+        records, cache_tensors = [], []
+        for binding in bindings:
+            if not isinstance(binding, (tuple, list)) or len(binding) != 4:
+                raise ValueError("Each request cache binding is (slot_k, slot_v, prefix_k, prefix_v)")
+            for tensor in binding:
+                if (not isinstance(tensor, torch.Tensor) or not tensor.is_cuda
+                        or tensor.device.index != self.mpi_rank or tensor.dtype != torch.bfloat16
+                        or tensor.ndim != 4 or not tensor.is_contiguous()):
+                    raise ValueError("Request KV tensors must be contiguous CUDA BF16 rank-four tensors")
+            slot_k, slot_v, prefix_k, prefix_v = binding
+            heads = slot_k.shape[2]
+            if (heads < 1 or slot_k.shape != (slots, 64, heads, 128)
+                    or slot_v.shape != slot_k.shape
+                    or prefix_k.shape != (count, 64, heads, 128)
+                    or prefix_v.shape != prefix_k.shape):
+                raise ValueError("Request KV requires slot[S,64,heads,128] and prefix[N,64,heads,128]")
+            records.append((*[t.data_ptr() for t in binding], heads))
+            cache_tensors.extend(binding)
+        # Keep every caller-owned buffer alive for compiled and loaded kernels.
+        # Mutable lengths/caches must never alias seeds, saved results, or prefixes.
+        tensors = (*self._context_io, prefixes, lengths, *cache_tensors)
+        ranges = [(t.data_ptr(), t.data_ptr() + t.numel() * t.element_size()) for t in tensors]
+        for i, (begin, end) in enumerate(ranges):
+            if begin != end and any(other_begin != other_end and
+                    begin < other_end and other_begin < end
+                    for other_begin, other_end in ranges[:i]):
+                raise ValueError("Request metadata, prefix caches, and ContextIO buffers must not overlap")
+        self._context_requests = (prefixes, lengths, tuple(tuple(b) for b in bindings))
+        self._context_request_arguments = (count, prefixes.data_ptr(), lengths.data_ptr(), records)
+        # Preserve the launcher's fixed sequence fields as disabled. The request
+        # policy uses its own lengths while slot_iteration remains monotonic.
+        return (*context_io, 0, 0)
+
+    def _bind_context_prefill(self, context_io, prefill):
+        """Bind (prompt_lengths[N], generated_lengths[N]) for native prefill.
+
+        Each prompt is a positive multiple of P and fits the private 64-token
+        cache. Full chunks consume prompt_ids[r*64:]; the final chunk's last
+        row predicts the first generated token. Decode then consumes one token
+        per pass. History and saved hidden rows use r*64+generated_index.
+        """
+        self._context_prefill = None
+        if prefill is None:
+            return context_io
+        if context_io is None or len(context_io) != 8 or context_io[7] != 1:
+            raise ValueError("context_prefill needs int64 ContextIO without another sequence/request policy")
+        if not isinstance(prefill, (tuple, list)) or len(prefill) != 2:
+            raise ValueError("context_prefill must contain prompt_lengths and generated_lengths")
+        prompts, lengths = prefill
+        for tensor in (prompts, lengths):
+            if (not isinstance(tensor, torch.Tensor) or tensor.dtype != torch.int32
+                    or not tensor.is_cuda or tensor.device.index != self.mpi_rank
+                    or tensor.ndim != 1 or not tensor.is_contiguous()):
+                raise ValueError("Prefill lengths must be contiguous CUDA int32 vectors")
+        count = prompts.numel()
+        if lengths.shape != prompts.shape or context_io[4] != count * 64:
+            raise ValueError("Prefill IO needs N prompt/length entries and N*64 input/output rows")
+        capacity = self._context_chunk_size
+        if bool(((prompts <= 0) | (prompts > 64) | (prompts % capacity != 0)).any().item()):
+            raise ValueError("Every prompt length must be in 1..64 and divisible by context_chunk_size")
+        tensors = (*self._context_io, prompts, lengths)
+        ranges = [(t.data_ptr(), t.data_ptr() + t.numel() * t.element_size()) for t in tensors]
+        for i, (begin, end) in enumerate(ranges):
+            if begin != end and any(other_begin != other_end and
+                    begin < other_end and other_begin < end
+                    for other_begin, other_end in ranges[:i]):
+                raise ValueError("Prefill metadata and ContextIO buffers must not overlap")
+        self._context_prefill = (prompts, lengths)
+        # Reuse the request queue tuple; native prompts have no imported KV.
+        self._context_request_arguments = (count, 0, lengths.data_ptr(), [],
+                                           capacity, prompts.data_ptr())
+        return (*context_io, 0, 0)
+
+    def _bind_context_autoregressive(self, context_io, buffers):
+        """Opt into greedy feedback using (slot predictions, saved token history).
+
+        Both are int64 CUDA matrices: [S,1] and one history row per saved
+        ContextIO row. Fixed sequences consume only their initial seed; native
+        prefill consumes the full prompt before saving its first prediction.
+        Request history uses r*64+generated_index and includes the EOS token.
+        """
+        self._context_autoregressive = None
+        if buffers is None:
+            if self._context_requests is not None or self._context_prefill is not None:
+                raise ValueError("Request prefill/decode requires context_autoregressive predictions/history")
+            return context_io
+        if context_io is None or len(context_io) != 10 or context_io[7] != 1:
+            raise ValueError("Autoregressive feedback requires int64 sequence, request, or prefill inputs")
+        if int(os.environ.get("MIRAGE_COMPARE_SEQUENCE_REPEATS", "1")) != 1:
+            raise ValueError("Autoregressive feedback supports one sequence per slot")
+        if not isinstance(buffers, (tuple, list)) or len(buffers) != 2:
+            raise ValueError("context_autoregressive must contain predicted_tokens and generated_tokens")
+        slots = max(self._data_slot_ids) + 1
+        for tensor, shape in zip(buffers, ((slots, 1), (context_io[4], 1))):
+            if (not isinstance(tensor, torch.Tensor) or not tensor.is_cuda
+                    or tensor.device.index != self.mpi_rank or tensor.dtype != torch.int64
+                    or tuple(tensor.shape) != shape or not tensor.is_contiguous()):
+                raise ValueError("Autoregressive buffers must be contiguous CUDA int64 [S,1] and [S*T,1]")
+        all_buffers = (*self._context_io, *buffers)
+        if self._context_requests is not None:
+            prefixes, lengths, bindings = self._context_requests
+            all_buffers += (prefixes, lengths, *[t for binding in bindings for t in binding])
+        if self._context_prefill is not None:
+            all_buffers += self._context_prefill
+        ranges = [(t.data_ptr(), t.data_ptr() + t.numel() * t.element_size()) for t in all_buffers]
+        for i, (begin, end) in enumerate(ranges):
+            if begin != end and any(other_begin != other_end and
+                   begin < other_end and other_begin < end
+                   for other_begin, other_end in ranges[:i]):
+                raise ValueError("Autoregressive and ContextIO buffers must not overlap")
+        # Retain caller-owned allocations for both compile() and load_mpk_kernel().
+        self._context_autoregressive = tuple(buffers)
+        result = (*context_io, *[tensor.data_ptr() for tensor in buffers])
+        if self._context_requests is not None or self._context_prefill is not None:
+            result += self._context_request_arguments
+        return result
+
     def compile(
         self,
         **kwargs,
     ):
         assert not self._is_compiled
+        self._bind_context_chunk(kwargs)
         context_io = self._bind_context_io(kwargs.get("context_io"))
         context_io = self._bind_context_sequence(context_io, kwargs.get("context_sequence"))
+        context_io = self._bind_context_requests(context_io, kwargs.get("context_requests"))
+        context_io = self._bind_context_prefill(context_io, kwargs.get("context_prefill"))
+        context_io = self._bind_context_autoregressive(context_io, kwargs.get("context_autoregressive"))
         
         output_dir = kwargs.get("output_dir", None)
 
@@ -3754,6 +4205,7 @@ class PersistentKernel:
             use_cutlass_kernel=self.use_cutlass_kernel,
             test_mode=self.test_mode,
         )
+        cc_cmd.append(f"-DNAS_PREFILL_CHUNK_ROWS={self._context_chunk_size}")
         print("Compiling megakernel using the following command line:")
         print(cc_cmd)
         subprocess.check_call(cc_cmd)
@@ -3873,8 +4325,12 @@ class PersistentKernel:
                        - task_graph_rank{N}.json
         """
         assert not self._is_compiled, "Kernel is already compiled"
+        self._bind_context_chunk(kwargs)
         context_io = self._bind_context_io(kwargs.get("context_io"))
         context_io = self._bind_context_sequence(context_io, kwargs.get("context_sequence"))
+        context_io = self._bind_context_requests(context_io, kwargs.get("context_requests"))
+        context_io = self._bind_context_prefill(context_io, kwargs.get("context_prefill"))
+        context_io = self._bind_context_autoregressive(context_io, kwargs.get("context_autoregressive"))
         
         # Find the compiled .so file
         so_pattern = f"mpk_launcher_rank{self.mpi_rank}.cpython-{sys.version_info.major}{sys.version_info.minor}-x86_64-linux-gnu.so"
@@ -4025,4 +4481,8 @@ class PersistentKernel:
         if self._is_compiled:
             self.finalize_func()
         self._context_io = None
+        self._context_autoregressive = None
+        self._context_requests = None
+        self._context_prefill = None
+        self._context_request_arguments = None
         self.__finalized__ = True

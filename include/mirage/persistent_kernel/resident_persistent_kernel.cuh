@@ -42,10 +42,18 @@ static_assert(MPK_NUM_KV_GROUPS == 1,
 #else
 #include "tasks/ampere/task_header.cuh"
 #endif
+// The last-valid-row gather reuses this architecture-independent copy kernel.
+// Hopper's task header does not otherwise include the Ampere identity helper.
+#include "tasks/ampere/identity.cuh"
 
 using bfloat16 = type::bfloat16_t;
 using namespace mirage::runtime;
 using namespace kernel;
+// Filled by the generated Python launcher before init_persistent_kernel().
+// Initialization validates these host records, then copies them to GPU storage.
+static std::vector<RequestKVBinding> g_request_kv_bindings;
+#include "nas_latency_probe.cuh"
+
 #ifdef MIRAGE_END_TRACE
 #include "end_trace.cuh"
 #else
@@ -382,6 +390,9 @@ __global__ void init_kernel(ResidentRuntimeConfig config) {
 
 __global__ void prepare_kernel(ResidentRuntimeConfig config,
                                int end_of_task_graph_event_pos) {
+#ifdef NAS_LATENCY_PROBE
+  if (blockIdx.x == 0 && threadIdx.x == 0) nas_probe::start();
+#endif
   // Initialize worker queue last task id
   // Each worker now maintains a local and a remote worker queue
   for (int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -420,14 +431,40 @@ __global__ void prepare_kernel(ResidentRuntimeConfig config,
     config.slot_iteration[slot] = 0u;
     config.slot_state[slot] = REQUEST_SLOT_INACTIVE;
     if (config.num_contexts >= 0) config.request_ids[slot] = -1;
+    if (config.num_decode_requests >= 0) config.decode_slot_request_ids[slot] = -1;
+    if (config.prefill_chunk_capacity > 0) {
+      config.slot_token_position[slot] = 0;
+      config.slot_chunk_rows[slot] = 0; // Admission publishes a valid count.
+    }
+  }
+  if (config.num_decode_requests >= 0) {
+    for (int request = blockIdx.x * blockDim.x + threadIdx.x;
+         request < config.num_decode_requests; request += blockDim.x * gridDim.x)
+      config.decode_generated_lengths[request] = 0;
   }
 #ifdef MIRAGE_EXPERIMENTAL_MOE_BATCHING
   if (config.experimental_moe != nullptr) {
     for (unsigned int slot = blockIdx.x * blockDim.x + threadIdx.x;
          slot < EXPERIMENTAL_MOE_STATE_SLOTS; slot += blockDim.x * gridDim.x) {
-      for (uint32_t kind = 0; kind < EXPERIMENTAL_BATCH_KINDS; kind++)
-        config.experimental_moe->pending[kind][slot].pending = 0u;
+      config.experimental_moe->pending[slot].pending_mask = 0u;
+      config.experimental_moe->remaining_branches[slot] = 0u;
+      config.experimental_moe->active_data[slot] = DATA_INVALID_ID;
     }
+#if NAS_SELECTOR_FIFO
+    // One reset per invocation. An empty bin's first append initializes its
+    // head/tail, and every append initializes its member link before use.
+    for (unsigned int key = blockIdx.x * blockDim.x + threadIdx.x;
+         key < EXPERIMENTAL_MOE_SELECTION_BINS; key += blockDim.x * gridDim.x)
+      config.experimental_moe->fifo.count[key] = 0u;
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+      config.experimental_moe->fifo.active_count = 0u;
+#elif NAS_SELECTOR_HISTOGRAM
+    // One full clear per invocation, before workers start. Selection then
+    // resets only its touched counts; oldest[] and touched[] need no clearing.
+    for (unsigned int key = blockIdx.x * blockDim.x + threadIdx.x;
+         key < EXPERIMENTAL_MOE_SELECTION_BINS; key += blockDim.x * gridDim.x)
+      config.experimental_moe->selection.count[key] = 0u;
+#endif
     for (unsigned int b = blockIdx.x * blockDim.x + threadIdx.x;
          b < EXPERIMENTAL_MOE_POOL; b += blockDim.x * gridDim.x)
       config.experimental_moe->batches[b].live = 0u;
@@ -463,6 +500,7 @@ __global__ void prepare_kernel(ResidentRuntimeConfig config,
     // Each invocation consumes the preloaded context queue from the beginning.
     // This preparation kernel completes before any persistent worker starts.
     if (config.num_contexts >= 0) *config.next_request_id = 0;
+    if (config.num_decode_requests >= 0) *config.decode_next_request = 0;
     if (config.num_request_slots > 0) {
       *config.completed_request_slot_count = 0u;
     }
@@ -974,6 +1012,14 @@ enqueue_worker_item(ResidentRuntimeConfig const &config,
                     int worker_queue_id,
                     size_t *next_free_task_pos,
                     TaskId work_item) {
+#ifdef NAS_LATENCY_DIAGNOSTIC
+  auto position = get_task_position_index(work_item);
+  if (position >= config.num_control_tasks) {
+    DataId data = config.task_to_data_id[position];
+    if (data != DATA_INVALID_ID)
+      nas_probe::buffer(nas_probe::DATA_ENQUEUE)[data] = nas_probe::clock();
+  }
+#endif
   ETRACE(1, get_task_iteration_num(work_item), get_task_position_index(work_item),
          get_task_position_index(work_item) >= config.num_control_tasks ? config.task_to_data_id[get_task_position_index(work_item)] : DATA_INVALID_ID,
          worker_queue_id, 0);
@@ -3053,6 +3099,12 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
   global_runtime_config.slot_data_offsets = nullptr;
   global_runtime_config.slot_data_ids = nullptr;
   global_runtime_config.active_request_slot_count = nullptr;
+  global_runtime_config.decode_slot_request_ids = nullptr;
+  global_runtime_config.decode_next_request = nullptr;
+  global_runtime_config.slot_token_position = nullptr;
+  global_runtime_config.slot_chunk_rows = nullptr;
+  global_runtime_config.num_request_kv_bindings = 0;
+  global_runtime_config.request_kv_bindings = nullptr;
   global_runtime_config.completion_queue_last_ready_data_id = nullptr;
   global_runtime_config.completion_queue_next_free_data_id = nullptr;
   global_runtime_config.data_last_enqueued_iteration = nullptr;
@@ -3219,6 +3271,8 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
       first_data_ids, all_events.size());
   validate_context_io_bindings(global_runtime_config, all_fulldata,
                                resident_tasks, slot_ids);
+  validate_decode_request_bindings(global_runtime_config, all_fulldata,
+                                  resident_tasks, slot_ids);
 #ifdef MIRAGE_END_TRACE
   fprintf(stderr, "END_TRACE runtime: mode=%d graphs=%d data=%d terminals=%d first=%d workers=%d schedulers=%d\n",
       int(global_runtime_config.resident_execution_mode), global_runtime_config.num_graphs,
@@ -3387,6 +3441,23 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
       cudaMemcpy(global_runtime_config.slot_data_ids,
                  slot_restart.data_ids.data(), data_bytes, cudaMemcpyHostToDevice);
       global_runtime_config.active_request_slot_count = gpu_malloc<uint32_t>(sizeof(uint32_t));
+    }
+  }
+  if (global_runtime_config.num_decode_requests >= 0) {
+    global_runtime_config.decode_slot_request_ids = gpu_malloc<int32_t>(
+        size_t(global_runtime_config.num_request_slots) * sizeof(int32_t));
+    global_runtime_config.decode_next_request = gpu_malloc<int32_t>(sizeof(int32_t));
+    if (global_runtime_config.prefill_chunk_capacity > 0) {
+      size_t bytes = size_t(global_runtime_config.num_request_slots) * sizeof(int32_t);
+      global_runtime_config.slot_token_position = gpu_malloc<int32_t>(bytes);
+      global_runtime_config.slot_chunk_rows = gpu_malloc<int32_t>(bytes);
+    }
+    global_runtime_config.num_request_kv_bindings = g_request_kv_bindings.size();
+    if (!g_request_kv_bindings.empty()) {
+      size_t bytes = g_request_kv_bindings.size() * sizeof(RequestKVBinding);
+      global_runtime_config.request_kv_bindings = gpu_malloc<RequestKVBinding>(bytes);
+      cudaMemcpy(global_runtime_config.request_kv_bindings,
+                 g_request_kv_bindings.data(), bytes, cudaMemcpyHostToDevice);
     }
   }
   global_runtime_config.completed_terminal_data_count =
@@ -3902,6 +3973,11 @@ extern "C" void finalize_persistent_kernel() {
   gpu_free(global_runtime_config.slot_data_offsets);
   gpu_free(global_runtime_config.slot_data_ids);
   gpu_free(global_runtime_config.active_request_slot_count);
+  gpu_free(global_runtime_config.decode_slot_request_ids);
+  gpu_free(global_runtime_config.decode_next_request);
+  gpu_free(global_runtime_config.slot_token_position);
+  gpu_free(global_runtime_config.slot_chunk_rows);
+  gpu_free(global_runtime_config.request_kv_bindings);
   gpu_free(global_runtime_config.completed_terminal_data_count);
   gpu_free(global_runtime_config.completed_streaming_data_count);
   gpu_free(global_runtime_config.completed_data_this_iteration_count);

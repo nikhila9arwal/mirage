@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <climits>
 #include <initializer_list>
+#include <memory>
 
 // Host validation for the deliberately small prototype. The native graph keeps
 // truthful per-slot tensor views; only these validated views create the physical
@@ -43,8 +44,11 @@ static void init_experimental_moe(
   if (marked_dense)
     throw std::runtime_error("NAS_MOE_OCCUPANCY does not support marked dense projections; use task/batch tracing instead");
 #endif
+  bool const native_prefill = config.prefill_chunk_capacity != 0;
+  int const input_width = native_prefill ? 1 : int(EXPERIMENTAL_MOE_CHUNK_ROWS);
   if (config.num_request_slots != EXPERIMENTAL_MOE_STATE_SLOTS ||
       config.num_contexts < 0 || !config.context_input_is_int64 ||
+      config.context_input_width != input_width ||
       config.num_gpus != 1 || config.num_local_schedulers != 1 ||
       config.num_workers < 1 || config.num_workers > 16 ||
       config.num_remote_schedulers != 0 || !config.split_worker_scheduler ||
@@ -52,15 +56,40 @@ static void init_experimental_moe(
       tasks.size() >= EXPERIMENTAL_MOE_ITEM_TAG ||
       data.size() >= EXPERIMENTAL_MOE_ITEM_TAG ||
       slots.size() != data.size() || data_to_task.size() != data.size()) {
-    throw std::runtime_error("Experimental batching requires the compiled state-slot count, 1..16 workers, finite scalar ContextIO, one split scheduler, single GPU resident scheduler_dispatch");
+    throw std::runtime_error("Experimental batching requires the compiled state-slot count, 1..16 workers, finite fixed-width int64 ContextIO, one split scheduler, single GPU resident scheduler_dispatch");
   }
-  ExperimentalMoeState host = {};
+  // Native prefill reads scalar prompt IDs into capacity-P slot storage. The
+  // request policy supplies full chunks and then one-token decode passes.
+  if (native_prefill &&
+      (config.prefill_chunk_capacity != int(EXPERIMENTAL_MOE_CHUNK_ROWS) ||
+       config.num_decode_requests < 0)) {
+    throw std::runtime_error("Native prefill batching requires the compiled chunk capacity and a finite request queue");
+  }
+  if (!native_prefill && EXPERIMENTAL_MOE_CHUNK_ROWS > 1 &&
+      (config.context_sequence_length != 1 || config.context_prefix_length != 0 ||
+       config.num_contexts != config.num_request_slots ||
+       config.num_decode_requests >= 0 || config.context_predicted_tokens != nullptr)) {
+    throw std::runtime_error("Fixed chunk batching requires one full prefill pass per slot, without decode or imported prefixes");
+  }
+  // Pending storage grows with slots * tokens * branches. Stage it on the heap
+  // so larger valid configurations do not overflow the CPU thread's stack.
+  auto host_storage = std::make_unique<ExperimentalMoeState>();
+  auto &host = *host_storage;
+  for (uint32_t slot = 0; slot < EXPERIMENTAL_MOE_STATE_SLOTS; ++slot) {
+    host.active_data[slot] = DATA_INVALID_ID;
+  }
   auto early = experimental_moe_unsigned_env("MIRAGE_MOE_EARLY_COALESCE", 0);
   if (early > 1u) throw std::runtime_error("MIRAGE_MOE_EARLY_COALESCE must be 0 or 1");
   host.early_coalesce = static_cast<uint32_t>(early);
   auto deadline = experimental_moe_unsigned_env("MIRAGE_MOE_DEADLINE_COALESCE", 0);
   if (deadline > 1u) throw std::runtime_error("MIRAGE_MOE_DEADLINE_COALESCE must be 0 or 1");
   host.deadline_coalesce = static_cast<uint32_t>(deadline);
+#if NAS_SELECTOR_HISTOGRAM || NAS_SELECTOR_FIFO
+  // These selectors deliberately select ONE expert.
+  // Reject other policies rather than silently ignoring a requested companion.
+  if (early || deadline)
+    throw std::runtime_error("Histogram/FIFO selection requires early/deadline coalescing disabled");
+#endif
 #ifdef NAS_MOE_OCCUPANCY
   // The archived recorder assumes one expert per physical batch.
   if (early || deadline) throw std::runtime_error("Coalescing requires batch tracing; the old occupancy recorder is unsupported");
@@ -73,6 +102,10 @@ static void init_experimental_moe(
   if (dense_mode != "none" && dense_mode != "qkv" &&
       dense_mode != "wo" && dense_mode != "both")
     throw std::runtime_error("MIRAGE_DENSE_BATCHING must be none, qkv, wo, or both");
+  // The real-model dense projections retain their ordinary capacity-P tasks.
+  // Their rectangular dimensions are not the old toy dense-bin dimensions.
+  if (EXPERIMENTAL_MOE_CHUNK_ROWS > 1 && dense_mode != "none")
+    throw std::runtime_error("Chunk capacity greater than one requires dense batching disabled");
   auto moe_rows = experimental_moe_unsigned_env("MIRAGE_MOE_BATCH_ROWS", 4);
   auto moe_us = experimental_moe_unsigned_env("MIRAGE_MOE_TIMEOUT_US", 100);
   auto dense_rows = experimental_moe_unsigned_env("MIRAGE_DENSE_BATCH_ROWS", moe_rows);
@@ -99,6 +132,7 @@ static void init_experimental_moe(
     op.output_width = kind == EXPERIMENTAL_BATCH_W13 ? 2 * EXPERIMENTAL_MOE_I :
         (kind == EXPERIMENTAL_BATCH_QKV ? 3 * EXPERIMENTAL_MOE_H / 2 : EXPERIMENTAL_MOE_H);
     op.num_experts = dense ? 1 : EXPERIMENTAL_MOE_EXPERTS;
+    op.num_branches = dense ? 1 : EXPERIMENTAL_MOE_TOP_K;
     op.threshold = dense ? dense_rows : moe_rows;
     op.timeout_ns = 1000ull * (dense ? dense_us : moe_us);
   }
@@ -155,7 +189,29 @@ static void init_experimental_moe(
     base = value;
   };
   for (size_t d = 0; d < data.size(); d++) {
-    int kind = experimental_moe_kind(tasks[data_to_task[d]].task_type);
+    TaskType type = tasks[data_to_task[d]].task_type;
+    // A logical slot owns P token rows and every token's R branches. Ordinary
+    // worker views must agree with the compiled P/R, not global token metadata.
+    int const P = EXPERIMENTAL_MOE_CHUNK_ROWS;
+    if (type == TASK_MOE_TOP1_ROW) {
+      tensor(data[d].outputs[0], mirage::type::DT_FLOAT32,
+             {P, int(EXPERIMENTAL_MOE_TOP_K)});
+      tensor(data[d].outputs[1], mirage::type::DT_INT32,
+             {P, int(EXPERIMENTAL_MOE_EXPERTS)});
+    } else if (type == TASK_SILU_MUL) {
+      tensor(data[d].inputs[0], mirage::type::DT_BFLOAT16,
+             {P, int(EXPERIMENTAL_MOE_TOP_K), 2 * int(EXPERIMENTAL_MOE_I)});
+      tensor(data[d].outputs[0], mirage::type::DT_BFLOAT16,
+             {P, int(EXPERIMENTAL_MOE_TOP_K), int(EXPERIMENTAL_MOE_I)});
+    } else if (type == TASK_MOE_WEIGHTED_SUM) {
+      tensor(data[d].inputs[0], mirage::type::DT_BFLOAT16,
+             {P, int(EXPERIMENTAL_MOE_TOP_K), int(EXPERIMENTAL_MOE_H)});
+      tensor(data[d].inputs[1], mirage::type::DT_FLOAT32,
+             {P, int(EXPERIMENTAL_MOE_TOP_K)});
+      tensor(data[d].outputs[0], mirage::type::DT_BFLOAT16,
+             {P, int(EXPERIMENTAL_MOE_H)});
+    }
+    int kind = experimental_moe_kind(type);
     if (kind < 0) continue;
     int32_t op_id = -1;
     for (uint32_t candidate = 0; candidate < EXPERIMENTAL_BATCH_OPERATORS; candidate++) {
@@ -175,19 +231,32 @@ static void init_experimental_moe(
     auto const &x = data[d].inputs[0];
     auto const &w = data[d].inputs[1];
     auto const &y = data[d].outputs[0];
-    tensor(x, mirage::type::DT_BFLOAT16, {1, K});
-    tensor(y, mirage::type::DT_BFLOAT16, {1, N});
+    bool moe = op.num_experts != 1;
+    int R = op.num_branches;
+    // R=1 accepts the existing 2D API as well as explicit [S,1,width] storage.
+    if (kind == EXPERIMENTAL_BATCH_W2 && (R > 1 || x.num_dims == 3))
+      tensor(x, mirage::type::DT_BFLOAT16, {P, R, K});
+    else
+      tensor(x, mirage::type::DT_BFLOAT16, {P, K});
+    if (moe && (R > 1 || y.num_dims == 3))
+      tensor(y, mirage::type::DT_BFLOAT16, {P, R, N});
+    else
+      tensor(y, mirage::type::DT_BFLOAT16, {P, N});
     if (op.num_experts == 1) {
       tensor(w, mirage::type::DT_BFLOAT16, {N, K});
     } else {
       tensor(w, mirage::type::DT_BFLOAT16, {int(EXPERIMENTAL_MOE_EXPERTS), N, K});
       auto const &r = data[d].inputs[2];
-      tensor(r, mirage::type::DT_INT32, {1, int(EXPERIMENTAL_MOE_EXPERTS)});
-      same_pointer(routing[op_id], static_cast<char *>(r.base_ptr) - slot * EXPERIMENTAL_MOE_EXPERTS * 4);
+      tensor(r, mirage::type::DT_INT32, {P, int(EXPERIMENTAL_MOE_EXPERTS)});
+      same_pointer(routing[op_id], static_cast<char *>(r.base_ptr) - size_t(slot) * P * EXPERIMENTAL_MOE_EXPERTS * 4);
       op.routing = static_cast<int32_t const *>(routing[op_id]);
     }
-    same_pointer(op.input, static_cast<char *>(x.base_ptr) - slot * K * 2);
-    same_pointer(op.output, static_cast<char *>(y.base_ptr) - slot * N * 2);
+    // Every token has its own input vector. W13 branches share that vector;
+    // W2 reads P*R branch vectors. Both projections write P*R output vectors.
+    // Subtract the whole slot's stride to recover the shared allocation base.
+    size_t input_rows = size_t(P) * (kind == EXPERIMENTAL_BATCH_W2 ? R : 1);
+    same_pointer(op.input, static_cast<char *>(x.base_ptr) - size_t(slot) * input_rows * K * 2);
+    same_pointer(op.output, static_cast<char *>(y.base_ptr) - size_t(slot) * P * R * N * 2);
     same_pointer(weights[op_id], w.base_ptr);
     data_to_op[d] = op_id;
   }
@@ -221,9 +290,10 @@ static void init_experimental_moe(
     CUDA_CHECK(cudaMalloc(&experimental_moe_host_maps[op_id], sizeof(CUtensorMap)));
     CUDA_CHECK(cudaMemcpy(experimental_moe_host_maps[op_id], &map, sizeof(map), cudaMemcpyHostToDevice));
     op.weight_map = experimental_moe_host_maps[op_id];
-    fprintf(stderr, "BATCH_OPERATOR op_id=%u kind=%u layer=%u resident_task_id=%u enabled=%u K=%u N=%u E=%u threshold=%u timeout_ns=%llu\n",
+    fprintf(stderr, "BATCH_OPERATOR op_id=%u kind=%u layer=%u resident_task_id=%u enabled=%u K=%u N=%u E=%u threshold=%u timeout_ns=%llu branches=%u chunk_rows=%u\n",
             op_id, op.kind, op.layer_id, op.resident_task_id, op.enabled, op.input_width,
-            op.output_width, op.num_experts, op.threshold, op.timeout_ns);
+            op.output_width, op.num_experts, op.threshold, op.timeout_ns, op.num_branches,
+            EXPERIMENTAL_MOE_CHUNK_ROWS);
   }
   CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&experimental_moe_host_data_to_op),
                         data_to_op.size() * sizeof(int32_t)));

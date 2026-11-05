@@ -306,6 +306,18 @@ enum RequestSlotState : uint32_t {
   REQUEST_SLOT_COMPLETE = 3,
 };
 
+// One immutable prefix source and fixed working cache per attention layer.
+// Both layouts are contiguous [rows, 64, heads, 128]; rows are requests for
+// the sources and reusable slots for the destinations. Workers copy only
+// their own head, once when a newly admitted request first reaches attention.
+struct RequestKVBinding {
+  __nv_bfloat16 *slot_k;
+  __nv_bfloat16 *slot_v;
+  __nv_bfloat16 const *prefix_k;
+  __nv_bfloat16 const *prefix_v;
+  int heads;
+};
+
 struct ResidentRuntimeConfig : public RuntimeConfig {
   // Null preserves the existing runtime. Allocated only by the explicitly
   // enabled, fixed-shape overnight MoE experiment.
@@ -358,6 +370,33 @@ struct ResidentRuntimeConfig : public RuntimeConfig {
   __nv_bfloat16 *context_saved_outputs = nullptr; // [num_contexts, output_width]
   void *context_slot_inputs = nullptr; // [num_request_slots, input_width]
   __nv_bfloat16 const *context_slot_outputs = nullptr; // [slots, output_width]
+  // Optional greedy feedback for one bounded sequence per slot. Both pointers
+  // are caller-owned; null keeps the existing preloaded-input behavior.
+  // Only inputs[slot*T] seeds a sequence. Later input rows are not consumed.
+  int64_t const *context_predicted_tokens = nullptr; // [slots], argmax output
+  int64_t *context_generated_tokens = nullptr; // [slots*T], saved predictions
+  // Optional finite offline request queue. -1 preserves the existing modes;
+  // zero is an empty workload. Each request reserves 64 ContextIO output rows,
+  // and only context_inputs[request*64] is a seed. Prefix + saved predictions
+  // cannot exceed 64, so no per-request maximum-generation array is needed.
+  int num_decode_requests = -1;
+  int32_t const *decode_prefix_lengths = nullptr; // [requests], caller-owned
+  int32_t *decode_generated_lengths = nullptr;    // [requests], caller-owned
+  // Saved length is also this request's next decode position. Slot epochs stay
+  // monotonic across replacement; request ownership changes independently.
+  int32_t *decode_slot_request_ids = nullptr;     // [slots], runtime-owned
+  int32_t *decode_next_request = nullptr;         // One controller's queue cursor
+  // Optional native prefill: prompts are full P-row chunks, then decode uses
+  // one valid row of the same P-row allocation. Zero keeps the existing APIs.
+  int prefill_chunk_capacity = 0;
+  int32_t const *decode_prompt_lengths = nullptr; // [requests], caller-owned
+  // The controller changes these only after acquiring this slot's terminal.
+  // Position counts consumed input tokens; it is independent of slot epoch
+  // and of the number of accepted output predictions.
+  int32_t *slot_token_position = nullptr;         // [slots], next input position
+  int32_t *slot_chunk_rows = nullptr;             // [slots], P during prefill, 1 during decode
+  int num_request_kv_bindings = 0;
+  RequestKVBinding *request_kv_bindings = nullptr; // Runtime-owned GPU copy
   unsigned long long int per_completion_queue_len;
   unsigned long long int *worker_queue_next_free_task_id;
   unsigned long long int *completion_queue_last_ready_data_id;

@@ -114,8 +114,12 @@ enum TaskType {
   TASK_EMBEDDING_INPUT = 122,
   TASK_SILU_MUL_ROW = 123,
   TASK_MOE_TOP1_ROW = 124,
+  // Keep the original routing task ID for serialized graph compatibility.
+  TASK_MOE_TOPK_ROW = TASK_MOE_TOP1_ROW,
   TASK_MOE_SLOT_W13 = 125,
   TASK_MOE_SLOT_W2 = 126,
+  TASK_MOE_WEIGHTED_SUM = 127,
+  TASK_ARGMAX_ROW = 128,
   // Hopper Tasks
   TASK_HOPPER_TASK_BEGIN = 150, // Hopper start placeholder, not a real task
   TASK_LINEAR_WITH_RESIDUAL_HOPPER = 151,

@@ -18,7 +18,9 @@ constexpr int num_routes = 1;
 // Every thread of a 256-thread worker must call this helper. The immutable
 // mask lists active expert IDs; mask[E] is their count. Expert-major membership
 // routing[expert * 16 + local_row] is 1 only for that expert's rows. state_rows maps
-// each active local row to its fixed activation slot; row_count is at most 16.
+// each active local row to its input row; output_rows may select a different
+// destination. Flattening [slot, branch, width] into branch rows lets top-k use
+// the same one-expert-per-physical-row arithmetic. row_count is at most 16.
 // INDEXED_ROWS=false retains the original dense 16-state-row adapter. All metadata
 // arrays, participating activation rows, and the descriptor must stay alive
 // until this function and the caller's completion publication have finished.
@@ -32,7 +34,8 @@ __device__ __forceinline__ void projection(
     int32_t const *expert_mask,
     void *output,
     uint32_t const *state_rows = nullptr,
-    uint32_t row_count = physical_rows) {
+    uint32_t row_count = physical_rows,
+    uint32_t const *output_rows = nullptr) {
   using T = cute::bfloat16_t;
   static_assert(K % 64 == 0 && O % 64 == 0,
                 "The probe deliberately excludes reduction/output tails");
@@ -79,7 +82,7 @@ __device__ __forceinline__ void projection(
         T, WeightTMA, decltype(in), decltype(bias), decltype(indices),
         decltype(mask), decltype(out), 64, 16, physical_rows, O, O, K,
         E, num_routes, 1, true, true, 8, INDEXED_ROWS>(
-        weight_tma, in, bias, indices, mask, out, 0, state_rows, row_count);
+        weight_tma, in, bias, indices, mask, out, 0, state_rows, row_count, output_rows);
   } else {
     auto input_layout = cute::make_layout(
         cute::make_shape(physical_rows, K, num_routes),
@@ -90,7 +93,7 @@ __device__ __forceinline__ void projection(
         T, WeightTMA, decltype(in), decltype(bias), decltype(indices),
         decltype(mask), decltype(out), 64, 16, physical_rows, O, O, K,
         E, num_routes, 1, false, true, 8, INDEXED_ROWS>(
-        weight_tma, in, bias, indices, mask, out, 0, state_rows, row_count);
+        weight_tma, in, bias, indices, mask, out, 0, state_rows, row_count, output_rows);
   }
   // Join only this worker's producer/consumer threads before its caller can
   // publish the logical results. This is not a barrier between slots/batches.
@@ -107,9 +110,11 @@ __device__ __forceinline__ void moe_linear(
     int32_t const *expert_mask,
     void *output,
     uint32_t const *state_rows = nullptr,
-    uint32_t row_count = physical_rows) {
+    uint32_t row_count = physical_rows,
+    uint32_t const *output_rows = nullptr) {
   projection<W13, W13 ? H : I, W13 ? 2 * I : H, num_experts, INDEXED_ROWS>(
-      weight_tma_desc, input, routing, expert_mask, output, state_rows, row_count);
+      weight_tma_desc, input, routing, expert_mask, output, state_rows, row_count,
+      output_rows);
 }
 
 // Dense batches use indexed slot rows and one expert. The caller supplies a
@@ -122,9 +127,11 @@ __device__ __forceinline__ void dense_linear(
     int32_t const *expert_mask,
     void *output,
     uint32_t const *state_rows,
-    uint32_t row_count) {
+    uint32_t row_count,
+    uint32_t const *output_rows = nullptr) {
   projection<true, K, N, 1, true>(
-      weight_tma_desc, input, routing, expert_mask, output, state_rows, row_count);
+      weight_tma_desc, input, routing, expert_mask, output, state_rows, row_count,
+      output_rows);
 }
 
 } // namespace nas_moe_probe

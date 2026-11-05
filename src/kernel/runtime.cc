@@ -310,6 +310,21 @@ void register_mugraph(
       -> std::vector<FullTaskDesc> {
     std::vector<FullTaskDesc> tasks;
     tb::Graph const &bgraph = cur_op->bgraph;
+    // These wrappers use immutable slot coordinates to read the pass's active
+    // row count. Ordinary identity partitions features; joined SiLU has rank 3
+    // and leaves the branch axis whole. Their native variants stay unchanged.
+    bool const slot_gather = task_type == TASK_IDENTITY && input_ops.size() == 1 &&
+        output_ops.size() == 1 && input_ops[0]->dtensor.num_dims == 2 &&
+        input_ops[0]->input_map.x == 0 && output_ops[0]->input_map.x == 0 &&
+        input_ops[0]->input_map.y == -1 && input_ops[0]->forloop_dim == -1;
+    bool const slot_silu = task_type == TASK_SILU_MUL && input_ops.size() == 1 &&
+        input_ops[0]->dtensor.num_dims == 3 && input_ops[0]->input_map.x == 0 &&
+        input_ops[0]->input_map.y == -1;
+    bool const slot_rows = slot_gather || slot_silu ||
+        task_type == TASK_MOE_TOPK_ROW || task_type == TASK_MOE_WEIGHTED_SUM ||
+        task_type == TASK_ATTENTION_SLOT_HOPPER;
+    if (slot_rows && bgraph.grid_dim.x > 32768u)
+      throw std::runtime_error("Slot task IDs must fit the signed 16-bit request metadata");
     dim3 bid;
     for (bid.x = 0; bid.x < bgraph.grid_dim.x; bid.x++) {
       for (bid.y = 0; bid.y < bgraph.grid_dim.y; bid.y++) {
@@ -318,7 +333,7 @@ void register_mugraph(
             FullTaskDesc task(task_type, variant_id);
             // Set request_id when grid_dim.x selects a request or slot. The
             // MTP/EAGLE cases also need this index despite replicated tensors.
-            if ((task_type == TASK_ATTENTION_1) ||
+            if (slot_rows || (task_type == TASK_ATTENTION_1) ||
                 (task_type == TASK_ATTENTION_2) ||
                 (task_type == TASK_SINGLE_BATCH_EXTEND_ATTENTION) ||
                 (task_type == TASK_PAGED_ATTENTION_1) ||
@@ -1761,6 +1776,7 @@ TaskGraphResult print_task_graph(
       "TASK_SILU_MUL_LINEAR_WITH_RESIDUAL";
   task_type_to_name[TASK_LINEAR] = "TASK_LINEAR";
   task_type_to_name[TASK_LINEAR_WITH_RESIDUAL] = "TASK_LINEAR_WITH_RESIDUAL";
+  task_type_to_name[TASK_ARGMAX_ROW] = "TASK_ARGMAX_ROW";
   task_type_to_name[TASK_ARGMAX_PARTIAL] = "TASK_ARGMAX_PARTIAL";
   task_type_to_name[TASK_ARGMAX_REDUCE] = "TASK_ARGMAX_REDUCE";
   task_type_to_name[TASK_REDUCE] = "TASK_REDUCE";

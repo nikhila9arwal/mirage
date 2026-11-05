@@ -103,3 +103,11 @@ benchmark/microbench/sync_primitives
 benchmark/microbench/tma_bandwidth
 benchmark/microbench/.build_flags
 benchmark/microbench/*.json
+
+# Local NAS research artifacts; source, tests, and documentation stay tracked.
+/research/nas/.build/
+/research/nas/data/
+/research/nas/results/
+/research/nas/logs/
+*.perfetto.json
+*.safetensors

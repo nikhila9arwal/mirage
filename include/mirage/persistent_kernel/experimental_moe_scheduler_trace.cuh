@@ -2,7 +2,25 @@
 // Optional, single-writer scheduler timeline. Only the controller's thread 0
 // writes this buffer; the host reads it after the entire invocation completes.
 // No per-record atomic, fence, or cross-worker synchronization is needed.
-#ifdef NAS_MOE_SCHEDULER_TRACE
+#ifdef NAS_LATENCY_DIAGNOSTIC
+enum NasSchedulerTraceKind {
+  NAS_SCHED_POLL_COMPLETION = 1,
+  NAS_SCHED_HANDLE_COMPLETION = 2,
+  NAS_SCHED_COMPLETE_LOGICAL = 3,
+  NAS_SCHED_POLL_CONTROL = 4,
+  NAS_SCHED_HANDLE_CONTROL = 5,
+  NAS_SCHED_DISPATCH = 6,
+  NAS_SCHED_BACKOFF = 7,
+};
+
+// Aggregate the existing scopes; leave their placement and scheduler policy alone.
+#define NAS_SCHED_TRACE_INIT() (nas_probe::buffer(nas_probe::HEADER)[2] = nas_probe::clock())
+#define NAS_SCHED_TRACE_LOOP() (++nas_probe::buffer(nas_probe::HEADER)[4])
+#define NAS_SCHED_TRACE_BEGIN(name) auto name = nas_probe::clock()
+#define NAS_SCHED_TRACE_END(name, kind, result, subject, epoch, sequence) \
+  nas_probe::scope(kind, (result) != 0, name, nas_probe::clock())
+#define NAS_SCHED_TRACE_FINISH() (nas_probe::buffer(nas_probe::HEADER)[3] = nas_probe::clock())
+#elif defined(NAS_MOE_SCHEDULER_TRACE)
 enum NasSchedulerTraceKind {
   NAS_SCHED_POLL_COMPLETION = 1,
   NAS_SCHED_HANDLE_COMPLETION = 2,

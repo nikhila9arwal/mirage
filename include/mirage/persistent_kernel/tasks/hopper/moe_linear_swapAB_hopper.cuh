@@ -103,8 +103,12 @@ __device__ __forceinline__ void
                               OutputTensor mOutput,
                               int const expert_offset,
                               uint32_t const *state_rows = nullptr,
-                              uint32_t row_count = BATCH_SIZE) {
+                              uint32_t row_count = BATCH_SIZE,
+                              uint32_t const *output_rows = nullptr) {
   // A selected-row batch uses a compact tile while activations stay in slots.
+  // state_rows selects input rows; output_rows optionally selects different
+  // destinations. Top-k W13 reads slot s but writes branch row s * R + r.
+  // W2 reads/writes that branch row. A physical row still computes one expert.
   // Default arguments preserve the upstream native call and addressing path.
   static_assert(!INDEXED_ROWS ||
                     (BATCH_SIZE == 16 && MMA_N == 16 && NUM_TOPK == 1 &&
@@ -596,7 +600,8 @@ __device__ __forceinline__ void
               // rows must neither alias state row zero nor overwrite sentinels.
               if (n_idx < row_count && tRoutingIndex(n_idx) > 0 &&
                   m_idx < OUTPUT_SIZE) {
-                int64_t state_row = static_cast<int64_t>(state_rows[n_idx]);
+                int64_t state_row = static_cast<int64_t>(
+                    output_rows == nullptr ? state_rows[n_idx] : output_rows[n_idx]);
                 auto *output = cute::raw_pointer_cast(mOutput.data());
                 output[state_row * OUTPUT_SIZE + m_idx] =
                     TypeAcc_to_TypeC(accum(i));

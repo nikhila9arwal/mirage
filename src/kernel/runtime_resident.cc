@@ -1958,11 +1958,14 @@ TaskGraphResult print_task_graph(
   task_type_to_name[TASK_MOE_TOP1_ROW] = "TASK_MOE_TOP1_ROW";
   task_type_to_name[TASK_MOE_SLOT_W13] = "TASK_MOE_SLOT_W13";
   task_type_to_name[TASK_MOE_SLOT_W2] = "TASK_MOE_SLOT_W2";
+  task_type_to_name[TASK_MOE_WEIGHTED_SUM] = "TASK_MOE_WEIGHTED_SUM";
+  task_type_to_name[TASK_ELEMENTWISE_ADD_SM100] = "TASK_ELEMENTWISE_ADD_SM100";
   task_type_to_name[TASK_IDENTITY] = "TASK_IDENTITY";
   task_type_to_name[TASK_SILU_MUL_LINEAR_WITH_RESIDUAL] =
       "TASK_SILU_MUL_LINEAR_WITH_RESIDUAL";
   task_type_to_name[TASK_LINEAR] = "TASK_LINEAR";
   task_type_to_name[TASK_LINEAR_WITH_RESIDUAL] = "TASK_LINEAR_WITH_RESIDUAL";
+  task_type_to_name[TASK_ARGMAX_ROW] = "TASK_ARGMAX_ROW";
   task_type_to_name[TASK_ARGMAX_PARTIAL] = "TASK_ARGMAX_PARTIAL";
   task_type_to_name[TASK_ARGMAX_REDUCE] = "TASK_ARGMAX_REDUCE";
   task_type_to_name[TASK_REDUCE] = "TASK_REDUCE";

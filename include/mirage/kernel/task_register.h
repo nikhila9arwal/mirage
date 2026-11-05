@@ -49,8 +49,12 @@ public:
                              bool one_row_per_task = false);
   int register_identity_task(threadblock::Graph const &bgraph,
                              std::vector<int> const &params);
+  int register_gather_last_slot_row_task(threadblock::Graph const &bgraph,
+                                         std::vector<int> const &params);
   int register_silu_mul_linear_with_residual_task(
       threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_argmax_row_task(threadblock::Graph const &bgraph,
+                               std::vector<int> const &params);
   int register_argmax_partial_task(threadblock::Graph const &bgraph,
                                    std::vector<int> const &params);
   int register_argmax_reduce_task(threadblock::Graph const &bgraph,
@@ -75,8 +79,12 @@ public:
                                    std::vector<int> const &params);
   int register_moe_top1_row_task(threadblock::Graph const &bgraph,
                                std::vector<int> const &params);
+  int register_moe_topk_row_task(threadblock::Graph const &bgraph,
+                               std::vector<int> const &params);
   int register_moe_slot_task(threadblock::Graph const &bgraph,
                             std::vector<int> const &params, bool w13_linear);
+  int register_moe_weighted_sum_task(threadblock::Graph const &bgraph,
+                                   std::vector<int> const &params);
   int register_rmsnorm_hopper_task(threadblock::Graph const &bgraph,
                                    std::vector<int> const &params);
   int register_linear_swapAB_hopper_task(threadblock::Graph const &bgraph,
