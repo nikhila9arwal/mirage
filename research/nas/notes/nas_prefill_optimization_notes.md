@@ -5,6 +5,13 @@ Code under review: `/u/elu1/mpk_prefill_flat_scan/checkout`
 
 User's code-review notes, organized for later discussion. These are proposed changes and open questions, not confirmed performance findings or approved code changes.
 
+Review update: 2026-11-04. Items 1–13 preserve the original flat-scan discussion;
+items 14–22 add the later proposals and reassess them against the measured FIFO
+implementation in `/u/elu1/Async-NAS-F1` (code commit `a0b9029`). In particular,
+the FIFO build no longer uses the seen array described above. Historical paths
+and layout sizes in the original discussion refer to that earlier checkout.
+The exact original notes were pushed first in commit `5e98581`.
+
 1. **Seen bookkeeping** (original shorthand: “Seem”)
 
    - In `config` / runtime state.
@@ -282,3 +289,231 @@ User's code-review notes, organized for later discussion. These are proposed cha
     4. Make the separate diagnostic hidden-vector copy optional too. The harness includes `last_hidden` in its [capture list](/u/elu1/mpk_prefill_flat_scan/experiments/native_prefill/run.py:144), and [compare_complete()](/u/elu1/mpk_prefill_flat_scan/experiments/qwen_decoder_layer/bench_io.cuh:7) copies it on the scheduler. Removing only `save_output()` leaves that other copy running.
 
     This is a proposed capture/interface simplification. It does not require changing the model's numerical operators, batching policy, or slot-progression semantics. No implementation change or measured speedup is claimed here.
+
+14. **Important updates to the original proposals**
+
+    These are review findings, not changes implemented by this document update.
+
+    | Proposal | Current assessment |
+    |---|---|
+    | Optimize `selection_seen` / `experimental_moe_clear_seen` | Superseded for the measured FIFO configuration. Its state contains FIFO storage instead of `selection_seen`, and selection performs no seen-table reset. The legacy selector still exists behind its own configuration. |
+    | Define `members_per_slot` once | Good readability cleanup. The existing `constexpr` multiplication is already a compile-time constant; centralizing the definition is not an established runtime optimization. |
+    | Shrink `ExperimentalBatchOperator` | Focus on fields actually loaded in the hot loop. The record is 88 bytes, but reading one field does not read the entire record. A compact selector-specific representation may help more than deleting unrelated fields. |
+    | Remove the descriptor pool | Keep independent immutable storage for outstanding physical tasks. Shrinking each descriptor is different from reducing the number of descriptors. One shared descriptor cannot safely replace multiple live descriptors. |
+    | Remove `active_data[slot]` | It is an optional correctness guard, but only 64 bytes at S=16. Keep it unless its access cost is measured and an alternative validation strategy is clear. Our successful removal of duplicate immutable checks is not evidence that every runtime guard is redundant. |
+    | Remove old preparation modes | They are bypassed in native-prefill mode, but support earlier demos/configurations. Explicitly retire a mode and update its callers before deleting it. Commenting out unrelated code does not establish a performance improvement. |
+    | Call `dispatch_slot()` directly from `advance_slot()` | Possible as a single-scheduler specialization. Multiple schedulers still need notification and worker-queue ownership preserved; scheduler 0 must not start writing another scheduler's queues. All control handling measured only 0.554 s in the latest diagnostic, so this is a lower performance priority. |
+    | Compact the input-ID buffer | At S=16 and P=4 it holds only 512 bytes of int64 IDs. Changing this layout alone does not eliminate capacity-row computation in dense kernels; that requires changing their active-row handling or batching. |
+
+    Source: [conditional FIFO/seen state and descriptor pool](https://github.com/Ethan7894/Async-NAS-F1/blob/a0b90296c8235e8ca1ee740214913e8ae43bb6ca/include/mirage/persistent_kernel/experimental_moe_types.h#L191).
+
+15. **Understand `make_slot_restart_plan()` before simplifying its tables**
+
+    This is CPU-side initialization work before GPU execution, not a function
+    called for every token. It validates the supported graph and workload,
+    checks slot ownership/dependencies and finite queue bounds, and builds a
+    topological list of DataIds for each slot.
+
+    For example, if the graph has two independent chains:
+
+    ```text
+    Slot 0: D0 -> D2 -> D4
+    Slot 1: D1 -> D3 -> D5
+
+    slot_data_offsets = {0, 3, 6}
+    slot_data_ids     = {D0, D2, D4, D1, D3, D5}
+    ```
+
+    The GPU uses these tables to reset a slot's predecessor counters and to
+    traverse its tasks during dispatch. Simplifying the planner primarily
+    affects initialization/readability; changing the tables can affect the
+    runtime accesses. Preserve the topological order and queue-capacity proof.
+
+    Sources: [planner](https://github.com/Ethan7894/Async-NAS-F1/blob/a0b90296c8235e8ca1ee740214913e8ae43bb6ca/include/mirage/persistent_kernel/resident_slot_restart.cuh#L1084),
+    [counter reset](https://github.com/Ethan7894/Async-NAS-F1/blob/a0b90296c8235e8ca1ee740214913e8ae43bb6ca/include/mirage/persistent_kernel/resident_slot_restart.cuh#L55),
+    [slot dispatch](https://github.com/Ethan7894/Async-NAS-F1/blob/a0b90296c8235e8ca1ee740214913e8ae43bb6ca/include/mirage/persistent_kernel/resident_slot_restart.cuh#L446).
+
+16. **Compute slot mappings instead of storing lookup arrays?**
+
+    Proposed: replace `data_slot_ids[D]` (the DataId-to-slot lookup),
+    `slot_data_offsets[S+1]`, and possibly `slot_data_ids[D]` with formulas.
+
+    Equal DataId counts per slot are sufficient to make the offsets uniform:
+    if every slot has M entries, its list begins at `slot * M`. They are not
+    sufficient to derive each DataId or its slot. Operator-family ordering,
+    attention-head task multiplicity, and topological ordering also matter.
+
+    A specialized layout could use formulas if the compiler/planner verifies
+    that exact layout. Keep a general lookup fallback for other graphs. Do not
+    assume `slot = data_id % S` merely because each slot has the same graph.
+    Avoid replacing one load with a more expensive family-search operation.
+
+    This is a possible compiler/runtime specialization, not a deletion justified
+    by the current batch size alone. No performance benefit is measured yet.
+
+17. **Uniform terminal counts and the single-terminal case**
+
+    Proposed: replace `slot_num_terminal_data[S]` with one scalar when all slots
+    have the same number of terminals, or specialize the current one-terminal
+    workload. The saved 48-layer/readout graph has one terminal per slot.
+
+    Distinguish the expected terminal count from
+    `slot_completed_terminal_data_count[S]`, which tracks completed terminals.
+    These are also separate from the MoE token/branch join counters.
+
+    The runtime already avoids the terminal-counter atomic in the common case:
+
+    ```cpp
+    uint32_t required = config.slot_num_terminal_data[slot];
+    if (required == 1u) return static_cast<int>(slot);
+    // Only multiple-terminal slots need the counter increment below this.
+    ```
+
+    A host-verified uniform count could remove an array lookup and allocation.
+    Keep multiple-terminal support unless we explicitly restrict the graph API;
+    otherwise a new independent output could silently permit premature restart.
+    At S=16 each uint32 array is only 64 bytes. This is not a leading measured
+    bottleneck. [Current fast path](https://github.com/Ethan7894/Async-NAS-F1/blob/a0b90296c8235e8ca1ee740214913e8ae43bb6ca/include/mirage/persistent_kernel/resident_persistent_kernel.cuh#L1252).
+
+18. **Narrow the pending expert-ID array**
+
+    Proposed: use `uint16_t` for
+    `ExperimentalMoePendingSlot::experts[P][R]` instead of `uint32_t`.
+    This is reasonable if the supported expert-ID range and any invalid sentinel
+    are checked explicitly. Keep arithmetic/indexing widened where needed.
+
+    At S=16, P=4, R=8, the array payload across all slots drops from 2,048 to
+    1,024 bytes: a 1 KiB saving. It scales with S*P*R, but is small for this run.
+    Narrower storage does not guarantee faster scalar loads or fewer registers.
+
+    Correction to the original reasoning: unsigned eight-bit IDs represent
+    0–255. More than 128 experts alone does not require 16 bits. Supporting
+    256 valid IDs plus a distinct invalid sentinel, or larger expert sets, does.
+
+19. **Compact descriptor routing and expert metadata**
+
+    User proposal: pack the binary `batch.routing` entries into bitsets and
+    simplify the expert mask when coalescing is disabled.
+
+    A 16-row membership mask fits in one uint32. However, the existing adapter
+    and physical kernel consume an integer membership tensor and an expert list
+    whose count lives at `mask[E]`. Changing the storage requires changing those
+    reads as well; simply changing the array's element type is incorrect.
+
+    There is a simpler candidate for the current single-expert batches:
+
+    ```text
+    selected expert = batch.expert
+    membership(local_row) = local_row < batch.count
+    ```
+
+    Every selected physical row already belongs to that expert, even though a
+    logical token has top-k branches. This could eliminate the stored membership
+    bitmap on a specialized path. Retain input/output row maps, branch identity,
+    epoch, and immutable descriptor lifetime. Preserve the generic path if mixed
+    experts remain an experimental option. `batch.expert` is already one uint32;
+    the larger object is the mask/list and routing representation around it.
+
+    Capacity and traffic differ: `routing[128 * 16]` reserves 8 KiB per
+    descriptor, but dispatch clears only each selected expert's 16-entry row.
+    With coalescing off, that clear writes 64 bytes, followed by membership
+    stores for selected members. Other expert rows remain untouched. Removing
+    reserved holes need not save 8 KiB of traffic per dispatch.
+
+    Compact routing may simplify the interface and reduce footprint. Its
+    contribution to the measured 4.635 s of descriptor construction is not yet
+    isolated. [Current adapter contract](https://github.com/Ethan7894/Async-NAS-F1/blob/a0b90296c8235e8ca1ee740214913e8ae43bb6ca/include/mirage/persistent_kernel/fixed_moe_adapter.cuh#L18).
+
+20. **Parallelize routing initialization or readiness work across a warp?**
+
+    Candidate independent work includes clearing selected routing rows, decoding
+    per-token routing, and writing different members' metadata. The scheduler
+    currently returns immediately for every thread except thread 0, so a warp
+    implementation requires an explicit cooperative region and synchronization.
+
+    The whole insertion loop cannot simply run one branch per lane:
+
+    - Different tokens can append to the same expert FIFO. Concurrent head/tail,
+      count, and active-list updates would conflict.
+    - `pending_mask |= bit` is a shared read-modify-write. Reduce lane masks and
+      let one owner store the result, or use another correct update protocol.
+    - Occupancy/trace bookkeeping also has ownership assumptions.
+    - Finish descriptor writes before the existing release publication; worker
+      consumption must still acquire the completed descriptor.
+
+    Prefer parallel read/compute with a single owner committing shared state if
+    this is tested. Keep the branch join initialized before any dispatch.
+
+    Before parallelizing the routing scan, consider avoiding it:
+    `experimental_moe_ready()` currently scans E routing ranks per active token
+    to reconstruct R expert IDs. A direct `selected_experts[token][branch]`
+    output from top-k could replace that scan. This needs a routing-interface
+    change and measurement; it is not already implemented by FIFO membership.
+    [Current scan and TODO](https://github.com/Ethan7894/Async-NAS-F1/blob/a0b90296c8235e8ca1ee740214913e8ae43bb6ca/include/mirage/persistent_kernel/experimental_moe_runtime.cuh#L197).
+
+21. **Request identity duplication and `next_request_id`**
+
+    `request_ids[slot] = request * 64 + position` duplicates information available
+    from `decode_slot_request_ids[slot]` and `slot_token_position[slot]` in native
+    prefill. It is also the pass/capture key used by inherited instrumentation.
+    We could derive that key at its consumers, after auditing those consumers
+    and keeping generated-output indexing distinct from prompt/pass indexing.
+
+    `next_request_id` is not unused, despite its misleading name:
+
+    | Field | Meaning in the current native-prefill path |
+    |---|---|
+    | `decode_next_request` | Next request in the offline admission queue; advances once per admitted request. |
+    | `next_request_id` | Cumulative prepared graph passes; advances for each prompt chunk or decode pass and is checked against `num_contexts`. |
+    | `request_ids[slot]` | Encoded request/position key for this slot's current pass. |
+
+    Other ContextIO modes use `next_request_id` as their input cursor. The
+    experimental scheduler also passes it to occupancy bookkeeping. Removing
+    it requires replacing or retiring these uses. Renaming it by policy is a
+    readability option; deleting it is not a demonstrated speed optimization.
+    [Current pass-counter update](https://github.com/Ethan7894/Async-NAS-F1/blob/a0b90296c8235e8ca1ee740214913e8ae43bb6ca/include/mirage/persistent_kernel/resident_slot_restart.cuh#L191).
+
+22. **Measured priorities after the FIFO winner optimization**
+
+    Job 3530637, `diagnostic_fifo_cached_unchecked`, uses 16 slots/workers,
+    one scheduler, completion budget 16, 48 layers, P=4, top-8, B=8, and
+    T=100 microseconds. Dense batching and expert companions are off. The
+    instrumented invocation took 51.734 s and produced the same 663 NAS tokens.
+
+    | Measured scope | Summed seconds | Interpretation |
+    |---|---:|---|
+    | Choose winner, including unsuccessful scans | 16.653 | Largest measured selection component. |
+    | Entire completion handler | 13.503 | Includes logical completion, successor readiness, and retirement. |
+    | Descriptor construction/removal of selected pending members | 4.635 | Includes more than routing initialization. |
+    | All control-event handling | 0.554 | Includes slot preparation/restart; output-copy cost is not isolated. |
+    | Ready-side FIFO membership loop | 0.578 | Inside completion/control work; excludes the earlier E-expert routing scan. |
+
+    Do not add nested scopes: the winner/descriptor scopes are inside dispatch,
+    and ready-side maintenance is inside its callers. Full dispatch was 30.074 s.
+    These are diagnostic timings, not the separate uninstrumented performance
+    control. All these measurements are individual invocations, not variance
+    estimates. [Full local report](/work/hdd/bgpd/elu1/nas_fifo_winner_20261105T004506Z/results/job_3530637/measurement/REPORT.md).
+
+    Suggested next steps, not an approved implementation plan:
+
+    1. Try compact hot metadata for the winner scan: bin identity, count, oldest
+       timestamp, threshold, and timeout. Keep the existing FIFO, eligibility,
+       and tie-breaking policy. Update any cached fields on append/commit and
+       maintain one authoritative count. Compare generated instructions and
+       replay identical selector inputs before matched GPU timing. Reduced
+       scattered accesses/dependencies are the hypothesis, not a promised gain.
+    2. Subdivide completion handling into validation, dependency release,
+       routing decoding, FIFO insertion, publication, and retirement as useful.
+       Use that evidence to choose between removing the E-expert reconstruction
+       scan and other completion changes. Existing ready-membership timing does
+       not measure the whole `experimental_moe_ready()` function.
+    3. Evaluate a compact single-expert descriptor path separately. Keep the
+       descriptor pool and row/branch ownership. Measure actual writes and
+       kernel effects instead of predicting speedup from `sizeof` alone.
+    4. Treat constant definitions, legacy-mode cleanup, uniform terminal counts,
+       and optional hidden capture as separate readability/interface work.
+
+    A global CSR activation redesign, multiple controllers, or a cooperative
+    warp introduces broader changes than these initial experiments. Preserve
+    the current code and policy as the comparison baseline. No code or GPU job
+    is changed by this notes update.

@@ -10,6 +10,9 @@ small programs that previously lived beside isolated `checkout/` copies:
 - `measurement`: matched whole-model timing and optional device diagnostics.
 - `tests`: standalone selector/FIFO replay and its independent reference.
 - `archive`: original DeltaAI launch commands retained for provenance.
+- `notes/nas_prefill_optimization_notes.md`: optimization proposals, review
+  updates for the FIFO implementation, and measured priorities. Historical
+  source/result links refer to paths on the original research machine.
 
 No weights, cache tensors, compiled test binaries, or raw GPU traces are included.
 Legacy HF-prefix demos and archived scripts contain site-specific default data
