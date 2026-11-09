@@ -56,7 +56,7 @@ class SelectorAccounting(unittest.TestCase):
     def test_fifo_winner_variants_use_the_same_phase_boundaries(self):
         p,s,d=self.fixture()
         baseline=analyze_selector(p,s,d,'fifo')
-        for name in ('fifo_cached','fifo_cached_unchecked'):
+        for name in ('fifo_cached','fifo_cached_unchecked','fifo_hot'):
             result=analyze_selector(p,s,d,name)
             self.assertTrue(result['passed'])
             self.assertEqual(result['rows'],baseline['rows'])

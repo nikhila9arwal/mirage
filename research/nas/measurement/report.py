@@ -5,7 +5,12 @@ from pathlib import Path
 
 def write_report(output):
     reports = [json.loads(p.read_text()) for p in sorted(output.glob('*/report.json'))]
-    text = ['# FIFO winner-loop comparison', '',
+    # Keep archived/baseline comparisons relative to fifo. The compact-record
+    # experiment changes only the representation of fifo_cached_unchecked.
+    reference_selector = ('fifo_cached_unchecked'
+                          if any(r['selector'] == 'fifo_hot' for r in reports)
+                          else 'fifo')
+    text = ['# Compact FIFO records and packed-weight comparison', '',
         'Real 48-layer Qwen3-30B-A3B, identical 64 offline prompts; 16 slots, 16 worker CTAs, '
         'one controller; P=4, top-k=8, H=2048, I=768, 128 experts. MoE threshold 8, timeout '
         '100 microseconds, batch capacity 16, descriptor pool 16. Dense batching and both '
@@ -14,14 +19,16 @@ def write_report(output):
         'and (op_id, expert) equal-age tie rule. fifo is the preserved baseline. '
         'fifo_cached stores the head timestamp per bin. fifo_cached_unchecked also '
         'omits duplicate per-bin present/enabled checks, reusing the validation in ready(). '
-        'No heap, extra scheduler, kernel, or compiler change is included.', '',
+        'fifo_hot keeps count, oldest, and policy parameters in compact active records. '
+        'Its control is fifo_cached_unchecked. No heap, extra scheduler, kernel, or compiler change is included.', '',
         'Each variant is one full invocation. GPU timing excludes checkpoint loading, compilation, '
         'and host analysis. Compare within the same instrumentation and completion budget. '
-        'Diagnostics can alter batch formation; uninstrumented controls are reported separately.', '',
+        'Diagnostics can alter batch formation; uninstrumented controls are reported separately.',
+        f'The speedup reference in this report is {reference_selector}.', '',
         '| Variant | Completion budget | Invocation s | Generated tokens | Tokens/s | Speedup vs matching FIFO baseline | Checks |',
         '|---|---:|---:|---:|---:|---:|---|']
     for r in reports:
-        old = next((x for x in reports if x['selector']=='fifo' and
+        old = next((x for x in reports if x['selector']==reference_selector and
             x['instrumentation']==r['instrumentation'] and x['completion_budget']==r['completion_budget']),None)
         speed = f"{old['invocation_seconds']/r['invocation_seconds']:.3f}x" if old else 'not run'
         text.append(f"| {r['variant']} | {r['completion_budget']} | {r['invocation_seconds']:.6f} | "
@@ -86,13 +93,21 @@ def write_report(output):
             f"[Selector CSV]({name}/selector_timings.csv), [counts]({name}/selector.json), "
             f"[dispatch CSV]({name}/dispatch_timings.csv), [raw measurements]({name}/measurements.npz), "
             f"[validation]({name}/report.json)."]
-    text += ['', 'Only completed variants appear above. See status.json, failure.json (if present), '
-        'and the Slurm log for incomplete runs. Faster selection can itself change arrival timing '
-        'and batching. One run does not measure variance or establish each optimization’s isolated '
-        'contribution. Compare diagnostic_fifo to diagnostic_fifo_cached for age caching, '
-        'then diagnostic_fifo_cached to diagnostic_fifo_cached_unchecked for the additional '
-        'effect of removing duplicate validity checks. Their changed execution timing can '
-        'alter bin populations; use both per-call and per-inspected-bin costs.']
+    if (output/'loading.json').exists():
+        loading=json.loads((output/'loading.json').read_text())
+        text += ['', '## Loading (separate from GPU invocation timing)', '',
+            '| Loader | Wall seconds | Exact tensors verified |', '|---|---:|---:|']
+        for key in ('original','packed'):
+            if key+'_load_seconds' in loading:
+                text.append(f"| {key} | {loading[key+'_load_seconds']:.3f} | {loading[key+'_tensors_verified']} |")
+        text += ['', 'Loading order: '+', '.join(loading['order'])+'. Hash checks are timed separately. '
+            'Filesystem cache state is uncontrolled, so this is not an isolated storage-bandwidth comparison. '
+            'Both loaders are checked against exact per-tensor packed-cache hashes; selector variants share one packed load.',
+            '', '[Detailed loading measurements](loading.json).']
+    text += ['', 'Only completed variants appear above. Inspect status/failure JSON for incomplete runs. '
+        'Compare fifo_hot with fifo_cached_unchecked at matching instrumentation and completion budget. '
+        'Use both per-call/per-bin selection costs and FIFO maintenance costs; faster selection can change batching. '
+        'Single invocations do not establish variance. Uninstrumented controls determine end-to-end performance.']
     (output/'REPORT.md').write_text('\n'.join(text)+'\n')
 
 

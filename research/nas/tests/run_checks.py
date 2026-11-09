@@ -14,7 +14,7 @@ import sys
 SESSION = Path(__file__).resolve().parents[1]
 ROOT = SESSION.parents[1]
 OPTIONS = {'baseline': (0, 0), 'cached': (1, 0),
-           'checks_only': (0, 1), 'fast': (1, 1)}
+           'checks_only': (0, 1), 'fast': (1, 1), 'hot': (1, 1)}
 
 
 def main():
@@ -32,7 +32,8 @@ def main():
         for name, (cache, skip) in OPTIONS.items():
             flags = [f'-DNAS_PREFILL_CHUNK_ROWS={p}', f'-DNAS_MOE_TOP_K={r}',
                      f'-DNAS_FIFO_CACHE_OLDEST={cache}',
-                     f'-DNAS_FIFO_SKIP_STATIC_CHECKS={skip}']
+                     f'-DNAS_FIFO_SKIP_STATIC_CHECKS={skip}',
+                     f'-DNAS_FIFO_HOT_RECORDS={int(name == "hot")}']
             binary = output / f'fifo_p{p}_r{r}_{name}'
             subprocess.run([os.environ.get('CXX', 'g++'), '-std=c++17', '-O2',
                             '-Wall', '-Wextra', '-pedantic', *common, *flags,
@@ -52,6 +53,8 @@ def main():
     subprocess.run([sys.executable, '-B', '-m', 'unittest', 'test_analysis',
                     'test_dispatch_analysis', 'test_selector_analysis'],
                    cwd=SESSION / 'measurement', check=True)
+    subprocess.run([sys.executable, '-B', '-m', 'unittest', 'test_packed_loading'],
+                   cwd=SESSION / 'tests', check=True)
 
 
 if __name__ == '__main__':

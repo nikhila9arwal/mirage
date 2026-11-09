@@ -252,7 +252,8 @@ __device__ __forceinline__ void experimental_moe_ready(
       uint32_t member = (slot * EXPERIMENTAL_MOE_CHUNK_ROWS + token) *
                             EXPERIMENTAL_MOE_TOP_K + branch;
       require_request_slot_invariant(
-          experimental_moe_fifo_append(state.fifo, key, member, ready_ns));
+          experimental_moe_fifo_append(state.fifo, key, member, ready_ns,
+                                       op.threshold, op.timeout_ns));
 #endif
       occupancy.ready(op.kind, ready_ns);
       // All members share logical readiness. Physical completion order is free.

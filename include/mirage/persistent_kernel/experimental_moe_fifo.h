@@ -13,7 +13,31 @@ namespace mirage { namespace runtime {
 // descriptor before selection. Selection itself never removes any work.
 NAS_MOE_FIFO_INLINE bool experimental_moe_fifo_append(
     ExperimentalMoeFifo &fifo, uint32_t key, uint32_t member,
-    unsigned long long ready_ns) {
+    unsigned long long ready_ns, uint32_t threshold = 0u,
+    unsigned long long timeout_ns = 0u) {
+#if NAS_FIFO_HOT_RECORDS
+  if (key >= EXPERIMENTAL_MOE_SELECTION_BINS ||
+      member >= EXPERIMENTAL_MOE_PENDING_ROWS) return false;
+  uint32_t position = fifo.active_position[key];
+  if (position == 0u) {
+    if (fifo.active_count >= EXPERIMENTAL_MOE_PENDING_ROWS) return false;
+    uint32_t index = fifo.active_count++;
+    // Threshold and timeout are immutable operation parameters. Capture once
+    // when this bin becomes active; the winner scan needs no operator lookup.
+    fifo.active[index] = {ready_ns, timeout_ns, key, threshold, 0u, 0u, 0u};
+    position = index + 1u;
+    fifo.active_position[key] = position;
+    fifo.head[key] = member;
+  } else {
+    if (fifo.active[position - 1u].count == UINT16_MAX) return false;
+    fifo.next[fifo.tail[key]] = member;
+  }
+  fifo.next[member] = UINT32_MAX;
+  fifo.tail[key] = member;
+  ++fifo.active[position - 1u].count;
+#else
+  (void)threshold;
+  (void)timeout_ns;
 #if !NAS_FIFO_CACHE_OLDEST
   (void)ready_ns;
 #endif
@@ -34,6 +58,7 @@ NAS_MOE_FIFO_INLINE bool experimental_moe_fifo_append(
   fifo.next[member] = UINT32_MAX;
   fifo.tail[key] = member;
   ++fifo.count[key];
+#endif
   return true;
 }
 
@@ -51,6 +76,9 @@ NAS_MOE_FIFO_INLINE ExperimentalMoeSelection experimental_moe_select_fifo(
 #if NAS_FIFO_CACHE_OLDEST
   (void)pending;
 #endif
+#if NAS_FIFO_HOT_RECORDS
+  (void)operators;
+#endif
   experimental_moe_selection_stamp(timing, 0);
   ExperimentalMoeSelection selected;
   uint64_t best_time = UINT64_MAX;
@@ -58,6 +86,18 @@ NAS_MOE_FIFO_INLINE ExperimentalMoeSelection experimental_moe_select_fifo(
   experimental_moe_selection_stamp(timing, 1);
 
   for (uint32_t i = 0; i < fifo.active_count; ++i) {
+#if NAS_FIFO_HOT_RECORDS
+    auto const &bin = fifo.active[i];
+    uint32_t key = bin.key;
+    uint32_t op_id = key / EXPERIMENTAL_MOE_EXPERTS;
+#ifdef NAS_INVESTIGATE_ALL_ROWS
+    if ((eligible_ops & (1u << op_id)) == 0u) continue;
+#endif
+    uint32_t count = bin.count;
+    uint64_t oldest = bin.oldest;
+    bool threshold = count >= bin.threshold;
+    bool timeout = now - oldest >= bin.timeout_ns;
+#else
     uint32_t key = fifo.active[i];
     uint32_t op_id = key / EXPERIMENTAL_MOE_EXPERTS;
     auto const &op = operators[op_id];
@@ -81,6 +121,7 @@ NAS_MOE_FIFO_INLINE ExperimentalMoeSelection experimental_moe_select_fifo(
 #endif
     bool threshold = count >= op.threshold;
     bool timeout = now - oldest >= op.timeout_ns;
+#endif
     // Equal ages use (op_id, expert), independent of active-list swaps. This
     // intentionally replaces the old flat-member-index tie rule. Members of
     // the selected bin leave in FIFO arrival order, not flat slot order.
@@ -133,14 +174,36 @@ NAS_MOE_FIFO_INLINE bool experimental_moe_fifo_commit(
   if (selected.op_id < 0 || i >= fifo.active_count || selected.count == 0u ||
       selected.count > EXPERIMENTAL_MOE_BATCH_CAPACITY) return false;
   uint32_t key = uint32_t(selected.op_id) * EXPERIMENTAL_MOE_EXPERTS + selected.expert;
+#if NAS_FIFO_HOT_RECORDS
+  auto &bin = fifo.active[i];
+  if (bin.key != key || fifo.active_position[key] != i + 1u ||
+      bin.count != selected.group_count || selected.count > bin.count) return false;
+#else
   if (fifo.active[i] != key || fifo.count[key] != selected.group_count ||
       selected.count > fifo.count[key]) return false;
+#endif
   // Selection already traversed these links. One lookup after the last
   // selected member advances the head past the entire captured prefix.
   uint32_t j = selected.count - 1u;
   uint32_t last = (selected.slots[j] * EXPERIMENTAL_MOE_CHUNK_ROWS +
                    selected.tokens[j]) * EXPERIMENTAL_MOE_TOP_K + selected.branches[j];
   fifo.head[key] = fifo.next[last];
+#if NAS_FIFO_HOT_RECORDS
+  bin.count -= selected.count;
+  if (bin.count == 0u) {
+    fifo.tail[key] = UINT32_MAX;
+    uint32_t last_index = --fifo.active_count;
+    if (i != last_index) {
+      fifo.active[i] = fifo.active[last_index];
+      fifo.active_position[fifo.active[i].key] = i + 1u;
+    }
+    fifo.active_position[key] = 0u;
+  } else {
+    constexpr uint32_t members_per_slot =
+        EXPERIMENTAL_MOE_CHUNK_ROWS * EXPERIMENTAL_MOE_TOP_K;
+    bin.oldest = pending[fifo.head[key] / members_per_slot].ready_ns;
+  }
+#else
   fifo.count[key] -= selected.count;
   if (fifo.count[key] == 0u) {
     fifo.tail[key] = UINT32_MAX;
@@ -154,6 +217,7 @@ NAS_MOE_FIFO_INLINE bool experimental_moe_fifo_commit(
     fifo.oldest[key] = pending[fifo.head[key] / members_per_slot].ready_ns;
 #endif
   }
+#endif
   return true;
 }
 }} // namespace mirage::runtime

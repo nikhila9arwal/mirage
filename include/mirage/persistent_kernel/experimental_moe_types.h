@@ -27,6 +27,15 @@
 #error "FIFO winner optimizations require NAS_SELECTOR_FIFO=1"
 #endif
 
+// Compact active records are an independent experiment, off by default.
+// Compare against the already-validated cached/unchecked FIFO, not a policy change.
+#ifndef NAS_FIFO_HOT_RECORDS
+#define NAS_FIFO_HOT_RECORDS 0
+#endif
+#if NAS_FIFO_HOT_RECORDS && (!NAS_SELECTOR_FIFO || !NAS_FIFO_CACHE_OLDEST || !NAS_FIFO_SKIP_STATIC_CHECKS)
+#error "Hot records require the cached, unchecked FIFO baseline"
+#endif
+
 namespace mirage { namespace runtime {
 #ifndef NAS_MOE_STATE_SLOTS
 #define NAS_MOE_STATE_SLOTS 16
@@ -173,6 +182,30 @@ struct ExperimentalMoeSelectionScratch {
 // another independently maintained histogram. Only undispatched members live
 // here; descriptors own members after dispatch. Each flat (slot,token,branch)
 // position supplies one link, so we do not reserve a large FIFO for every bin.
+// The scan reads this contiguous record without first following key-indexed
+// arrays. Count is authoritative here in the hot variant; there is no second
+// count to keep in sync. Explicit reserved fields make CPU/GPU replay bytes
+// deterministic and keep the record naturally 32 bytes.
+struct ExperimentalMoeActiveBin {
+  uint64_t oldest, timeout_ns;
+  uint32_t key, threshold;
+  uint16_t count, reserved16;
+  uint32_t reserved32;
+};
+static_assert(sizeof(ExperimentalMoeActiveBin) == 32);
+
+#if NAS_FIFO_HOT_RECORDS
+struct ExperimentalMoeFifo {
+  ExperimentalMoeActiveBin active[EXPERIMENTAL_MOE_PENDING_ROWS];
+  // Zero means empty; otherwise position+1. Reset invalidates stale records.
+  uint32_t active_position[EXPERIMENTAL_MOE_SELECTION_BINS];
+  uint32_t head[EXPERIMENTAL_MOE_SELECTION_BINS];
+  uint32_t tail[EXPERIMENTAL_MOE_SELECTION_BINS];
+  uint32_t next[EXPERIMENTAL_MOE_PENDING_ROWS];
+  uint32_t active_count;
+};
+#else
+// Keep the control's byte layout as well as its behavior unchanged.
 struct ExperimentalMoeFifo {
   uint16_t count[EXPERIMENTAL_MOE_SELECTION_BINS];
   uint32_t head[EXPERIMENTAL_MOE_SELECTION_BINS];
@@ -187,6 +220,8 @@ struct ExperimentalMoeFifo {
   uint64_t oldest[EXPERIMENTAL_MOE_SELECTION_BINS];
 #endif
 };
+
+#endif
 
 struct ExperimentalMoeState {
   ExperimentalBatchOperator operators[EXPERIMENTAL_BATCH_OPERATORS];

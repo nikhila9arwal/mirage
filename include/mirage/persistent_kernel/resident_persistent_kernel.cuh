@@ -456,7 +456,11 @@ __global__ void prepare_kernel(ResidentRuntimeConfig config,
     // member link before use. Empty bins never read stale cached ages.
     for (unsigned int key = blockIdx.x * blockDim.x + threadIdx.x;
          key < EXPERIMENTAL_MOE_SELECTION_BINS; key += blockDim.x * gridDim.x)
+#if NAS_FIFO_HOT_RECORDS
+      config.experimental_moe->fifo.active_position[key] = 0u;
+#else
       config.experimental_moe->fifo.count[key] = 0u;
+#endif
     if (blockIdx.x == 0 && threadIdx.x == 0)
       config.experimental_moe->fifo.active_count = 0u;
 #elif NAS_SELECTOR_HISTOGRAM

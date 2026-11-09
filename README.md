@@ -19,6 +19,8 @@ next operation. The current prefill harness leaves dense QKV/W_O batching off.
 
 ## Start here
 
+- [Reviewer guide: what changed from resident NAS](research/nas/REVIEWER_GUIDE.md)
+- [How to run asynchronous binned MPK](research/nas/HOW_TO_RUN.md)
 - [NAS experiments, tests, and reproduction](research/nas/README.md)
 - [Source provenance and rollback](research/nas/PROVENANCE.md)
 - [Runtime](include/mirage/persistent_kernel/experimental_moe_runtime.cuh)

@@ -8,6 +8,7 @@ PHASES = {
 }
 PHASES['fifo_cached'] = PHASES['fifo']
 PHASES['fifo_cached_unchecked'] = PHASES['fifo']
+PHASES['fifo_hot'] = PHASES['fifo']
 
 
 def analyze_membership(raw, selected_rows, published):

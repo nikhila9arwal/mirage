@@ -25,6 +25,31 @@ struct Fixture {
   ExperimentalMoeFifo fifo = {};
   ExperimentalMoeSelection selected;
 };
+
+uint32_t active_key(ExperimentalMoeFifo const &fifo, uint32_t i) {
+#if NAS_FIFO_HOT_RECORDS
+  return fifo.active[i].key;
+#else
+  return fifo.active[i];
+#endif
+}
+uint32_t bin_count(ExperimentalMoeFifo const &fifo, uint32_t key) {
+#if NAS_FIFO_HOT_RECORDS
+  return fifo.active_position[key] ? fifo.active[fifo.active_position[key]-1].count : 0;
+#else
+  return fifo.count[key];
+#endif
+}
+uint64_t bin_age(ExperimentalMoeFifo const &fifo, uint32_t key) {
+#if NAS_FIFO_HOT_RECORDS
+  return fifo.active[fifo.active_position[key]-1].oldest;
+#elif NAS_FIFO_CACHE_OLDEST
+  return fifo.oldest[key];
+#else
+  (void)fifo; (void)key; return 0;
+#endif
+}
+
 enum Kind { APPEND, SELECT, COMMIT, RESET };
 struct Action { Kind kind; uint32_t member, key; unsigned long long time; };
 
@@ -45,7 +70,8 @@ void act(Fixture &f, Action a) {
     assert(slot.op_id == a.key / 128 && slot.ready_ns == a.time);
     slot.experts[offset/R][offset%R] = a.key % 128;
     slot.pending_mask |= 1u << offset;
-    assert(experimental_moe_fifo_append(f.fifo,a.key,a.member,a.time));
+    assert(experimental_moe_fifo_append(f.fifo,a.key,a.member,a.time,
+        f.operators[a.key/128].threshold,f.operators[a.key/128].timeout_ns));
   } else if (a.kind == SELECT) {
     f.selected = experimental_moe_select_fifo(f.pending,f.operators,f.fifo,a.time);
   } else if (a.kind == COMMIT) {
@@ -58,7 +84,11 @@ void act(Fixture &f, Action a) {
     }
   } else {
     // Match prepare_kernel: links/heads/tails intentionally retain old bytes.
+#if NAS_FIFO_HOT_RECORDS
+    for (auto &n : f.fifo.active_position) n=0;
+#else
     for (auto &n : f.fifo.count) n=0;
+#endif
     f.fifo.active_count=0;
     for (auto &row : f.pending) row.pending_mask=0;
   }
@@ -95,7 +125,11 @@ int main() {
   auto initial=std::make_unique<Fixture>();
   for (uint32_t i=0; i<OPS; ++i) {
     auto &op=initial->operators[i];
-    op.present=op.enabled=1; op.threshold=8; op.timeout_ns=1000;
+    op.present=op.enabled=1;
+    // Operation zero retains the explicit deadline-boundary fixture below.
+    // Other operations exercise copying distinct immutable policy parameters.
+    op.threshold=i==0 ? 8u : 1u+i%16u;
+    op.timeout_ns=i==0 ? 1000u : 1u+(i*137u)%1000u;
   }
   auto owned=std::make_unique<Fixture>(*initial);
   auto &f=*owned;
@@ -109,11 +143,17 @@ int main() {
     assert(f.fifo.active_count==queues.size());
     std::vector<bool> seen(N,false);
     std::vector<uint32_t> keys;
-    for (uint32_t i=0; i<f.fifo.active_count; ++i) keys.push_back(f.fifo.active[i]);
+    for (uint32_t i=0; i<f.fifo.active_count; ++i) keys.push_back(active_key(f.fifo,i));
     std::sort(keys.begin(),keys.end());
     size_t k=0;
     for (auto const &[key,q] : queues) {
-      assert(keys[k++]==key && f.fifo.count[key]==q.size());
+      assert(keys[k++]==key && bin_count(f.fifo,key)==q.size());
+#if NAS_FIFO_HOT_RECORDS
+      uint32_t pos=f.fifo.active_position[key];
+      assert(pos>0 && pos<=f.fifo.active_count && f.fifo.active[pos-1].key==key);
+      assert(f.fifo.active[pos-1].threshold==f.operators[key/128].threshold);
+      assert(f.fifo.active[pos-1].timeout_ns==f.operators[key/128].timeout_ns);
+#endif
       uint32_t index=f.fifo.head[key];
       for (uint32_t member : q) {
         assert(index==member && member<N && !seen[member]); seen[member]=true;
@@ -126,11 +166,11 @@ int main() {
       // The oracle follows the head even when the selector uses cached age.
       // This catches a stale age after partial dispatch, empty-bin reuse, or
       // prepare_kernel-style reset (which deliberately leaves age bytes alone).
-      assert(f.fifo.oldest[key]==f.pending[q.front()/(P*R)].ready_ns);
+      assert(bin_age(f.fifo,key)==f.pending[q.front()/(P*R)].ready_ns);
 #endif
     }
     for (uint32_t key=0; key<EXPERIMENTAL_MOE_SELECTION_BINS; ++key)
-      if (!queues.count(key)) assert(f.fifo.count[key]==0);
+      if (!queues.count(key)) assert(bin_count(f.fifo,key)==0);
     for (uint32_t member=0; member<N; ++member)
       assert(seen[member]==bool(experimental_moe_row(f.pending,member).pending));
   };

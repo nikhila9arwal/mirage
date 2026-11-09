@@ -35,8 +35,9 @@ def compile_options(args, out, pointers, variant):
         flags = [f'-DNAS_INVESTIGATE_COMPLETION_BUDGET={args.completion_budget}',
             f'-DNAS_SELECTOR_HISTOGRAM={int(policy == "histogram")}',
             f'-DNAS_SELECTOR_FIFO={int(policy.startswith("fifo"))}',
-            f'-DNAS_FIFO_CACHE_OLDEST={int(policy in ("fifo_cached", "fifo_cached_unchecked"))}',
-            f'-DNAS_FIFO_SKIP_STATIC_CHECKS={int(policy == "fifo_cached_unchecked")}',
+            f'-DNAS_FIFO_CACHE_OLDEST={int(policy in ("fifo_cached", "fifo_cached_unchecked", "fifo_hot"))}',
+            f'-DNAS_FIFO_SKIP_STATIC_CHECKS={int(policy in ("fifo_cached_unchecked", "fifo_hot"))}',
+            f'-DNAS_FIFO_HOT_RECORDS={int(policy == "fifo_hot")}',
             '-DMIRAGE_EXPERIMENTAL_MOE_BATCHING=1',
             '-DNAS_MOE_TOP_K=8', '-DNAS_MOE_STATE_SLOTS=16', '-DNAS_MOE_LAYERS=48',
             '-DNAS_MOE_H=2048', '-DNAS_MOE_I=768',
@@ -135,7 +136,14 @@ def run(args):
         save(out / 'workload.json', data)
         owners = json.loads((snapshot / 'model.safetensors.index.json').read_text())['weight_map']
         progress('load_checkpoint')
-        weights = load_weights(torch, config, snapshot, owners, progress)
+        if args.packed_weights:
+            from packed_weights import load_for_experiment, source_identity, cache_manifest
+            _, expected_source = source_identity(data['checkpoint'])
+            assert cache_manifest(args.packed_weights, snapshot)['source'] == expected_source
+            weights = load_for_experiment(torch, config, snapshot, owners, progress,
+                args.packed_weights, out/'loading.json', compare_legacy=args.compare_loader)
+        else:
+            weights = load_weights(torch, config, snapshot, owners, progress)
         tokenizer = AutoTokenizer.from_pretrained(snapshot, local_files_only=True)
         progress('weights_ready')
         summary = []
@@ -237,8 +245,9 @@ def run(args):
                     bool(torch.isfinite(saved_cpu[request,:length]).all()) and
                     bool(torch.isnan(saved_cpu[request,length:]).all()))
             report = dict(variant=variant, selector=policy, completion_budget=args.completion_budget,
-                fifo_cache_oldest=policy in ('fifo_cached', 'fifo_cached_unchecked'),
-                fifo_skip_static_checks=policy == 'fifo_cached_unchecked',
+                fifo_cache_oldest=policy in ('fifo_cached', 'fifo_cached_unchecked', 'fifo_hot'),
+                fifo_hot_records=policy == 'fifo_hot',
+                fifo_skip_static_checks=policy in ('fifo_cached_unchecked', 'fifo_hot'),
                 instrumentation="diagnostic" if variant.startswith("diagnostic") else "off",
                 invocation_seconds=elapsed, host_launch_to_sync_seconds=host_elapsed,
                 same_tokens_as_preserved_control=bool(torch.equal(tokens,baseline["tokens"]) and
@@ -288,12 +297,18 @@ if __name__=='__main__':
     parser.add_argument('--hf-reference', type=Path, required=True)
     parser.add_argument('--variants', nargs='+', choices=('diagnostic_legacy','diagnostic_histogram','control_legacy','control_histogram',
                         'diagnostic_fifo','control_fifo','diagnostic_fifo_cached','control_fifo_cached',
-                        'diagnostic_fifo_cached_unchecked','control_fifo_cached_unchecked'),
+                        'diagnostic_fifo_cached_unchecked','control_fifo_cached_unchecked',
+                        'diagnostic_fifo_hot','control_fifo_hot'),
                         default=['control_fifo','control_fifo_cached_unchecked',
                                  'diagnostic_fifo','diagnostic_fifo_cached','diagnostic_fifo_cached_unchecked'])
+    parser.add_argument('--packed-weights',type=Path)
+    parser.add_argument('--compare-loader',action='store_true',help='Time and byte-check original loading before packed loading')
     parser.add_argument('--completion-budget',type=int,choices=(1,16),default=1)
     parser.add_argument('--baseline-outputs',type=Path,required=True)
     parser.add_argument('--task-capacity',type=int,default=250000)
     parser.add_argument('--budget-seconds',type=int,default=6900)
     parser.add_argument('--output',type=Path,required=True)
-    run(parser.parse_args())
+    args = parser.parse_args()
+    if args.compare_loader and not args.packed_weights:
+        parser.error('--compare-loader requires --packed-weights')
+    run(args)

@@ -1,5 +1,9 @@
 # NAS experiment harness
 
+Start with the [reviewer guide](REVIEWER_GUIDE.md) for the changes from original
+resident NAS, or [How to run asynchronous binned MPK](HOW_TO_RUN.md) for setup,
+full-model commands, result interpretation, and the separate dense/online paths.
+
 The runtime/compiler live at the repository root. This directory collects the
 small programs that previously lived beside isolated `checkout/` copies:
 
@@ -27,9 +31,11 @@ python3 research/nas/tests/run_checks.py
 ```
 
 `CXX` selects the compiler. Binaries go to ignored `research/nas/.build/`.
-All four cache/check combinations run at P=1/R=1 and P=4/R=8, and their
-selection digests must match. The tests include partial drains, reuse, and reset.
-The runner also executes the measurement accounting unit tests. To compile the
+All four cache/check combinations and the compact-record variant run at
+P=1/R=1 and P=4/R=8; their selection digests must match. The tests include
+partial drains, reuse, reset, and distinct per-operation thresholds/timeouts.
+The runner also executes the measurement accounting and packed-loader checks
+(the latter use small CPU tensors, PyTorch, and safetensors). To compile the
 small GPU replay with NVCC, without launching a GPU workload:
 
 ```bash
@@ -71,6 +77,13 @@ existing exact-output check. Inspect `--help` for variant choices. Results must
 be below `research/nas/results`, which may be a symlink to scratch storage.
 Each invocation creates a new output directory.
 
+To reuse an already prepared NAS weight cache, pass `--packed-weights DIR`.
+The loader checks checkpoint identity and all saved tensor bytes, then reuses
+one GPU weight allocation across variants. Loading and hash-check times are
+reported separately from inference. Omit the option to retain the original
+loader. `--compare-loader` additionally times the original loader before using
+the cache; leave it off for normal packed-cache runs.
+
 For the existing DeltaAI allocation, submit **from the repository root**:
 
 ```bash
@@ -78,6 +91,7 @@ export NAS_PYTHON=/path/to/environment/bin/python
 export NAS_WORKLOAD=/path/to/prompts_64.json
 export NAS_HF_REFERENCE=/path/to/hf_reference.json
 export NAS_BASELINE_OUTPUTS=/path/to/preserved/control/outputs.pt
+export NAS_PACKED_WEIGHTS=/path/to/complete/packed_weights  # optional
 sbatch research/nas/measurement/run.sbatch
 ```
 
@@ -134,3 +148,26 @@ The original comparison was submitted as job 3530459 from the isolated source
 copy. Its GPU results are not claimed by this publishing snapshot. CPU replay
 and CUDA compilation passed there. The preserved `nas-fifo-baseline` Git tag
 and both switches set to zero provide independent rollback paths.
+
+## Compact active-bin records
+
+`NAS_FIFO_HOT_RECORDS=1` keeps the fields needed to choose a bin together in
+one 32-byte record: oldest timestamp, timeout, bin key, threshold, and count.
+The count is authoritative there. An inverse position lookup is updated when
+an empty bin activates or the last active record replaces a removed record.
+Tensor pointers and other operator metadata stay in the existing operator
+records. FIFO membership, eligibility, tie-breaking, and completion rules stay
+the same. The switch is off by default and requires both winner optimizations.
+
+Use `fifo_hot` to enable it and `fifo_cached_unchecked` as its control. The
+following runs both uninstrumented controls first, then their diagnostics:
+
+```bash
+sbatch research/nas/measurement/run.sbatch hot
+```
+
+Set `NAS_PACKED_WEIGHTS` as above to avoid repeating checkpoint preparation.
+The launcher runs the fast/hot GPU FIFO replays before model execution. A
+full-model speedup is not established by the CPU replay or CUDA compilation;
+compare the uninstrumented results. Select `fifo_cached_unchecked` to return
+to the previous representation without changing loading or scheduling policy.
