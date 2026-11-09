@@ -74,7 +74,7 @@ Function names are included because line numbers change during experiments.
 | Slot | Reusable storage and execution state for one request at a time |
 | Request ID | Logical input request; can change when a completed slot is reused |
 | Slot epoch | Completed/active graph-pass generation; increases across replacement requests too |
-| `slot_token_position` | Position within the current sequence; distinct from epoch and reset on replacement |
+| `slot_token_position` | Position of this pass's first input token in the current sequence/KV cache; advances by the active row count and resets on replacement (example below) |
 | `op_id` | Concrete batched operation identity, including its layer and kind; not just W13 versus W2 |
 | Token / branch | Row within a chunk / selected expert rank within that token |
 | Descriptor index / `batch.sequence` | Reusable physical-batch storage / generation of a publication; neither is a slot epoch |
@@ -85,52 +85,25 @@ layers in order and validates the resulting mapping. Shared weights do not
 make two layers the same operation. A physical batch has one `op_id`; members
 can come from different slots and epochs, but not different layers' weights.
 
-## Logical graph versus physical execution
+### Toy example: token position versus epoch
 
-For each slot, a complete model layer is:
+Suppose slot 0 processes request A, whose prompt has eight tokens, using
+prefill chunks of four tokens. Positions are zero-based; the table shows each
+pass's starting position.
 
-```text
-input -> RMSNorm -> QKV -> slot attention -> W_O -> residual add
-                                                     |
-              RMSNorm <- attention residual ---------+
-                 |
-          router linear -> top-k ranks/weights
-                 |
-        W13 [all active tokens, all R branches]
-                 | logical join
-           SiLU(gate) * up
-                 |
-         W2 [all active tokens, all R branches]
-                 | logical join
-          weighted sum over R -> residual add -> next layer
-```
+| Request in slot 0 | Epoch | `slot_token_position` | Input consumed and prediction |
+|---|---:|---:|---|
+| A | 1 | 0 | Prompt tokens 0–3; this intermediate chunk's prediction is ignored |
+| A | 2 | 4 | Prompt tokens 4–7; predicts the first generated token |
+| A | 3 | 8 | First generated token; predicts the second |
+| A | 4 | 9 | Second generated token; suppose it predicts EOS |
+| B replaces A | 5 | **0** | New request's prompt tokens 0–3 |
 
-The W13 input is the post-attention normalized activation; router output
-supplies its routing dependency. The graph also keeps residual data dependencies.
-After all layers, the last active row is gathered, normalized, projected through
-the LM head, and passed to argmax. Intermediate prefill-chunk predictions are
-computed but ignored by request progression.
-
-For W13 and W2, one logical DataId owns a slot's active rows and expert branches.
-It is **not one DataId per selected expert**. Physical execution looks like:
-
-```mermaid
-flowchart LR
-    A[Slot A: ready token/branch members] --> BIN[Bin: operation ID + expert]
-    B[Slot B: ready token/branch members] --> BIN
-    BIN --> DESC[Immutable descriptor: up to 16 members]
-    DESC --> WQ[One tagged worker queue item]
-    WQ --> CTA[Worker CTA: compact projection]
-    CTA --> CQ[One physical completion]
-    CQ --> JOIN[Decrement each member's slot join]
-    JOIN --> NEXT[Release a slot's logical edges only at zero]
-```
-
-Example: P=4, R=8 gives 32 W13 members for one prefill slot. Several descriptors
-may cover them. If 31 finish, SiLU is still not ready for that slot. The last
-member releases its W13 DataId once, enabling SiLU over that slot's active rows
-and branches. W2 has the same completion join before the weighted sum. Another
-slot can progress independently throughout this process.
+**Epoch** counts graph passes executed by the slot and keeps increasing across
+replacement requests. **`slot_token_position`** identifies where this pass's
+input belongs in the current sequence/KV cache: it advances by four during
+prefill, by one during decode, and resets to zero for a new request. The EOS
+prediction is saved but is not fed back through attention before admitting B.
 
 ## One controller iteration
 
