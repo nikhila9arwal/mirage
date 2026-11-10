@@ -11,19 +11,11 @@ logical work executes; it does not remove those dependencies.
 For commands, see [How to run](HOW_TO_RUN.md). For import history and preserved
 baselines, see [Provenance](PROVENANCE.md).
 
-## Scope and versions
-
-Initially reviewed on 2026-11-09 against the `nas-async` working tree at
-`d62d226`, including local compact-FIFO and packed-loader changes. Those changes
-and the initial guide were subsequently published in `1ccd627`. Check the
-current commit, `git status`, and actual compile flags when comparing a run.
 
 | Source | What to expect |
 |---|---|
 | This checkout, `nas-async` | Full 48-layer Qwen3-30B-A3B, top-8, successive prefill chunks, autoregressive decode, EOS/cap stopping, offline replacement, FIFO bins for W13/W2 |
 
-**Native online files already present in Mirage do not, by themselves, connect
-an application to our binned runtime.**
 
 ## What changed relative to the shared-iteration resident path
 
@@ -35,14 +27,12 @@ The old behavior remains available in this source. The new path is opt-in.
 | Completion boundary | All graph terminals allow shared END handling | A slot's terminals allow that slot to prepare its next pass |
 | Preparation | Shared `prepare_next_batch()` | Slot-local `prepare_slot()` and `advance_slot()` |
 | Ordinary ready work | Resident scheduling machinery | Same logical task, queued to a worker |
-| Ready W13/W2 work | A static task's CUDA body | Expand into token/branch members; select a physical batch later |
-| Completion of a batch | Not a separate entity | Retire a descriptor and account for each captured logical member |
-| Request state | Shared batch metadata | Private activations and KV storage per slot; weights shared read-only |
+| Ready W13/W2 work | Statically assigned | Dynamic physical batches |
 
 This is still a persistent GPU runtime. Python builds and initializes the graph
 and launches it; Python does not relaunch a graph for every token. Independent
-progress means different slots can be in different layers, chunk/decode phases,
-and epochs. It does not guarantee concurrent execution: worker queues, batching
+progress means **different slots can be in different layers, chunk/decode phases,
+and epochs**. It does not guarantee concurrent execution: worker queues, batching
 eligibility, and GPU resources can still delay ready work.
 
 ## Suggested reading order
@@ -77,11 +67,6 @@ Function names are included because line numbers change during experiments.
 | Token / branch | Row within a chunk / selected expert rank within that token |
 | Descriptor index / `batch.sequence` | Reusable physical-batch storage / generation of a publication; neither is a slot epoch |
 
-The host binds operator families in registration order, separately for each
-kind, into records indexed as `layer * 4 + kind`. The demo registers complete
-layers in order and validates the resulting mapping. Shared weights do not
-make two layers the same operation. A physical batch has one `op_id`; members
-can come from different slots and epochs, but not different layers' weights.
 
 ### Clarification: token position versus epoch
 
@@ -109,84 +94,43 @@ prediction is saved but is not fed back through attention before admitting B.
 Simplified, with optional diagnostics omitted:
 
 ```text
-consume up to completion_budget already-available completion messages
+consume up to completion messages in completion queue until it is empty
     ordinary item: complete its DataId at the captured epoch
     batch item: account for members; complete any logical joins that reach zero
                 retire the physically finished descriptor
-consume at most one control message (bootstrap, restart, dispatch, termination)
+consume at most one control message/event (bootstrap, restart, dispatch, termination)
 attempt to dispatch one eligible batch
 if nothing progressed: short nanosleep
 ```
 
-Completion draining does not wait for 16 items to accumulate. It stops at an
-empty queue. The code default is one; the checked-in measurement launcher uses
-16. Each dispatch attempt publishes **at most one descriptor**. It may fail
-because no descriptor is free or no pending bin is eligible. **Each scheduling
-pass dispatches at most one batch from one bin.** This was the simplest initial
+ **Each scheduling pass dispatches at most one batch from one bin.** This was the simplest initial
 approach. A proposed follow-up is to dispatch repeatedly until no eligible bin
 or free descriptor remains; that is not the current policy.
 
-The binned host initializer requires one local scheduler, 1–16 workers, one GPU,
-split workers/scheduler, and `resident_data/scheduler_dispatch`. Generic resident
-code still contains multi-scheduler and hybrid-prelaunch paths; their presence
-does not make this binned controller a multi-scheduler implementation.
+The binned host initializer requires one local scheduler, 1–16 workers, and one GPU. 
 **More than 16 workers or more than one scheduler are currently rejected by
 host initialization.** Supporting those configurations requires changes and
 validation, not just a larger launch parameter.
 
 ## Readiness, FIFO selection, and ownership
 
-1. `experimental_moe_ready()` validates the captured epoch. Ordinary or disabled
-   dense-bin tasks enter a worker queue directly. Enabled batched tasks instead
-   establish `remaining_branches[slot] = active_rows * num_branches` and populate
-   `pending[slot]`.
-2. Each member is appended to the FIFO for `key = op_id * 128 + expert`.
-   Member storage is flat: `(slot * P + token) * R + branch`. There is one FIFO
+1. `experimental_moe_ready()` enqueues tasks onto workers. Ordinary non binned tasks enter a worker queue directly. Enabled binned tasks instead
+   establish `remaining_branches[slot] = active_rows * num_branches`(the histogram we discussed) and populate
+   `pending[slot]`(state metadata).
+2. Each member is appended to the FIFO for `key = op_id * 128 + expert` op_id encodes information about what layer it is in. There is one FIFO
    structure containing many per-bin linked lists, not one shared-order queue.
-   The active-bin collection is unordered, but members within each bin retain
-   FIFO order. The field `fifo.head[key]` (`state.fifo.head[key]` in the runtime)
-   stores the flat member index at the head of that bin's linked list;
-   `fifo.next[member]` links to the next member. This index identifies a
-   `(slot, token, branch)` member, not a DataId or an active-bin array position.
+   The field `fifo.head[key]` (`state.fifo.head[key]` in the runtime)
+   stores the head of a bin's linked list; This FIFO is essentially a set indexed by the bin. 
 3. Selection scans nonempty bins. A bin is eligible at `count >= B` **or** age
    `>= T`. The oldest eligible bin wins; equal timestamps use the smaller key.
    The selector takes its oldest `min(count, 16)` members. B is an eligibility
    threshold, not the physical batch capacity.
-4. Dispatch reserves a descriptor before removing pending members. The descriptor
-   captures their DataIds, epochs, slot/token/branch identities, routing, and row
-   maps. It then clears their pending bits and publishes the worker item.
+4. Dispatching a bin reserves a descriptor. The descriptor
+   captures the member's metadata: DataIds, epochs, slot/token/branch identities, routing, and row
+   maps. It then publishes the them to a worker. If no descriptor are available to be reserved, then we are not able to dispatch. 
 5. The descriptor owns those dispatched members until physical completion is
-   handled. Empty pending bits do **not** mean the logical operation is complete.
-
-## Kernel addressing and completion safety
-
-[fixed_moe_adapter.cuh](../../include/mirage/persistent_kernel/fixed_moe_adapter.cuh)
-adapts the Hopper MoE arithmetic to compact selected rows. Let
-`t = slot * P + token` and `b = t * R + branch`:
-
-| Projection | Input row | Output row |
-|---|---|---|
-| W13 (gate/up projection) | `t` in `[S*P,H]` | `b` in `[S*P*R,2I]` |
-| W2 (down projection) | `b` in `[S*P*R,I]` | `b` in `[S*P*R,H]` |
-| Dense QKV/W_O on the dense branch | `t` | `t` |
-
-Activation vectors stay in slot allocations. Descriptors carry gather/scatter
-indices and stable routing metadata; they do not copy weights. A worker calls
-the projection collectively across its CTA.
-
-Descriptor writes precede worker-queue release publication; the worker acquires
-readiness before using them. CTA synchronization and completion publication
-make outputs visible before the controller releases logical successors.
-`remaining_branches` is single-controller state, so its decrement needs no
-worker atomic. `active_data[slot]` is an optional correctness guard against
-mixing operations; the join counter performs the completion accounting.
-
-A descriptor retires after its physical completion is handled, even if a
-member's slot still awaits branches in another descriptor. Holding it until
-the entire logical join finishes could exhaust the pool. `in_flight` includes
-queued, executing, and completed-but-not-yet-retired descriptors; it is not a
-count of busy workers. Ordinary queued tasks are not included in that counter.
-
+   handled. One the dispatched bin finished it's linear task, the descriptor gets returned to the descriptor pool. 
+   
 ## Slot restart, prefill, and autoregression
 
 ```text
@@ -202,26 +146,13 @@ slot terminal(s) finish -> COMPLETE + captured-epoch control message
 `make_slot_restart_plan()` runs during host initialization, not on the GPU. It
 validates ownership and dependencies, builds per-slot topological DataId lists
 and offsets, and checks finite queue bounds. `dispatch_slot()` and slot reset
-consume those lists on the GPU. Cross-slot compute edges and unsafe writable
-aliases are rejected; the implementation does not erase dependencies to
-manufacture independence.
+consume those lists on the GPU. 
 
 For native prefill, `prepare_slot()` selects `prepare_prefill_request()`; the
 older HF-prefix `prepare_decode_request()` path is not used. P is the prefill
 chunk capacity and the allocation stride. `slot_chunk_rows` is P during a full
 prompt chunk and 1 during decode.
-`slot_token_position` advances by that active count. A slot's chunk progresses
-through logical operations together; physical MoE members may finish separately
-but join before the next logical operation.
-
-The same CUDA `slot_ids` allocation is written by preparation and read by the
-embedding task. During decode, preparation copies the previous argmax token
-into it. There is no per-token host feedback. Attention consumes QKV, writes
-the current K/V at that slot's positions, and reads its own valid history. Each
-layer has private per-slot K/V storage; the generated attention call uses local
-metadata rather than shared compacted batch CSR metadata. **This path fixes
-each slot to one 64-position cache page; it does not implement multi-page cache
-management.**
+`slot_token_position` advances by P during prefill and by 1 during decode. During prefill, **all rows in a chunk runs in lockstep**. 
 
 ## Compiler integration to review
 
@@ -258,6 +189,8 @@ prove which row owns a DataId.
 - **Not every operation has a bin.** RMSNorm, routing, attention, SiLU, reduction,
   and readout remain ordinary tasks. Main-branch chunked QKV/W_O do too; the
   dense branch changes those two projections only.
+- **Paged attention is not supported** Since it is unsafe to access a CSR page table concurrently, so every requests gets a fixed KV cache of one page (64 tokens). The kv cache is updated in the multi head attention task. 
+
 
 [FIFO replay tests](tests/test_fifo.cc) cover selection, partial drains, reset,
 and reuse. The [full-model harness](experiments/native_prefill/run.py) adds native
