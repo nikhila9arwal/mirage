@@ -1,4 +1,4 @@
-# Reviewer guide: from resident NAS to asynchronous binned MPK
+# Reviewer guide: from resident NAS to asynchronous binned MPK (For a human to read)
 
 This guide is for someone who knows the original NAS runtime and is returning
 to the project. The central change is **independent request-slot progression,
@@ -22,10 +22,8 @@ the actual compile flags when comparing a run with a commit.
 | `feature/dense-prefill-bins-20261108`, `3ac9c8d` | Adds QKV/W_O bins that can mix individual prefill and decode rows; uses the actual rectangular projection shapes |
 | Isolated online-serving experiment | Reuses native MPK's pinned transport and engine around the NAS runtime; its adapter is not present on either branch above |
 
-The dense branch's [reviewed results](https://github.com/Ethan7894/Async-NAS-F1/blob/3ac9c8d/research/nas/reports/dense_bins_3551645/RESULTS.md)
-describe that feature separately. The [run guide](HOW_TO_RUN.md#online-serving-status)
-locates the online experiment. Native online files already present in Mirage
-do not, by themselves, connect an application to our binned runtime.
+## Native online files already present in Mirage
+## do not, by themselves, connect an application to our binned runtime.
 
 ## What changed relative to the shared-iteration resident path
 
@@ -85,7 +83,7 @@ layers in order and validates the resulting mapping. Shared weights do not
 make two layers the same operation. A physical batch has one `op_id`; members
 can come from different slots and epochs, but not different layers' weights.
 
-### Toy example: token position versus epoch
+### Clarification: token position versus epoch
 
 Suppose slot 0 processes request A, whose prompt has eight tokens, using
 prefill chunks of four tokens. Positions are zero-based; the table shows each
@@ -123,23 +121,22 @@ if nothing progressed: short nanosleep
 Completion draining does not wait for 16 items to accumulate. It stops at an
 empty queue. The code default is one; the checked-in measurement launcher uses
 16. Each dispatch attempt publishes **at most one descriptor**. It may fail
-because no descriptor is free or no pending bin is eligible.
+because no descriptor is free or no pending bin is eligible. **In other words, each scheduleing pass dispatches at most one bin**. The reason why I did this was because it was the naive approach, we should make it dispatch all eligible bins unless we run out of free descriptors. 
 
 The binned host initializer requires one local scheduler, 1–16 workers, one GPU,
 split workers/scheduler, and `resident_data/scheduler_dispatch`. Generic resident
 code still contains multi-scheduler and hybrid-prelaunch paths; their presence
-does not make this binned controller a multi-scheduler implementation.
+does not make this binned controller a multi-scheduler implementation. **Have not tested support for more than 16 workers and/or more than 1 scheduler**. I anticipate needing to change some stuff. 
 
 ## Readiness, FIFO selection, and ownership
 
 1. `experimental_moe_ready()` validates the captured epoch. Ordinary or disabled
    dense-bin tasks enter a worker queue directly. Enabled batched tasks instead
    establish `remaining_branches[slot] = active_rows * num_branches` and populate
-   `pending[slot]`. Top-k writes ranks per expert; readiness currently scans
-   those ranks to reconstruct the expert for each branch.
+   `pending[slot]`. 
 2. Each member is appended to the FIFO for `key = op_id * 128 + expert`.
    Member storage is flat: `(slot * P + token) * R + branch`. There is one FIFO
-   structure containing many per-bin linked lists, not one shared-order queue.
+   structure containing many per-bin linked lists, not one shared-order queue. The FIFO acts like an glorified set. The data feild _______ denotes the head of each binned linked list. 
 3. Selection scans nonempty bins. A bin is eligible at `count >= B` **or** age
    `>= T`. The oldest eligible bin wins; equal timestamps use the smaller key.
    The selector takes its oldest `min(count, 16)` members. B is an eligibility
@@ -150,16 +147,6 @@ does not make this binned controller a multi-scheduler implementation.
 5. The descriptor owns those dispatched members until physical completion is
    handled. Empty pending bits do **not** mean the logical operation is complete.
 
-Incremental counts and linked membership avoid rebuilding the histogram.
-`NAS_FIFO_HOT_RECORDS` optionally puts bin key, count, oldest timestamp,
-threshold, and timeout in a 32-byte active record. `active_position[key]` locates
-that record for removal/update; it is not the FIFO head. Removing an empty bin
-swaps the last active record into its place, so active-list order is not age
-order. Breaking at the first eligible record would change the scheduling policy.
-
-The FIFO path rejects early/deadline companion coalescing. The older selector,
-histogram selector, cohort experiments, and trace hooks remain for comparisons;
-their presence does not mean they run in the `fifo_hot` configuration.
 
 ## Kernel addressing and completion safety
 
@@ -169,15 +156,13 @@ adapts the Hopper MoE arithmetic to compact selected rows. Let
 
 | Projection | Input row | Output row |
 |---|---|---|
-| W13 | `t` in `[S*P,H]` | `b` in `[S*P*R,2I]` |
-| W2 | `b` in `[S*P*R,I]` | `b` in `[S*P*R,H]` |
+| W13(gate up) | `t` in `[S*P,H]` | `b` in `[S*P*R,2I]` |
+| W2(gate down) | `b` in `[S*P*R,I]` | `b` in `[S*P*R,H]` |
 | Dense QKV/W_O on the dense branch | `t` | `t` |
 
 Activation vectors stay in slot allocations. Descriptors carry gather/scatter
 indices and stable routing metadata; they do not copy weights. A worker calls
-the projection collectively across its CTA. Native and compact paths need not
-have identical task geometry or pipeline parameters; equal math alone is not
-a matched performance comparison.
+the projection collectively across its CTA. 
 
 Descriptor writes precede worker-queue release publication; the worker acquires
 readiness before using them. CTA synchronization and completion publication
@@ -204,20 +189,14 @@ slot terminal(s) finish -> COMPLETE + captured-epoch control message
   -> dispatch_slot(): enqueue roots for scheduler_dispatch
 ```
 
-The initial synthetic END bootstraps slots once. In this path, later slot
-completions do not publish graph-wide END. `current_iteration` is a bootstrap
-marker; `slot_iteration` is the execution clock. Legacy shared-END preparation
-still exists behind the other path.
-
-`make_slot_restart_plan()` is host initialization: it validates ownership and
+`make_slot_restart_plan()` is host initialization(does not run in runtime on GPU): it validates ownership and
 dependencies, builds per-slot topological DataId lists and offsets, and checks
 finite queue bounds. `dispatch_slot()` and slot reset consume those lists on
 the GPU. Cross-slot compute edges and unsafe writable aliases are rejected;
 the implementation does not erase dependencies to manufacture independence.
 
 For native prefill, `prepare_slot()` selects `prepare_prefill_request()`; the
-older HF-prefix `prepare_decode_request()` path is not used. P is the allocation
-stride. `slot_chunk_rows` is P during a full prompt chunk and 1 during decode.
+older HF-prefix `prepare_decode_request()` path is not used. P is the chunked prefill chunk size. `slot_chunk_rows` is P during a full prompt chunk and 1 during decode.
 `slot_token_position` advances by that active count. A slot's chunk progresses
 through logical operations together; physical MoE members may finish separately
 but join before the next logical operation.
@@ -227,15 +206,9 @@ embedding task. During decode, preparation copies the previous argmax token
 into it. There is no per-token host feedback. Attention consumes QKV, writes
 the current K/V at that slot's positions, and reads its own valid history. Each
 layer has private per-slot K/V storage; the generated attention call uses local
-metadata rather than shared compacted batch CSR metadata.
+metadata rather than shared compacted batch CSR metadata. **This is why we only support a context length of 64 and do not support paged attention**
 
-EOS or the position cap ends the request; the scheduler can admit another from
-the preloaded queue. The last prediction is saved but is not necessarily fed
-back through attention. Precisely, the offline contract permits at most 64
-**consumed** positions: without EOS, `prompt_length + generated_length - 1 = 64`.
-This explains the apparent extra final output when counting saved tokens.
-
-## Compiler integration to review
+## Compiler integration to review (Warning! Ethan did only understands this at a surface level, this section is almost fully vibe coded)
 
 The resident entry now calls the newer shared `kn::register_mugraph()` in
 [runtime.cc](../../src/kernel/runtime.cc), then converts its native tasks/events
@@ -263,24 +236,9 @@ prove which row owns a DataId.
 - **Fixed small cache/chunk contract.** The checked-in full-model path uses one
   64-position page, P=4, top-8, and full prompt chunks. Online tail handling is
   in the separate experiment. This is not a general paged-cache allocator.
-- **Finite internal queues.** The host conservatively bounds the whole run below
-  ring capacities. The offline path is not an unbounded producer/consumer queue
-  with general backpressure. Descriptor pool size, state slots, batch capacity,
-  and worker count are four different capacities.
 - **Not every operation has a bin.** RMSNorm, routing, attention, SiLU, reduction,
   and readout remain ordinary tasks. Main-branch chunked QKV/W_O do too; the
   dense branch changes those two projections only.
-- **Reset and reuse.** Check that pending membership, descriptor generations,
-  captured epochs, terminal counts, and request output lengths cannot leak into
-  another pass or replacement request.
-- **Do not infer correctness from plausible text.** Lifecycle, bounds, routing,
-  and exact preserved-NAS output checks are distinct from agreement with HF.
-  Different attention/BF16 arithmetic can change greedy choices; known mismatches
-  are reported rather than treated as bitwise model equivalence.
-- **Separate timing from diagnostics.** Loading, compilation, and hashing are
-  outside invocation timing. Worker-seconds sum task execution across workers;
-  they are not elapsed seconds. Nested scheduler scopes must not be added twice.
-  Instrumentation can change when bins fill and therefore change execution.
 
 [FIFO replay tests](tests/test_fifo.cc) cover selection, partial drains, reset,
 and reuse. The [full-model harness](experiments/native_prefill/run.py) adds native
