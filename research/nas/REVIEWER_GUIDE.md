@@ -21,8 +21,6 @@ current commit, `git status`, and actual compile flags when comparing a run.
 | Source | What to expect |
 |---|---|
 | This checkout, `nas-async` | Full 48-layer Qwen3-30B-A3B, top-8, successive prefill chunks, autoregressive decode, EOS/cap stopping, offline replacement, FIFO bins for W13/W2 |
-| `feature/dense-prefill-bins-20261108`, `3ac9c8d` | Adds QKV/W_O bins that can mix individual prefill and decode rows; uses the actual rectangular projection shapes |
-| Isolated online-serving experiment | Reuses native MPK's pinned transport and engine around the NAS runtime; its adapter is not present on either branch above |
 
 **Native online files already present in Mirage do not, by themselves, connect
 an application to our binned runtime.**
