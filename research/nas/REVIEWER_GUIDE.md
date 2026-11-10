@@ -1,4 +1,6 @@
-# Reviewer guide: from resident NAS to asynchronous binned MPK (For a human to read)
+# Reviewer guide: from resident NAS to asynchronous binned MPK
+
+Audience: human reviewers familiar with the original NAS runtime.
 
 This guide is for someone who knows the original NAS runtime and is returning
 to the project. The central change is **independent request-slot progression,
@@ -11,10 +13,10 @@ baselines, see [Provenance](PROVENANCE.md).
 
 ## Scope and versions
 
-Reviewed on 2026-11-09 against the `nas-async` working tree, whose HEAD is
-`d62d226`. Existing local changes include compact FIFO records and packed-weight
-loading; these are not all represented by that HEAD. Check `git status` and
-the actual compile flags when comparing a run with a commit.
+Initially reviewed on 2026-11-09 against the `nas-async` working tree at
+`d62d226`, including local compact-FIFO and packed-loader changes. Those changes
+and the initial guide were subsequently published in `1ccd627`. Check the
+current commit, `git status`, and actual compile flags when comparing a run.
 
 | Source | What to expect |
 |---|---|
@@ -22,8 +24,8 @@ the actual compile flags when comparing a run with a commit.
 | `feature/dense-prefill-bins-20261108`, `3ac9c8d` | Adds QKV/W_O bins that can mix individual prefill and decode rows; uses the actual rectangular projection shapes |
 | Isolated online-serving experiment | Reuses native MPK's pinned transport and engine around the NAS runtime; its adapter is not present on either branch above |
 
-## Native online files already present in Mirage
-## do not, by themselves, connect an application to our binned runtime.
+**Native online files already present in Mirage do not, by themselves, connect
+an application to our binned runtime.**
 
 ## What changed relative to the shared-iteration resident path
 
@@ -121,22 +123,33 @@ if nothing progressed: short nanosleep
 Completion draining does not wait for 16 items to accumulate. It stops at an
 empty queue. The code default is one; the checked-in measurement launcher uses
 16. Each dispatch attempt publishes **at most one descriptor**. It may fail
-because no descriptor is free or no pending bin is eligible. **In other words, each scheduleing pass dispatches at most one bin**. The reason why I did this was because it was the naive approach, we should make it dispatch all eligible bins unless we run out of free descriptors. 
+because no descriptor is free or no pending bin is eligible. **Each scheduling
+pass dispatches at most one batch from one bin.** This was the simplest initial
+approach. A proposed follow-up is to dispatch repeatedly until no eligible bin
+or free descriptor remains; that is not the current policy.
 
 The binned host initializer requires one local scheduler, 1–16 workers, one GPU,
 split workers/scheduler, and `resident_data/scheduler_dispatch`. Generic resident
 code still contains multi-scheduler and hybrid-prelaunch paths; their presence
-does not make this binned controller a multi-scheduler implementation. **Have not tested support for more than 16 workers and/or more than 1 scheduler**. I anticipate needing to change some stuff. 
+does not make this binned controller a multi-scheduler implementation.
+**More than 16 workers or more than one scheduler are currently rejected by
+host initialization.** Supporting those configurations requires changes and
+validation, not just a larger launch parameter.
 
 ## Readiness, FIFO selection, and ownership
 
 1. `experimental_moe_ready()` validates the captured epoch. Ordinary or disabled
    dense-bin tasks enter a worker queue directly. Enabled batched tasks instead
    establish `remaining_branches[slot] = active_rows * num_branches` and populate
-   `pending[slot]`. 
+   `pending[slot]`.
 2. Each member is appended to the FIFO for `key = op_id * 128 + expert`.
    Member storage is flat: `(slot * P + token) * R + branch`. There is one FIFO
-   structure containing many per-bin linked lists, not one shared-order queue. The FIFO acts like an glorified set. The data feild _______ denotes the head of each binned linked list. 
+   structure containing many per-bin linked lists, not one shared-order queue.
+   The active-bin collection is unordered, but members within each bin retain
+   FIFO order. The field `fifo.head[key]` (`state.fifo.head[key]` in the runtime)
+   stores the flat member index at the head of that bin's linked list;
+   `fifo.next[member]` links to the next member. This index identifies a
+   `(slot, token, branch)` member, not a DataId or an active-bin array position.
 3. Selection scans nonempty bins. A bin is eligible at `count >= B` **or** age
    `>= T`. The oldest eligible bin wins; equal timestamps use the smaller key.
    The selector takes its oldest `min(count, 16)` members. B is an eligibility
@@ -147,7 +160,6 @@ does not make this binned controller a multi-scheduler implementation. **Have no
 5. The descriptor owns those dispatched members until physical completion is
    handled. Empty pending bits do **not** mean the logical operation is complete.
 
-
 ## Kernel addressing and completion safety
 
 [fixed_moe_adapter.cuh](../../include/mirage/persistent_kernel/fixed_moe_adapter.cuh)
@@ -156,13 +168,13 @@ adapts the Hopper MoE arithmetic to compact selected rows. Let
 
 | Projection | Input row | Output row |
 |---|---|---|
-| W13(gate up) | `t` in `[S*P,H]` | `b` in `[S*P*R,2I]` |
-| W2(gate down) | `b` in `[S*P*R,I]` | `b` in `[S*P*R,H]` |
+| W13 (gate/up projection) | `t` in `[S*P,H]` | `b` in `[S*P*R,2I]` |
+| W2 (down projection) | `b` in `[S*P*R,I]` | `b` in `[S*P*R,H]` |
 | Dense QKV/W_O on the dense branch | `t` | `t` |
 
 Activation vectors stay in slot allocations. Descriptors carry gather/scatter
 indices and stable routing metadata; they do not copy weights. A worker calls
-the projection collectively across its CTA. 
+the projection collectively across its CTA.
 
 Descriptor writes precede worker-queue release publication; the worker acquires
 readiness before using them. CTA synchronization and completion publication
@@ -189,14 +201,17 @@ slot terminal(s) finish -> COMPLETE + captured-epoch control message
   -> dispatch_slot(): enqueue roots for scheduler_dispatch
 ```
 
-`make_slot_restart_plan()` is host initialization(does not run in runtime on GPU): it validates ownership and
-dependencies, builds per-slot topological DataId lists and offsets, and checks
-finite queue bounds. `dispatch_slot()` and slot reset consume those lists on
-the GPU. Cross-slot compute edges and unsafe writable aliases are rejected;
-the implementation does not erase dependencies to manufacture independence.
+`make_slot_restart_plan()` runs during host initialization, not on the GPU. It
+validates ownership and dependencies, builds per-slot topological DataId lists
+and offsets, and checks finite queue bounds. `dispatch_slot()` and slot reset
+consume those lists on the GPU. Cross-slot compute edges and unsafe writable
+aliases are rejected; the implementation does not erase dependencies to
+manufacture independence.
 
 For native prefill, `prepare_slot()` selects `prepare_prefill_request()`; the
-older HF-prefix `prepare_decode_request()` path is not used. P is the chunked prefill chunk size. `slot_chunk_rows` is P during a full prompt chunk and 1 during decode.
+older HF-prefix `prepare_decode_request()` path is not used. P is the prefill
+chunk capacity and the allocation stride. `slot_chunk_rows` is P during a full
+prompt chunk and 1 during decode.
 `slot_token_position` advances by that active count. A slot's chunk progresses
 through logical operations together; physical MoE members may finish separately
 but join before the next logical operation.
@@ -206,9 +221,15 @@ embedding task. During decode, preparation copies the previous argmax token
 into it. There is no per-token host feedback. Attention consumes QKV, writes
 the current K/V at that slot's positions, and reads its own valid history. Each
 layer has private per-slot K/V storage; the generated attention call uses local
-metadata rather than shared compacted batch CSR metadata. **This is why we only support a context length of 64 and do not support paged attention**
+metadata rather than shared compacted batch CSR metadata. **This path fixes
+each slot to one 64-position cache page; it does not implement multi-page cache
+management.**
 
-## Compiler integration to review (Warning! Ethan did only understands this at a surface level, this section is almost fully vibe coded)
+## Compiler integration to review
+
+**Author's note:** Ethan understands this compiler section at a surface level;
+the explanation is largely AI-generated. Review the claims against the linked
+implementation carefully.
 
 The resident entry now calls the newer shared `kn::register_mugraph()` in
 [runtime.cc](../../src/kernel/runtime.cc), then converts its native tasks/events
